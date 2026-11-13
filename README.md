@@ -6,7 +6,6 @@
 [![Kernel: eBPF LSM](https://img.shields.io/badge/Kernel-eBPF_LSM_(Linux_6.x%2B)-blue.svg?logo=linux)](https://ebpf.io/)
 [![GUI: Slint](https://img.shields.io/badge/GUI-Slint_UI-blueviolet.svg)](https://slint.dev/)
 [![AI: Qwen 2.5](https://img.shields.io/badge/AI-Qwen_2.5_0.5B_(llama.cpp)-green.svg)](https://huggingface.co/Qwen)
-[![License: MIT / GPL-2.0](https://img.shields.io/badge/License-MIT_%2F_GPL--2.0-yellow.svg)](LICENSE)
 [![Platform: Debian 13](https://img.shields.io/badge/Platform-Debian_13_Trixie-red.svg?logo=debian)](https://www.debian.org/)
 
 [English](README.en.md) | **Русский**
