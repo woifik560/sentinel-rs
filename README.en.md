@@ -1,4 +1,4 @@
-# 🛡️ Sentinel-RS
+# Sentinel-RS
 
 **eBPF Desktop Anti-Stealer & Deterministic Context-Aware Firewall for Linux**
 
@@ -6,15 +6,14 @@
 [![Kernel: eBPF LSM](https://img.shields.io/badge/Kernel-eBPF_LSM_(Linux_6.x%2B)-blue.svg?logo=linux)](https://ebpf.io/)
 [![GUI: Slint](https://img.shields.io/badge/GUI-Slint_UI-blueviolet.svg)](https://slint.dev/)
 [![Engine: Deterministic Risk](https://img.shields.io/badge/Engine-Causal_Lineage_%26_Risk-brightgreen.svg)](https://github.com/woifik560/sentinel-rs)
-[![Memory: < 30 MB](https://img.shields.io/badge/RAM-%3C_30_MB-success.svg)](#-key-features)
-[![License: MIT / GPL-2.0](https://img.shields.io/badge/License-MIT_%2F_GPL--2.0-yellow.svg)](LICENSE)
+[![Memory: < 30 MB](https://img.shields.io/badge/RAM-%3C_30_MB-success.svg)](#key-features)
 [![Platform: Debian 13](https://img.shields.io/badge/Platform-Debian_13_Trixie-red.svg?logo=debian)](https://www.debian.org/)
 
 **English** | [Русский](README.md)
 
 ---
 
-## 📌 Overview (Version 2.0)
+## Overview (Version 2.0)
 
 **Sentinel-RS** is an ultra-lightweight host firewall and data integrity system for Linux Desktop environments, engineered specifically to prevent **infostealers** and unauthorized credential exfiltration.
 
@@ -23,31 +22,31 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`), which lack aw
 2. **Deterministic In-Memory Causal Lineage Tracking** of process hierarchies.
 3. **Context-Aware Interactive Prompts ("Freeze & Inspect")** for ambiguous actions, preventing false positives.
 
-> **💡 Architectural Principle V2.0:** No embedded Large Language Models (LLMs) in the security core! The daemon eliminates hallucinations, runs without AVX2 instruction requirements, makes decisions in **< 1 millisecond**, and consumes **under 25–30 MB of RAM**.
+> **Architectural Principle V2.0:** No embedded Large Language Models (LLMs) in the security core! The daemon eliminates hallucinations, runs without AVX2 instruction requirements, makes decisions in **< 1 millisecond**, and consumes **under 25–30 MB of RAM**.
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-- 🔒 **eBPF LSM Taint Tracking & App Scoping**:
+- **eBPF LSM Taint Tracking & App Scoping**:
   - Access to sensitive credentials (Telegram `tdata`, browser cookies/logins, SSH/GPG keys, crypto wallets) is strictly guarded by application origin.
   - Unauthorized reads mark the entire process group (`TGID`) as `TAINTED`.
-- 🧬 **Causal Lineage Graph (In-Memory Process DAG)**:
+- **Causal Lineage Graph (In-Memory Process DAG)**:
   - Tracks process ancestry (`sched_process_fork` / `exec`) inside a ring LRU graph (4096–8192 nodes).
   - Ancestry is preserved even after intermediate parents (e.g., `sh -c` or npm build scripts) terminate.
-- 🔍 **Deep Execution Context Inspection**:
+- **Deep Execution Context Inspection**:
   - Script interpreter inspection (`python3`, `bash`, `node`, `perl`): trustworthiness is judged by the script and arguments, not the system binary hash.
   - Detection of fileless execution from RAM (`memfd_create`).
-- 🛑 **Deterministic Sub-millisecond Risk Engine (0..100)**:
+- **Deterministic Sub-millisecond Risk Engine (0..100)**:
   - Completely transparent, human-auditable rule weights (no black-box models).
   - Categorization into **LOW** (0..39), **GREY** (40..74), and **HIGH** (75..100).
-- ✋ **Interactive "Freeze & Inspect" Prompts**:
+- **Interactive "Freeze & Inspect" Prompts**:
   - For ambiguous events (GREY): immediate socket rejection (`-EPERM`) + `SIGSTOP`, surfacing an interactive dialog in Slint GUI or CLI.
   - Phase 2: zero-drop packet retention via `NFQUEUE` without breaking active user workflows.
   - **Fail-Closed Principle**: unhandled prompts time out in 30 seconds, automatically dropping the connection.
-- 🛡️ **IPC Security via `SO_PEERCRED`**:
+- **IPC Security via `SO_PEERCRED`**:
   - Unix Domain Socket commands are only accepted from `root` or the UID of the active desktop user session.
-- ⚡ **Extreme Lightweight Footprint**:
+- **Extreme Lightweight Footprint**:
   - Daemon memory: **< 25–30 MB RAM**
   - Slint GUI: **< 30 MB RAM**
   - **No Python, Electron, or C++ dependencies!** Pure Rust stack.
@@ -55,11 +54,11 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`), which lack aw
 
 ---
 
-## 🏗 System Architecture
+## System Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Kernel["🐧 LINUX KERNEL (eBPF LSM & Tracepoints)"]
+    subgraph Kernel["LINUX KERNEL (eBPF LSM & Tracepoints)"]
         LSM_FILE["lsm/file_open<br/>(App Scoping & Flag TAINTED)"]
         SCHED_FORK["sched_process_fork & exec<br/>(TGID Lineage & cmdline)"]
         LSM_NET["lsm/socket_connect & sendmsg<br/>(Socket Drop: Return -EPERM)"]
@@ -70,7 +69,7 @@ flowchart TD
         MAPS --> LSM_NET
     end
 
-    subgraph Daemon["⚙️ BACKGROUND DAEMON (sentineld, root, < 30 MB RAM)"]
+    subgraph Daemon["BACKGROUND DAEMON (sentineld, root, < 30 MB RAM)"]
         RING_BUF["RingBuffer Consumer"]
         
         subgraph Engine["Deterministic Security Engine"]
@@ -92,7 +91,7 @@ flowchart TD
         PROMPT_MGR <--> IPC_SOCK
     end
 
-    subgraph Clients["🖥️ USER SPACE INTERFACES"]
+    subgraph Clients["USER SPACE INTERFACES"]
         CLI["Terminal: sentinelctl<br/>(watch, monitor, export JSON)"]
         GUI["Native GUI: sentinel-gui (Slint)<br/>(Interactive Prompt, Breadcrumb, Risk Gauge)"]
     end
@@ -103,7 +102,7 @@ flowchart TD
 
 ---
 
-## ⚖️ Transparent Risk Scoring
+## Transparent Risk Scoring
 
 Every event is evaluated against a deterministic scoring table (`clamp(0, 100)`):
 
@@ -124,7 +123,7 @@ Every event is evaluated against a deterministic scoring table (`clamp(0, 100)`)
 
 ---
 
-## 💻 CLI Usage (`sentinelctl`)
+## CLI Usage (`sentinelctl`)
 
 ```bash
 # Real-time interactive terminal prompt mode (ideal for SSH/servers)
@@ -146,7 +145,7 @@ sentinelctl whitelist add /usr/bin/curl
 
 ---
 
-## 📦 Cargo Workspace Structure
+## Cargo Workspace Structure
 
 ```text
 sentinel-rs/
@@ -166,7 +165,7 @@ sentinel-rs/
 
 ---
 
-## 🗺 Roadmap (V2.0)
+## Roadmap (V2.0)
 
 - [x] **Milestone 1: V2.0 Architecture & Design Specifications**
   - Removal of LLM dependencies, strict RAM budget < 30 MB.
@@ -183,9 +182,3 @@ sentinel-rs/
   - Incident prompt dialog with breadcrumbs, fail-closed countdown, system tray.
 - [ ] **Milestone 7: Zero-Drop NFQUEUE Integration (Phase 2 Prompt)**
 - [ ] **Milestone 8: Test Harness & Debian Package Packaging**
-
----
-
-## 📜 License
-
-Dual-licensed under **MIT** and **GPL-2.0** (required for Linux kernel eBPF components). See [LICENSE](LICENSE) for details.
