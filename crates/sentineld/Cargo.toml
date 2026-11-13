@@ -1,0 +1,26 @@
+[package]
+name = "sentineld"
+description = "Deterministic host firewall and integrity monitor daemon for Linux Desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sentinel-common = { path = "../sentinel-common" }
+sentinel-ebpf = { path = "../sentinel-ebpf" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha2 = "0.10"
+lru = "0.13"
+nix = { version = "0.29", features = ["signal", "process", "socket", "user", "fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
