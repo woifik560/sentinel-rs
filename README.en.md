@@ -145,22 +145,72 @@ sentinelctl whitelist add /usr/bin/curl
 
 ---
 
-## Cargo Workspace Structure
+## Project Structure (Cargo Workspace)
+
+The project is structured as a modular Rust workspace with clean separation of concerns across kernel, daemon, and client layers:
 
 ```text
 sentinel-rs/
 ├── crates/
-│   ├── sentinel-common/   # Shared types, eBPF event formats, IPC protocol, risk models
-│   ├── sentinel-ebpf/     # Kernel programs (Aya eBPF, LSM hooks, RingBuffer)
-│   ├── sentineld/         # Root daemon (Lineage Tracker, Risk Engine, IPC)
-│   ├── sentinelctl/       # Terminal client (CLI, watch, monitor, export)
-│   └── sentinel-gui/      # Native Slint UI (incident modal dialogs, system tray)
+│   ├── sentinel-common/            # Shared types, protocol, and risk models
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Library entry point
+│   │       ├── events.rs           # eBPF kernel events (file_open, fork, exec, socket_connect)
+│   │       ├── process.rs          # ProcessNode, script interpreter inspection (python3, bash, node)
+│   │       ├── risk.rs             # Deterministic Risk Engine (0..100) and rule weights
+│   │       ├── ipc.rs              # Unix IPC message protocol (PromptRequest, Verdict)
+│   │       ├── incident.rs         # Forensic report formatters (Human / JSON)
+│   │       └── config.rs           # Configuration deserialization for config.toml and rules.toml
+│   │
+│   ├── sentinel-ebpf/              # Linux kernel programs (Aya eBPF, LSM hooks, maps)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Exported eBPF structures and constants
+│   │       ├── maps.rs             # TaintMapManager, RingBuffer, pending_verdicts
+│   │       ├── loader.rs           # eBPF LSM and tracepoint loader
+│   │       └── programs/
+│   │           ├── mod.rs          # Kernel program modules
+│   │           ├── file_open.rs    # LSM hook file_open: App Scoping and TAINTED tagging
+│   │           ├── process_fork.rs # sched fork tracepoint: lineage and taint inheritance
+│   │           ├── process_exec.rs # sched exec tracepoint: cmdline and memfd_create inspection
+│   │           ├── socket_connect.rs # LSM socket_connect: TCP SYN blocking (-EPERM)
+│   │           └── socket_sendmsg.rs # LSM socket_sendmsg: UDP/RAW transfer mediation
+│   │
+│   ├── sentineld/                  # Root security daemon (Root, RAM < 30 MB)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs             # Entry point, runtime initialization, and event loop
+│   │       ├── lineage.rs          # Causal Lineage Tracker (ring LRU DAG with 8192 nodes)
+│   │       ├── risk_engine.rs      # Sub-millisecond risk evaluation across 7 transparent rules
+│   │       ├── verdict.rs          # Verdict router (LOW: Allow, GREY: Prompt, HIGH: Kill)
+│   │       ├── freeze.rs           # Freeze & Inspect Orchestrator (SIGSTOP, Fail-Closed 30s)
+│   │       ├── ipc_server.rs       # Unix IPC server (/run/sentinel.sock + SO_PEERCRED)
+│   │       ├── sha_cache.rs        # In-memory SHA-256 binary hash cache
+│   │       └── pkg_check.rs        # Binary origin verification via dpkg-query
+│   │
+│   ├── sentinelctl/                # Terminal management utility (CLI Triage)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── main.rs             # Commands: watch, monitor, unfreeze, status, export, whitelist
+│   │
+│   └── sentinel-gui/               # Native desktop alert UI (Slint, RAM < 30 MB)
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs             # Slint DSL incident dialog, Fail-Closed timer, and IPC client
+│
 ├── config/
-│   ├── config.toml        # Core firewall settings and whitelists
-│   └── rules.toml         # Risk Engine weights and thresholds
-├── README.md              # Documentation (Russian)
-├── README.en.md           # Documentation (English)
-└── ТЗ.txt                 # Full technical specification (v2.0)
+│   ├── config.toml                 # Protected secret paths, app whitelist, IPC settings
+│   └── rules.toml                  # Deterministic rule weights and risk category thresholds
+│
+├── systemd/
+│   └── sentineld.service           # systemd service unit file for automated daemon startup
+│
+├── Cargo.toml                      # Root Cargo Workspace configuration
+├── Cargo.lock                      # Locked dependency versions
+├── README.md                       # Documentation & User Guide (Russian)
+├── README.en.md                    # Documentation & User Guide (English)
+└── ТЗ.txt                          # Full technical specification (v2.0)
 ```
 
 ---
@@ -170,15 +220,15 @@ sentinel-rs/
 - [x] **Milestone 1: V2.0 Architecture & Design Specifications**
   - Removal of LLM dependencies, strict RAM budget < 30 MB.
   - Causal Lineage DAG & Deterministic Risk Engine design.
-- [ ] **Milestone 2: Shared Types (`sentinel-common`)**
-  - eBPF events, `ProcessNode`, and IPC serialization formats.
-- [ ] **Milestone 3: Kernel eBPF Module (`sentinel-ebpf`)**
-  - LSM hooks (`file_open`, `socket_connect`, `socket_sendmsg`, `sched_process_fork/exec`).
-- [ ] **Milestone 4: Daemon Engine (`sentineld`)**
-  - In-memory process LRU graph, `memfd` detection, interpreter inspection, risk scoring.
-- [ ] **Milestone 5: IPC & CLI (`sentinelctl watch`)**
-  - `SO_PEERCRED` validation, terminal interactive triage.
-- [ ] **Milestone 6: Native Slint GUI (`sentinel-gui`)**
-  - Incident prompt dialog with breadcrumbs, fail-closed countdown, system tray.
+- [x] **Milestone 2: Shared Types (`sentinel-common`)**
+  - eBPF events, `ProcessNode`, configuration parsing, and IPC serialization formats.
+- [x] **Milestone 3: Kernel eBPF Module (`sentinel-ebpf`)**
+  - LSM hooks (`file_open`, `socket_connect`, `socket_sendmsg`, `sched_process_fork/exec`), RingBuffer, and TaintMap.
+- [x] **Milestone 4: Daemon Engine (`sentineld`)**
+  - In-memory process LRU graph (8192 nodes), `memfd` detection, interpreter inspection, sub-millisecond risk scoring.
+- [x] **Milestone 5: IPC & CLI (`sentinelctl watch`)**
+  - `SO_PEERCRED` validation, terminal interactive triage (`watch`, `monitor`, `unfreeze`, `status`, `export`).
+- [x] **Milestone 6: Native Slint GUI (`sentinel-gui`)**
+  - Incident prompt dialog with breadcrumbs, risk gauge, fail-closed countdown, zero GPU/AVX2 requirements.
 - [ ] **Milestone 7: Zero-Drop NFQUEUE Integration (Phase 2 Prompt)**
 - [ ] **Milestone 8: Test Harness & Debian Package Packaging**

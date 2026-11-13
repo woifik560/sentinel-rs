@@ -166,22 +166,72 @@ sentinelctl whitelist add /usr/bin/curl
 
 ---
 
-## Структура Cargo Workspace
+## Структура проекта (Cargo Workspace)
+
+Проект организован в виде модульного Rust-воркспейса с четким разделением ответственности между ядром, демоном и пользовательскими клиентами:
 
 ```text
 sentinel-rs/
 ├── crates/
-│   ├── sentinel-common/   # Общие типы, структуры eBPF, IPC-сообщения, модель рисков
-│   ├── sentinel-ebpf/     # Программы ядра Linux (Aya eBPF, LSM-хуки, RingBuffer)
-│   ├── sentineld/         # Фоновый демон (Lineage Tracker, Risk Engine, IPC)
-│   ├── sentinelctl/       # Терминальный клиент (CLI, watch, monitor, export)
-│   └── sentinel-gui/      # Нативный GUI на Slint UI (всплывающие алерты, трей)
+│   ├── sentinel-common/            # Общая библиотека типов, протоколов и моделей
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Точка входа библиотеки
+│   │       ├── events.rs           # eBPF-события ядра (file_open, fork, exec, socket_connect)
+│   │       ├── process.rs          # ProcessNode, анализ интерпретаторов (python3, bash, node)
+│   │       ├── risk.rs             # Детерминированный движок риска (0..100) и веса правил
+│   │       ├── ipc.rs              # Форматы сообщений Unix IPC (PromptRequest, Verdict)
+│   │       ├── incident.rs         # Форматирование криминалистических отчетов (Human / JSON)
+│   │       └── config.rs           # Десериализация конфигураций config.toml и rules.toml
+│   │
+│   ├── sentinel-ebpf/              # Программы ядра Linux (Aya eBPF, LSM-хуки, карты)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Экспорт eBPF-структур и констант
+│   │       ├── maps.rs             # TaintMapManager, RingBuffer, pending_verdicts
+│   │       ├── loader.rs           # Загрузчик eBPF LSM и трассировочных программ
+│   │       └── programs/
+│   │           ├── mod.rs          # Модули программ ядра
+│   │           ├── file_open.rs    # LSM-хук file_open: App Scoping и пометка TAINTED
+│   │           ├── process_fork.rs # Трассировка fork: клонирование предков и таинта
+│   │           ├── process_exec.rs # Трассировка exec: инспекция cmdline и memfd_create
+│   │           ├── socket_connect.rs # LSM socket_connect: блокировка SYN (-EPERM)
+│   │           └── socket_sendmsg.rs # LSM socket_sendmsg: контроль UDP/RAW передачи
+│   │
+│   ├── sentineld/                  # Основной системный демон (Root, RAM < 30 MB)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs             # Точка входа, инициализация рантайма и event loop
+│   │       ├── lineage.rs          # Causal Lineage Tracker (кольцевой LRU DAG на 8192 узла)
+│   │       ├── risk_engine.rs      # Расчет суммарного риска по 7 прозрачным правилам (< 1 мс)
+│   │       ├── verdict.rs          # Маршрутизатор вердиктов (LOW: Allow, GREY: Prompt, HIGH: Kill)
+│   │       ├── freeze.rs           # Freeze & Inspect Orchestrator (SIGSTOP, Fail-Closed 30s)
+│   │       ├── ipc_server.rs       # Unix IPC сервер (/run/sentinel.sock + SO_PEERCRED)
+│   │       ├── sha_cache.rs        # In-memory кэш SHA-256 хешей исполняемых файлов
+│   │       └── pkg_check.rs        # Проверка происхождения бинарников через dpkg-query
+│   │
+│   ├── sentinelctl/                # Консольная утилита управления (CLI Triage)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── main.rs             # Команды: watch, monitor, unfreeze, status, export, whitelist
+│   │
+│   └── sentinel-gui/               # Легковесный Desktop UI (Slint, RAM < 30 MB)
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs             # Модальное окно алерта (Slint DSL), таймер и IPC-клиент
+│
 ├── config/
-│   ├── config.toml        # Основные настройки защиты и белые списки
-│   └── rules.toml         # Таблица весов и порогов Risk Engine
-├── README.md              # Документация (Русский)
-├── README.en.md           # Документация (English)
-└── ТЗ.txt                 # Полное техническое задание (v2.0)
+│   ├── config.toml                 # Пути к секретам, белый список приложений, настройки IPC
+│   └── rules.toml                  # Детерминированные веса правил и пороги категорий риска
+│
+├── systemd/
+│   └── sentineld.service           # Unit-файл systemd для автозапуска демона
+│
+├── Cargo.toml                      # Конфигурация корневого Cargo Workspace
+├── Cargo.lock                      # Зафиксированные версии зависимостей
+├── README.md                       # Документация и руководство (Русский)
+├── README.en.md                    # Documentation & User Guide (English)
+└── ТЗ.txt                          # Полное техническое задание проекта (v2.0)
 ```
 
 ---
@@ -204,15 +254,15 @@ sentinel-rs/
 - [x] **Этап 1: Архитектурные спецификации V2.0**
   - Исключение LLM-зависимостей, фиксация лимита памяти < 30 МБ.
   - Спецификация Causal Lineage DAG и детерминированного Risk Engine.
-- [ ] **Этап 2: Общие структуры и типы (`sentinel-common`)**
-  - Определение eBPF-событий, `ProcessNode`, IPC-протокола.
-- [ ] **Этап 3: eBPF-программы ядра (`sentinel-ebpf`)**
-  - LSM-хуки `file_open`, `socket_connect`, `socket_sendmsg`, `sched_process_fork/exec`.
-- [ ] **Этап 4: Демон `sentineld`**
-  - LRU-граф процессов, детекция `memfd`, инспекция интерпретаторов, расчет риска.
-- [ ] **Этап 5: IPC и консольный клиент (`sentinelctl`)**
-  - Проверка прав `SO_PEERCRED`, интерактивный режим `sentinelctl watch`.
-- [ ] **Этап 6: Десктопный GUI (`sentinel-gui` на Slint)**
-  - Верстка окна алерта с цепочкой breadcrumb, таймер Fail-Closed, системный трей.
+- [x] **Этап 2: Общие структуры и типы (`sentinel-common`)**
+  - Определение eBPF-событий, `ProcessNode`, IPC-протокола, парсинг конфигурации.
+- [x] **Этап 3: eBPF-программы ядра (`sentinel-ebpf`)**
+  - LSM-хуки `file_open`, `socket_connect`, `socket_sendmsg`, `sched_process_fork/exec`, RingBuffer и TaintMap.
+- [x] **Этап 4: Демон `sentineld`**
+  - LRU-граф процессов (8192 узла), детекция `memfd`, инспекция скриптов интерпретаторов, расчет риска за < 1 мс.
+- [x] **Этап 5: IPC и консольный клиент (`sentinelctl`)**
+  - Проверка прав `SO_PEERCRED`, интерактивный режим `sentinelctl watch`, `monitor`, `unfreeze`, `status`, `export`.
+- [x] **Этап 6: Десктопный GUI (`sentinel-gui` на Slint)**
+  - Верстка окна алерта с цепочкой breadcrumb, шкалой риска, таймер Fail-Closed (30с), отсутствие GPU/AVX2 зависимостей.
 - [ ] **Этап 7: Zero-Drop удержание через NFQUEUE (Этап 2 промпта)**
 - [ ] **Этап 8: Стендовые тесты и сборка deb-пакета**
