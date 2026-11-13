@@ -6,12 +6,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sentinel_common::events::{
-    encode_flow_mark, FlowContext, MAY_EXEC, MAY_READ, MAY_WRITE, SENTINEL_MARK_REVAL_BIT,
-    SENTINEL_SO_MARK_PREFIX,
+    decode_flow_mark, encode_flow_mark, FlowContext, MAY_EXEC, MAY_READ, MAY_WRITE,
+    SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
 };
 
 /// Bitflags representing taint states of a task or inode object.
@@ -265,8 +265,8 @@ pub struct TaintMapManager {
     allowed_tgids: Arc<RwLock<HashSet<u32>>>,
     /// Synchronous eBPF map `flow_mark_ctx` (mark -> FlowContext).
     flow_mark_ctx: Arc<RwLock<HashMap<u32, FlowContext>>>,
-    /// Monotonic sequence generator for dynamic flow marks.
-    flow_seq: Arc<AtomicU16>,
+    /// Monotonic sequence generator for dynamic flow marks (up to 23 bits).
+    flow_seq: Arc<AtomicU32>,
     /// PID of the verified sentinel-gui process for in-kernel ptrace protection.
     gui_pid: Arc<RwLock<Option<u32>>>,
     /// PID of the sentineld daemon process for self-defense.
@@ -335,7 +335,7 @@ impl TaintMapManager {
             .map(|t| t.taint_flags.0)
             .unwrap_or(0);
 
-        let seq = self.flow_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.flow_seq.fetch_add(1, Ordering::SeqCst) & SENTINEL_MARK_FLOW_ID_MASK;
         let mark = encode_flow_mark(seq, requires_reval);
 
         let ctx = FlowContext {
@@ -351,14 +351,27 @@ impl TaintMapManager {
         };
 
         let mut map = self.flow_mark_ctx.write().unwrap();
-        map.insert(mark, ctx);
+        map.insert(seq, ctx);
         mark
     }
 
     /// Look up FlowContext by packet mark (instant synchronous retrieval upon NFQUEUE arrival).
     pub fn lookup_flow_context(&self, mark: u32) -> Option<FlowContext> {
+        let (_, _, flow_id) = decode_flow_mark(mark);
         let map = self.flow_mark_ctx.read().unwrap();
-        map.get(&mark).copied()
+        map.get(&flow_id).copied()
+    }
+
+    /// Direct insertion of flow context by mark/flow_id (for testing and direct eBPF simulation).
+    pub fn insert_flow_context(&self, mark: u32, ctx: FlowContext) {
+        let (_, _, flow_id) = decode_flow_mark(mark);
+        let mut map = self.flow_mark_ctx.write().unwrap();
+        map.insert(flow_id, ctx);
+    }
+
+    /// Retrieve flow context by mark (alias for lookup_flow_context).
+    pub fn get_flow_context(&self, mark: u32) -> Option<FlowContext> {
+        self.lookup_flow_context(mark)
     }
 
     /// Register a thread (TID) under its process group leader (TGID).

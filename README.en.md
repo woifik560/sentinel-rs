@@ -29,8 +29,18 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
    - `lsm/ptrace_access_check` & Kernel Self-Defense: Blocks `ptrace`, `process_vm_readv/writev`, and `/proc/<pid>/mem` access against both `sentineld` and `sentinel-gui` from any process running under the same user UID.
 3. **Fast-Path & Slow-Path Separation via NFQUEUE**:
    - *Fast-Path in eBPF*: **Sub-microsecond in-kernel fast-path** on clean regular files with zero allocations or locks, eliminating I/O regressions during large project builds.
-   - *Synchronous Dynamic Mark Correlation*: Eliminates race conditions between NFQUEUE and RingBuffer. The kernel encodes a dynamic `mark = 0x5E170000 | flow_id` and records context in the `flow_mark_ctx` BPF map synchronously prior to packet departure.
-   - *Closing the Established Socket (`ct state established`) & UDP/QUIC Bypass*: If a process attempts exfiltration over a pre-opened socket, `lsm/socket_sendmsg` and `cgroup_skb/egress` tag the packet with revalidation mark `0x40000000 | flow_id`. In Netfilter, this mark check is evaluated **above** `ct state established accept`.
+   - *Synchronous Dynamic Mark Correlation with Zero Bit Collisions*: Eliminates race conditions between NFQUEUE and RingBuffer. Distinct bit allocation:
+     - Bits `[31:24]` = `0x5E` (Sentinel magic byte)
+     - Bit `[23]` = `0x00800000` (`REVAL_PREOPENED` flag)
+     - Bits `[22:0]` = `flow_id` (up to 8.3M active concurrent flows)
+     - New flow mark: `0x5E000000 | flow_id`
+     - Revalidation mark: `0x5E800000 | flow_id`
+     - In-kernel context is synchronously saved in `flow_mark_ctx` map by `flow_id` before packet departure.
+   - *Closing the Established Socket (`ct state established`) & UDP/QUIC Bypass*: If a process attempts exfiltration over a pre-opened socket, `lsm/socket_sendmsg` and `cgroup_skb/egress` tag the packet with `0x5E800000 | flow_id`. Netfilter rules are ordered:
+     1. `meta mark & 0xff800000 == 0x5e800000 counter queue num 100` (Reval Pre-Opened — prioritized above established!)
+     2. `ct state established,related accept` (Line-speed kernel fast-path)
+     3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100` (New SYN hold)
+     Zero bit collisions: clean flows (`0x5E00xxxx`) never trigger rule 1.
 4. **LoLBin Hardening & TOFU**:
    - Package trust discount (`-35`) is invalidated whenever a secret is accessed (`SECRET_NON_OWNER`) or when run via piped stdin or inline arguments.
    - Cryptographic integrity verification via SHA-256 with symlink canonicalization, root-ownership verification, and cache invalidation on write (`MAY_WRITE`) and rename/unlink.
@@ -39,8 +49,12 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
 5. **Dual-Socket Architecture & Strict GUI Peer Verification (P0)**:
    - **Dual Unix Domain Sockets**:
      - `/run/sentinel/sentinel-ro.sock` (0666): Public read-only socket for monitoring, status queries, and forensic exports (`sntctl monitor`, `sntctl status`, `sntctl export`).
-     - `/run/sentinel/sentinel.sock` (0750, root:root): Privileged management socket accepting verdicts **only** from `root` (UID 0) or cryptographically verified `sentinel-gui`.
-   - **Strict Peer Verification**: Validates `SO_PEERCRED`, checks `/proc/<pid>/exe`, verifies binary is owned by root and unwriteable by user, verifies `(dev, ino)` and SHA-256, and ensures environment variables (`LD_PRELOAD`, `LD_AUDIT`) have not been tampered with.
+     - `/run/sentinel/sentinel.sock` (0666, authenticated post-accept): Management socket accessible to unprivileged desktop GUI session without kernel `EACCES` errors.
+   - **Strict Peer Verification & TOCTOU Defense**:
+     - Validates `SO_PEERCRED` (`uid` and `pid`). Root granted administrative rights.
+     - Resolves canonical `/proc/<pid>/exe`, checks root ownership (`uid == 0`), non-writable permissions (`mode & 0o022 == 0`), and SHA-256.
+     - Inspects `/proc/<pid>/environ` to verify absence of `LD_PRELOAD` / `LD_AUDIT`.
+     - **Anti-TOCTOU `/proc/<pid>/maps` Inspection**: Even if a hostile library's constructor wiped `environ` in memory prior to `connect()`, the daemon inspects process memory maps. Executable mappings (`r-xp`) from `/tmp`, `/dev/shm`, `~`, or deleted files immediately terminate authorization.
    - **X11 Anti-Clickjacking Defense**: Detects X11 sessions and mandates entering an ephemeral 4-digit PIN for sensitive prompt actions.
 6. **Never-Freeze Allowlist & DoS Defense**:
    - Hardcoded protection list (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
@@ -90,8 +104,8 @@ flowchart TD
         LSM_UNIX["lsm/unix_may_send<br/>(D-Bus & systemd broker isolation)"]
         LSM_PTRACE["lsm/ptrace_access_check<br/>(Protects GUI & daemon from same-UID ptrace/mem snooping)"]
         
-        DYNAMIC_MARK["Synchronous eBPF Map:<br/>flow_mark_ctx (mark -> FlowContext)"]
-        NFQUEUE_HOOK["Netfilter / nftables<br/>1. meta mark & 0x40000000 (Reval Pre-Opened)<br/>2. ct state established accept<br/>3. meta mark & 0x5E170000 (NFQUEUE SYN Hold)"]
+        DYNAMIC_MARK["Synchronous eBPF Map:<br/>flow_mark_ctx (flow_id -> FlowContext)"]
+        NFQUEUE_HOOK["Netfilter / nftables<br/>1. meta mark & 0xff800000 == 0x5e800000 (Reval Pre-Opened)<br/>2. ct state established,related accept<br/>3. meta mark & 0xff800000 == 0x5e000000 (NFQUEUE SYN Hold)"]
         
         LSM_BPRM --> DYNAMIC_MARK
         LSM_FILE --> DYNAMIC_MARK
@@ -100,7 +114,7 @@ flowchart TD
     end
 
     subgraph Daemon["BACKGROUND DAEMON (sentineld, root, < 30 MB RAM)"]
-        MAP_READER["Synchronous reading of flow_mark_ctx by mark<br/>(Zero race condition against RingBuffer)"]
+        MAP_READER["Synchronous reading of flow_mark_ctx by flow_id<br/>(Zero race condition against RingBuffer)"]
         
         subgraph Engine["Deterministic Security Engine"]
             LINEAGE["Lineage Tracker (LRU graph 8192 nodes)"]
@@ -114,7 +128,7 @@ flowchart TD
         
         subgraph Sockets["Dual Sockets with Privilege Separation"]
             RO_SOCK["/run/sentinel/sentinel-ro.sock (0666)<br/>Read-Only: Status, monitoring, exports"]
-            MGMT_SOCK["/run/sentinel/sentinel.sock (0750)<br/>Privileged: GUI verification, SO_PEERCRED, PIN"]
+            MGMT_SOCK["/run/sentinel/sentinel.sock (0666)<br/>Privileged: SO_PEERCRED, exe, /proc/maps, PIN"]
         end
 
         MAP_READER --> LINEAGE

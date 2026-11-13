@@ -129,13 +129,14 @@ impl NfqueueHoldManager {
 
     /// Configure kernel nftables rule for diverting SO_MARK traffic to NFQUEUE.
     ///
-    /// # Performance & Fail-Closed Rules:
-    /// 1. Established Socket Re-evaluation: `meta mark & 0x40000000 != 0 counter queue num 100`
-    ///    is evaluated FIRST, before `ct state established accept`!
-    /// 2. Fast-Path: `ct state established accept` allows clean gigabit throughput inside the kernel.
-    ///    Notice: broad `related` is excluded to prevent conntrack helper bypasses!
-    /// 3. Slow-Path: `ct state new meta mark & 0xffff0000 == 0x5e170000 counter queue num 100`
+    /// # Performance & Zero Bit-Collision Rules:
+    /// 1. Established Socket Re-evaluation: `meta mark & 0xff800000 == 0x5e800000 counter queue num 100`
+    ///    is evaluated FIRST, before `ct state established,related accept`!
+    /// 2. Fast-Path: `ct state established,related accept` allows clean gigabit throughput inside the kernel.
+    /// 3. Slow-Path: `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100`
     ///    diverts all dynamic Sentinel flow marks to the userspace hold orchestrator.
+    ///
+    /// Uses disjoint bitmasks ([31:24]=0x5E, [23]=reval flag, [22:0]=flow_id) to eliminate any bit collision!
     pub fn setup_nftables_rule() -> anyhow::Result<()> {
         info!(
             "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({})",
@@ -145,9 +146,9 @@ impl NfqueueHoldManager {
         let setup_cmd = format!(
             "nft add table inet sentinel 2>/dev/null; \
              nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
-             nft add rule inet sentinel output meta mark & 0x40000000 != 0 counter queue num {} 2>/dev/null; \
-             nft add rule inet sentinel output ct state established accept 2>/dev/null; \
-             nft add rule inet sentinel output ct state new meta mark & 0xffff0000 == 0x5e170000 counter queue num {} 2>/dev/null",
+             nft add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {} 2>/dev/null; \
+             nft add rule inet sentinel output ct state established,related accept 2>/dev/null; \
+             nft add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {} 2>/dev/null",
             SENTINEL_NFQUEUE_NUM, SENTINEL_NFQUEUE_NUM
         );
 

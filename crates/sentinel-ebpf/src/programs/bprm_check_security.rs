@@ -31,6 +31,22 @@ pub fn is_memfd_or_fileless(path_str: &str) -> bool {
         || path_str.contains("(deleted)") && path_str.starts_with("/dev/shm")
 }
 
+/// Kernel-level check at execve time: prevents launching sentinel-gui with malicious LD_PRELOAD or LD_AUDIT.
+pub fn check_gui_secure_bprm(exe_path: &Path, envp_entries: &[&str]) -> Result<(), &'static str> {
+    let path_str = exe_path.to_string_lossy();
+    if path_str.ends_with("/sentinel-gui") || path_str == "sentinel-gui" {
+        for entry in envp_entries {
+            if entry.starts_with("LD_PRELOAD=") && entry.len() > "LD_PRELOAD=".len() {
+                return Err("-EPERM: LD_PRELOAD forbidden on sentinel-gui binary");
+            }
+            if entry.starts_with("LD_AUDIT=") && entry.len() > "LD_AUDIT=".len() {
+                return Err("-EPERM: LD_AUDIT forbidden on sentinel-gui binary");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute initial baseline trust profile bits for `TASK_STORAGE`.
 pub fn compute_baseline_profile(path: &Path) -> u32 {
     let path_str = path.to_string_lossy();

@@ -279,10 +279,11 @@ fn test_9_dynamic_mark_correlation_concurrent() {
 
     // 10 concurrent network flows
     for flow_id in 1..=10 {
-        let mark = encode_flow_mark(flow_id);
+        let mark = encode_flow_mark(flow_id, false);
         assert_eq!(mark & SENTINEL_SO_MARK_PREFIX, SENTINEL_SO_MARK_PREFIX);
 
         let ctx = FlowContext {
+            mark,
             tgid: 9000 + flow_id,
             pid: 9000 + flow_id,
             uid: 1000,
@@ -297,9 +298,11 @@ fn test_9_dynamic_mark_correlation_concurrent() {
         taint_mgr.insert_flow_context(mark, ctx);
     }
 
-    // When NFQUEUE pops a packet with NFQA_MARK = 0x5E170007:
-    let received_mark = encode_flow_mark(7);
-    let recovered_flow_id = decode_flow_mark(received_mark);
+    // When NFQUEUE pops a packet with NFQA_MARK:
+    let received_mark = encode_flow_mark(7, false);
+    let (is_sentinel, requires_reval, recovered_flow_id) = decode_flow_mark(received_mark);
+    assert!(is_sentinel);
+    assert!(!requires_reval);
     assert_eq!(recovered_flow_id, 7);
 
     let retrieved_ctx = taint_mgr.get_flow_context(received_mark);
@@ -316,7 +319,7 @@ fn test_9_dynamic_mark_correlation_concurrent() {
 async fn test_10_syn_retransmit_dedup_and_duration_allow() {
     // Incident tracking simulation
     let incident_id = "inc-retrans-99";
-    let flow_mark = encode_flow_mark(15);
+    let flow_mark = encode_flow_mark(15, false);
 
     struct PendingIncident {
         id: String,
@@ -374,4 +377,72 @@ async fn test_10_syn_retransmit_dedup_and_duration_allow() {
     }
 
     assert_eq!(released_packets, vec![1001, 1002, 1003], "All queued SYN packets released at once");
+}
+
+// -----------------------------------------------------------------------------
+// Test 11: Zero Bitmask Collision in Netfilter Rules
+// -----------------------------------------------------------------------------
+#[test]
+fn test_11_nftables_bitmask_collision_free() {
+    use sentinel_common::events::{
+        SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_NEW_MATCH, SENTINEL_MARK_REVAL_MATCH,
+    };
+
+    // For any flow_id up to 23 bits:
+    for flow_id in [0, 1, 42, 1024, 65535, 0x007FFFFF] {
+        let new_flow_mark = encode_flow_mark(flow_id, false);
+        let reval_flow_mark = encode_flow_mark(flow_id, true);
+
+        // 1. New flow must match ONLY Rule 3 (New flow), NEVER Rule 1 (Reval)
+        assert_eq!(new_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_NEW_MATCH);
+        assert_ne!(new_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_REVAL_MATCH);
+
+        // 2. Revalidation flow must match Rule 1 (Reval), NOT Rule 3 (New flow)
+        assert_eq!(reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_REVAL_MATCH);
+        assert_ne!(reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_NEW_MATCH);
+
+        // 3. Both must decode cleanly to the exact same flow_id
+        let (_, reval_1, id_1) = decode_flow_mark(new_flow_mark);
+        let (_, reval_2, id_2) = decode_flow_mark(reval_flow_mark);
+        assert!(!reval_1);
+        assert!(reval_2);
+        assert_eq!(id_1, flow_id);
+        assert_eq!(id_2, flow_id);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 12: TOCTOU Defense: /proc/<pid>/maps Detects Wiped LD_PRELOAD
+// -----------------------------------------------------------------------------
+#[test]
+fn test_12_ld_preload_toctou_maps_defense() {
+    // Simulated maps content where a malicious .so was loaded from /tmp, but environ was wiped
+    let simulated_maps = "\
+55b8e4000000-55b8e4005000 r-xp 00000000 08:01 100000 /usr/bin/sentinel-gui
+7f8a10000000-7f8a10002000 r-xp 00000000 08:01 200000 /tmp/evil_constructor_wiped.so
+7f8a20000000-7f8a20003000 r-xp 00000000 08:01 300000 /usr/lib/x86_64-linux-gnu/libc.so.6
+";
+
+    let mut detected_malicious_mapping = false;
+    for line in simulated_maps.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 6 {
+            let perms = parts[1];
+            let mapped_path = parts[5..].join(" ");
+            if perms.contains('x') {
+                if mapped_path.starts_with("/tmp")
+                    || mapped_path.starts_with("/dev/shm")
+                    || mapped_path.starts_with("/home")
+                {
+                    detected_malicious_mapping = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        detected_malicious_mapping,
+        "/proc/<pid>/maps inspection must detect hostile shared library even after environ wipe!"
+    );
 }

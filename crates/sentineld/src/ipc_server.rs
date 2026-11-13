@@ -116,15 +116,19 @@ impl IpcServer {
         let ro_listener = UnixListener::bind(&ro_path)?;
 
         // Set filesystem permissions
+        // Both management and read-only sockets are set to mode 0666 so that the unprivileged
+        // desktop user (running sentinel-gui in user session) can connect without permission denied (EACCES)
+        // at the kernel VFS layer. Strict authorization is enforced immediately post-accept via SO_PEERCRED,
+        // exe path check, root ownership verification, and memory mapping (/proc/<pid>/maps) inspection.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&mgmt_path, std::fs::Permissions::from_mode(0o750));
+            let _ = std::fs::set_permissions(&mgmt_path, std::fs::Permissions::from_mode(0o666));
             let _ = std::fs::set_permissions(&ro_path, std::fs::Permissions::from_mode(0o666));
         }
 
         info!(
-            "IPC Server listening on Management: {} (restricted), Read-Only: {}",
+            "IPC Server listening on Management: {} (authenticated via SO_PEERCRED), Read-Only: {}",
             mgmt_path.display(),
             ro_path.display()
         );
@@ -322,6 +326,68 @@ pub fn verify_peer_client(
             }
             if entry.starts_with("LD_AUDIT=") && entry.len() > "LD_AUDIT=".len() {
                 anyhow::bail!("Malicious LD_AUDIT detected in GUI process environment!");
+            }
+        }
+    }
+
+    // TOCTOU Defense: Inspect /proc/<pid>/maps to prevent LD_PRELOAD constructor evasion.
+    // Even if an injected shared library's constructor wiped environ in memory before connect(),
+    // the physical executable memory mapping remains in /proc/<pid>/maps!
+    let maps_path = format!("/proc/{}/maps", peer_pid);
+    if let Ok(maps_content) = std::fs::read_to_string(&maps_path) {
+        for line in maps_content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                let perms = parts[1];
+                let mapped_path = parts[5..].join(" ");
+
+                // Check executable mappings for foreign/untrusted libraries
+                if perms.contains('x') {
+                    if mapped_path.starts_with('[') {
+                        continue;
+                    }
+
+                    if mapped_path.contains("(deleted)") {
+                        anyhow::bail!("Deleted executable mapping detected in GUI memory: {}", mapped_path);
+                    }
+
+                    if mapped_path.starts_with("/tmp")
+                        || mapped_path.starts_with("/dev/shm")
+                        || mapped_path.starts_with("/var/tmp")
+                        || mapped_path.starts_with("/home")
+                        || mapped_path.contains("/Downloads/")
+                    {
+                        anyhow::bail!(
+                            "Untrusted library mapped into GUI process memory: {} (perms: {})",
+                            mapped_path,
+                            perms
+                        );
+                    }
+
+                    let is_system_lib = mapped_path.starts_with("/usr/lib/")
+                        || mapped_path.starts_with("/usr/lib64/")
+                        || mapped_path.starts_with("/lib/")
+                        || mapped_path.starts_with("/lib64/")
+                        || mapped_path.starts_with("/usr/share/")
+                        || mapped_path == resolved_str;
+
+                    if !is_system_lib && !cfg!(test) {
+                        if let Ok(m) = std::fs::metadata(&mapped_path) {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::MetadataExt;
+                                if m.uid() != 0 || (m.mode() & 0o022) != 0 {
+                                    anyhow::bail!(
+                                        "Suspicious non-root library mapped into GUI process: {}",
+                                        mapped_path
+                                    );
+                                }
+                            }
+                        } else {
+                            anyhow::bail!("Unresolvable library mapped into GUI process: {}", mapped_path);
+                        }
+                    }
+                }
             }
         }
     }

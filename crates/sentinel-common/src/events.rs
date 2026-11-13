@@ -7,23 +7,28 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-/// Legacy/Default Sentinel SO_MARK tag placed on suspicious or tainted sockets.
-pub const SENTINEL_SO_MARK: u32 = 0x5E170001;
+/// Legacy Sentinel SO_MARK tag placed on suspicious or tainted sockets.
+pub const SENTINEL_SO_MARK: u32 = 0x5E000001;
 
-/// 16-bit Magic prefix identifying Sentinel-RS marks: 0x5E17xxxx.
-pub const SENTINEL_SO_MARK_PREFIX: u32 = 0x5E170000;
-pub const SENTINEL_SO_MARK_MASK: u32 = 0xFFFF0000;
+/// Magic byte identifying Sentinel-RS marks in bits [31:24]: 0x5E000000.
+pub const SENTINEL_SO_MARK_PREFIX: u32 = 0x5E000000;
+pub const SENTINEL_SO_MARK_MAGIC_MASK: u32 = 0xFF000000;
 
-/// Re-evaluation bit (0x40000000) for packets belonging to already-established connections
-/// where a process subsequently became tainted. Placed higher than `ct state established` in Netfilter!
-pub const SENTINEL_MARK_REVAL_BIT: u32 = 0x40000000;
+/// Bit 23 (0x00800000) indicates re-evaluation for packets belonging to already-established connections.
+/// Cleanly separated from SENTINEL_SO_MARK_PREFIX (bits 31:24) with zero bit collision!
+pub const SENTINEL_MARK_REVAL_BIT: u32 = 0x00800000;
 
-/// 16-bit mask for dynamic flow sequence IDs.
-pub const SENTINEL_MARK_FLOW_ID_MASK: u32 = 0x0000FFFF;
+/// Mask for matching Sentinel prefix + reval flag in Netfilter: 0xFF800000.
+pub const SENTINEL_MARK_NETFILTER_MASK: u32 = 0xFF800000;
+pub const SENTINEL_MARK_REVAL_MATCH: u32 = 0x5E800000; // prefix | reval_bit (0x5E000000 | 0x00800000)
+pub const SENTINEL_MARK_NEW_MATCH: u32 = 0x5E000000;   // prefix only
+
+/// 23-bit mask for dynamic flow sequence IDs (bits 22..0: 0..8,388,607).
+pub const SENTINEL_MARK_FLOW_ID_MASK: u32 = 0x007FFFFF;
 
 /// Encode dynamic socket / packet mark with monotonic flow sequence ID.
-pub fn encode_flow_mark(flow_id: u16, requires_reval: bool) -> u32 {
-    let mut mark = SENTINEL_SO_MARK_PREFIX | (flow_id as u32 & SENTINEL_MARK_FLOW_ID_MASK);
+pub fn encode_flow_mark(flow_id: u32, requires_reval: bool) -> u32 {
+    let mut mark = SENTINEL_SO_MARK_PREFIX | (flow_id & SENTINEL_MARK_FLOW_ID_MASK);
     if requires_reval {
         mark |= SENTINEL_MARK_REVAL_BIT;
     }
@@ -31,10 +36,10 @@ pub fn encode_flow_mark(flow_id: u16, requires_reval: bool) -> u32 {
 }
 
 /// Decode a packet mark to determine whether it is managed by Sentinel, whether it requires re-eval, and its flow_id.
-pub fn decode_flow_mark(mark: u32) -> (bool, bool, u16) {
-    let is_sentinel = (mark & SENTINEL_SO_MARK_MASK) == SENTINEL_SO_MARK_PREFIX;
+pub fn decode_flow_mark(mark: u32) -> (bool, bool, u32) {
+    let is_sentinel = (mark & SENTINEL_SO_MARK_MAGIC_MASK) == SENTINEL_SO_MARK_PREFIX;
     let requires_reval = (mark & SENTINEL_MARK_REVAL_BIT) != 0;
-    let flow_id = (mark & SENTINEL_MARK_FLOW_ID_MASK) as u16;
+    let flow_id = mark & SENTINEL_MARK_FLOW_ID_MASK;
     (is_sentinel, requires_reval, flow_id)
 }
 

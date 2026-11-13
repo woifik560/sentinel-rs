@@ -29,8 +29,18 @@
    - `lsm/ptrace_access_check` и самозащита ядра: блокирует `ptrace`, `process_vm_readv/writev` и доступ к `/proc/<pid>/mem` как для демона `sentineld`, так и для интерфейса `sentinel-gui` от любых процессов пользователя того же UID.
 3. **Разделение Fast-Path и Slow-Path с удержанием в NFQUEUE**:
    - *Fast-Path в eBPF*: **субмикросекундный Fast-Path в пространстве ядра** при проверке `file_permission` без аллокаций и локов на чистых файлах, исключая I/O-просадки при компиляции.
-   - *Синхронная корреляция dynamic mark*: устранена гонка состояний между NFQUEUE и RingBuffer. Ядро формирует динамический `mark = 0x5E170000 | flow_id` и сохраняет контекст в BPF-карту `flow_mark_ctx` до отправки пакета. При получении пакета из очереди демон мгновенно читает контекст процесса.
-   - *Закрытие байпаса через `ct state established` и UDP/QUIC*: при попытке эксфильтрации через ранее открытый сокет связка `lsm/socket_sendmsg` + `cgroup_skb/egress` метит пакет флагом перепроверки `0x40000000 | flow_id`. В Netfilter правило проверки метки расположено **выше** `ct state established accept`, что делает невозможным слив через pre-opened сокеты.
+   - *Синхронная корреляция dynamic mark без битовых коллизий*: устранена гонка состояний между NFQUEUE и RingBuffer. Разделены биты метки:
+     - Биты `[31:24]` = `0x5E` (магический байт Sentinel)
+     - Бит `[23]` = `0x00800000` (флаг `REVAL_PREOPENED`)
+     - Биты `[22:0]` = `flow_id` (до 8.3 млн одновременных потоков)
+     - Новое соединение (SYN): `mark = 0x5E000000 | flow_id`
+     - Перепроверка открытого сокета: `mark = 0x5E800000 | flow_id`
+     - Контекст сохраняется в синхронную BPF-карту `flow_mark_ctx` по `flow_id` до отправки пакета. При получении пакета из очереди демон мгновенно читает контекст процесса.
+   - *Закрытие байпаса через `ct state established` и UDP/QUIC*: при попытке эксфильтрации через ранее открытый сокет связка `lsm/socket_sendmsg` + `cgroup_skb/egress` метит пакет флагом `0x5E800000 | flow_id`. В Netfilter правила выстроены строго:
+     1. `meta mark & 0xff800000 == 0x5e800000 counter queue num 100` (Reval Pre-Opened — выше established!)
+     2. `ct state established,related accept` (Fast-Path в ядре)
+     3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100` (New SYN hold)
+     Битовая коллизия полностью исключена: обычный поток `0x5E00xxxx` никогда не заденет правило №1.
 4. **Защита от LoLBin-атак (Living off the Land) и TOFU**:
    - Скидка доверия пакету dpkg (`-35`) блокируется, если процесс прочитал секрет (`SECRET_NON_OWNER`) или запущен из пайпа/inline-аргументов.
    - Проверка криптографической целостности бинарников по SHA-256 с канонизацией симлинков, проверкой владельца (`root:root`) и инвалидацией кэша при записи (`MAY_WRITE`) и переименовании (`unlink`/`rename`).
@@ -39,8 +49,12 @@
 5. **Разделение сокетов и строгая верификация GUI-клиента (P0)**:
    - **Два раздельных Unix-сокета**:
      - `/run/sentinel/sentinel-ro.sock` (0666): публичный read-only канал для команд мониторинга и статуса (`sntctl monitor`, `sntctl status`, `sntctl export`).
-     - `/run/sentinel/sentinel.sock` (0750, root:root): защищённый канал управления, принимающий вердикты **только** от `root` (UID 0) или криптографически верифицированного процесса `sentinel-gui`.
-   - **Строгая верификация peer-процесса**: проверка `SO_PEERCRED`, валидация канонического пути `/proc/<pid>/exe`, проверка root-владения бинарником, сверка `(dev, ino)` и SHA-256, проверка очистки переменных окружения от `LD_PRELOAD` и `LD_AUDIT`.
+     - `/run/sentinel/sentinel.sock` (0666, строгая аутентификация post-accept): канал управления, доступный для подключения непривилегированному десктопному GUI без ошибки ядра `EACCES`.
+   - **Строгая верификация peer-процесса и защита от TOCTOU**:
+     - Чтение `SO_PEERCRED` (`uid` и `pid`). Если `uid == 0`, выдаются права администратора.
+     - Валидация канонического пути `/proc/<pid>/exe`, проверка root-владения бинарником (`uid == 0`), прав (`mode & 0o022 == 0`) и SHA-256.
+     - Проверка очистки переменных окружения от `LD_PRELOAD` и `LD_AUDIT` через `/proc/<pid>/environ`.
+     - **Анти-TOCTOU инспекция `/proc/<pid>/maps`**: даже если вредоносный конструктор библиотеки очистил `environ` в памяти процесса перед вызовом `connect()`, демон сканирует карту памяти процесса. Наличие исполняемых отображений (`r-xp`) из `/tmp`, `/dev/shm`, `~` или удалённых файлов немедленно отклоняет подключение.
    - **Защита от X11-кликджекинга**: детекция X11-сессии и обязательный запрос динамического 4-значного PIN-кода для подтверждения чувствительных действий.
 6. **Предохранитель Never-Freeze Allowlist и защита от DoS**:
    - Жесткий список защиты рабочего стола (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
@@ -90,8 +104,8 @@ flowchart TD
         LSM_UNIX["lsm/unix_may_send<br/>(Изоляция D-Bus / systemd брокеров)"]
         LSM_PTRACE["lsm/ptrace_access_check<br/>(Защита GUI и демона от ptrace/mem того же UID)"]
         
-        DYNAMIC_MARK["Синхронная eBPF-карта:<br/>flow_mark_ctx (mark -> FlowContext)"]
-        NFQUEUE_HOOK["Netfilter / nftables<br/>1. meta mark & 0x40000000 (Reval Pre-Opened)<br/>2. ct state established accept<br/>3. meta mark & 0x5E170000 (NFQUEUE SYN Hold)"]
+        DYNAMIC_MARK["Синхронная eBPF-карта:<br/>flow_mark_ctx (flow_id -> FlowContext)"]
+        NFQUEUE_HOOK["Netfilter / nftables<br/>1. meta mark & 0xff800000 == 0x5e800000 (Reval Pre-Opened)<br/>2. ct state established,related accept<br/>3. meta mark & 0xff800000 == 0x5e000000 (NFQUEUE SYN Hold)"]
         
         LSM_BPRM --> DYNAMIC_MARK
         LSM_FILE --> DYNAMIC_MARK
@@ -100,7 +114,7 @@ flowchart TD
     end
 
     subgraph Daemon["ФОНОВЫЙ ДЕМОН (sentineld, root, < 30 MB RAM)"]
-        MAP_READER["Синхронное чтение flow_mark_ctx по mark<br/>(Без гонки состояний с RingBuffer)"]
+        MAP_READER["Синхронное чтение flow_mark_ctx по flow_id<br/>(Без гонки состояний с RingBuffer)"]
         
         subgraph Engine["Детерминированный Движок Безопасности"]
             LINEAGE["Lineage Tracker (LRU граф 8192 узлов)"]
@@ -114,7 +128,7 @@ flowchart TD
         
         subgraph Sockets["Двойной сокет с разделением привилегий"]
             RO_SOCK["/run/sentinel/sentinel-ro.sock (0666)<br/>Read-Only: статус, мониторинг, аудит"]
-            MGMT_SOCK["/run/sentinel/sentinel.sock (0750)<br/>Privileged: верификация GUI, SO_PEERCRED, PIN"]
+            MGMT_SOCK["/run/sentinel/sentinel.sock (0666)<br/>Privileged: SO_PEERCRED, exe, /proc/maps, PIN"]
         end
 
         MAP_READER --> LINEAGE
