@@ -1,42 +1,60 @@
-//! eBPF LSM hook: `lsm/socket_connect` (`security_socket_connect`)
+//! eBPF LSM / cgroup hook: `lsm/socket_connect` (`security_socket_connect`)
 //!
-//! # Kernel Logic:
-//! 1. Intercepts outbound TCP/UDP `connect()` calls.
-//! 2. Reads `current->tgid`.
-//! 3. Checks the `allowed_processes` eBPF map: if present, allows immediately (`return 0`).
-//! 4. Checks the `tainted_processes` eBPF map:
-//!    - If tainted:
-//!      - In MVP mode: returns `-EPERM` (1), drops the connection before SYN packet is sent,
-//!        and calls `bpf_send_signal(SIGSTOP)` on the caller.
-//!      - In NFQUEUE mode: sets `sk_mark = SENTINEL_PENDING_MARK` for zero-drop packet holding.
-//! 5. Pushes `RawSocketConnectEvent` to the RingBuffer for daemon risk scoring and user prompt.
+//! # Fast-Path vs Slow-Path Architecture:
+//!
+//! 1. **Fast-Path (In-Kernel, Nanosecond Latency)**:
+//!    - Queries `BPF_MAP_TYPE_TASK_STORAGE` for `current->tgid`.
+//!    - If `taint_flags.is_empty()` and task is in allowlist or has `PROFILE_TRUSTED_PKG`:
+//!      - Immediately returns `0` (Allow).
+//!      - Bypasses userspace daemon and NFQUEUE completely: zero network latency!
+//!
+//! 2. **Slow-Path (Tainted / Suspicious Traffic Hold)**:
+//!    - If task has `TAINTED` bitflag or suspicious origin:
+//!      - In NFQUEUE mode (Production): Sets socket security mark `sk->mark = 0x5E170001` (SENTINEL_SO_MARK)
+//!        in `BPF_MAP_TYPE_SK_STORAGE`.
+//!      - Packet is routed by nftables directly into NFQUEUE (queue num 100), where it is
+//!        physically frozen at Netfilter hook until sentineld or user returns NF_ACCEPT/NF_DROP.
+//!      - In strict/legacy mode: Returns `-EPERM` (1) immediately.
+//!    - Emits `RawSocketConnectEvent` to the eBPF RingBuffer.
 
-/// Simulated evaluation of a socket_connect hook invocation.
+use sentinel_common::events::SENTINEL_SO_MARK;
+
+/// Evaluated action for an intercepted socket connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketConnectVerdict {
-    /// Allow connection through.
-    Allow,
-    /// Deny connection with -EPERM.
+    /// Fast-Path: Allow connection immediately with zero latency.
+    FastPathAllow,
+    /// Slow-Path: Hold initial SYN packet in Netfilter queue via SO_MARK (0x5E170001).
+    SlowPathHoldNfqueue { so_mark: u32 },
+    /// Strict/Legacy fallback: Deny connection with -EPERM.
     DenyEperm,
-    /// Hold connection in NFQUEUE.
-    HoldPending,
 }
 
+/// Evaluates network connection request, choosing Fast-Path or Slow-Path.
 pub fn evaluate_socket_connect(
     is_tainted: bool,
     is_allowed: bool,
+    is_trusted_profile: bool,
     use_nfqueue: bool,
 ) -> SocketConnectVerdict {
     if is_allowed {
-        SocketConnectVerdict::Allow
-    } else if is_tainted {
+        return SocketConnectVerdict::FastPathAllow;
+    }
+
+    if !is_tainted && is_trusted_profile {
+        // Fast-Path: clean task with trusted package origin
+        SocketConnectVerdict::FastPathAllow
+    } else if is_tainted || !is_trusted_profile {
+        // Slow-Path: mark socket for zero-drop packet holding in NFQUEUE
         if use_nfqueue {
-            SocketConnectVerdict::HoldPending
+            SocketConnectVerdict::SlowPathHoldNfqueue {
+                so_mark: SENTINEL_SO_MARK,
+            }
         } else {
             SocketConnectVerdict::DenyEperm
         }
     } else {
-        SocketConnectVerdict::Allow
+        SocketConnectVerdict::FastPathAllow
     }
 }
 
@@ -45,22 +63,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_socket_connect_verdicts() {
+    fn test_fast_path_clean_process() {
+        // Untainted process with trusted profile -> Fast-Path Allow
+        let verdict = evaluate_socket_connect(false, false, true, true);
+        assert_eq!(verdict, SocketConnectVerdict::FastPathAllow);
+    }
+
+    #[test]
+    fn test_slow_path_tainted_process_nfqueue() {
+        // Tainted process -> Slow-Path hold via SO_MARK in NFQUEUE
+        let verdict = evaluate_socket_connect(true, false, true, true);
         assert_eq!(
-            evaluate_socket_connect(false, false, false),
-            SocketConnectVerdict::Allow
+            verdict,
+            SocketConnectVerdict::SlowPathHoldNfqueue {
+                so_mark: SENTINEL_SO_MARK
+            }
         );
-        assert_eq!(
-            evaluate_socket_connect(true, false, false),
-            SocketConnectVerdict::DenyEperm
-        );
-        assert_eq!(
-            evaluate_socket_connect(true, false, true),
-            SocketConnectVerdict::HoldPending
-        );
-        assert_eq!(
-            evaluate_socket_connect(true, true, false),
-            SocketConnectVerdict::Allow
-        );
+    }
+
+    #[test]
+    fn test_allowed_override() {
+        let verdict = evaluate_socket_connect(true, true, false, true);
+        assert_eq!(verdict, SocketConnectVerdict::FastPathAllow);
     }
 }

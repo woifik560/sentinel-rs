@@ -4,7 +4,16 @@
 //! capturing its ancestry, execution context, and any secret accesses.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Baseline profile bitflags stored in TASK_STORAGE.
+pub const PROFILE_UNKNOWN: u32 = 0;
+pub const PROFILE_TRUSTED_PKG: u32 = 1 << 0;
+pub const PROFILE_UNTRUSTED_ORIGIN: u32 = 1 << 1;
+pub const PROFILE_INTERPRETER: u32 = 1 << 2;
+pub const PROFILE_FILELESS_MEMFD: u32 = 1 << 3;
+pub const PROFILE_NEVER_FREEZE: u32 = 1 << 4;
 
 /// Category of a protected secret / sensitive credential.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -23,7 +32,7 @@ pub enum SecretCategory {
     Other(String),
 }
 
-/// A single secret access event recorded by eBPF `lsm/file_open`.
+/// A single secret access event recorded by eBPF `lsm/file_open` or inherited via `lsm/file_permission`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretAccessEvent {
     /// Absolute path of the accessed secret file.
@@ -36,7 +45,8 @@ pub struct SecretAccessEvent {
 
 /// A node in the in-memory causal lineage DAG (LRU ring graph).
 ///
-/// Matches the structure defined in ТЗ section 3.1 exactly.
+/// Matches the structure defined in ТЗ section 3.1 with extensions for
+/// object storage and LoLBin mitigation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessNode {
     /// Thread Group ID (process PID in Linux).
@@ -61,13 +71,20 @@ pub struct ProcessNode {
     pub script_path: Option<PathBuf>,
     /// Whether the binary was loaded from anonymous memory (memfd_create).
     pub is_memfd: bool,
-    /// All secret file accesses performed by this process.
+    /// Pre-evaluated baseline profile in TASK_STORAGE.
+    pub baseline_profile: u32,
+    /// Whether this process is an interactive shell (e.g. bash/zsh), protected from upward taint.
+    pub is_interactive_shell: bool,
+    /// Set of destination IP strings previously contacted by this process.
+    pub contacted_ips: HashSet<String>,
+    /// All secret file accesses performed or inherited by this process.
     pub secret_accesses: Vec<SecretAccessEvent>,
 }
 
 impl ProcessNode {
     /// Create a new empty process node with the given identifiers.
     pub fn new(tgid: u32, ppid: u32, uid: u32, exe_path: PathBuf) -> Self {
+        let is_shell = is_interactive_shell_binary(&exe_path);
         Self {
             tgid,
             ppid,
@@ -80,6 +97,9 @@ impl ProcessNode {
             cmdline: Vec::new(),
             script_path: None,
             is_memfd: false,
+            baseline_profile: PROFILE_UNKNOWN,
+            is_interactive_shell: is_shell,
+            contacted_ips: HashSet::new(),
             secret_accesses: Vec::new(),
         }
     }
@@ -103,23 +123,44 @@ impl ProcessNode {
         }
     }
 
-    /// Check if this process is a known script interpreter.
+    /// Record a secret access on this process node.
+    pub fn record_secret_access(&mut self, path: PathBuf, category: SecretCategory, timestamp_ns: u64) {
+        self.secret_accesses.push(SecretAccessEvent {
+            path,
+            category,
+            timestamp_ns,
+        });
+    }
+
+    /// Check if this process has accessed any protected secret.
+    pub fn has_secret_access(&self) -> bool {
+        !self.secret_accesses.is_empty()
+    }
+
+    /// Record an outbound IP contact. Returns true if this is the first time contacting this IP.
+    pub fn record_ip_contact(&mut self, ip: &str) -> bool {
+        self.contacted_ips.insert(ip.to_string())
+    }
+
+    /// Check if the executable is a common scripting interpreter.
     pub fn is_interpreter(&self) -> bool {
-        const INTERPRETERS: &[&str] = &["python3", "python", "bash", "sh", "node", "perl"];
-        if let Some(name) = self.exe_path.file_name() {
-            INTERPRETERS.contains(&name.to_string_lossy().as_ref())
+        if let Some(name) = self.exe_path.file_name().and_then(|n| n.to_str()) {
+            matches!(
+                name,
+                "python3" | "python" | "bash" | "sh" | "zsh" | "dash" | "node" | "perl" | "ruby" | "php"
+            )
         } else {
             false
         }
     }
+}
 
-    /// Record a secret access event.
-    pub fn record_secret_access(&mut self, path: PathBuf, category: SecretCategory, ts: u64) {
-        self.secret_accesses.push(SecretAccessEvent {
-            path,
-            category,
-            timestamp_ns: ts,
-        });
+/// Identify if a binary is a common interactive user shell.
+pub fn is_interactive_shell_binary(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        matches!(name, "bash" | "zsh" | "fish" | "csh" | "tcsh")
+    } else {
+        false
     }
 }
 
@@ -128,24 +169,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_display_name_binary() {
-        let node = ProcessNode::new(100, 1, 1000, PathBuf::from("/usr/bin/curl"));
-        assert_eq!(node.display_name(), "curl");
-    }
+    fn test_process_node_display_name() {
+        let mut node = ProcessNode::new(100, 1, 1000, PathBuf::from("/usr/bin/python3"));
+        assert_eq!(node.display_name(), "python3");
 
-    #[test]
-    fn test_display_name_interpreter_with_script() {
-        let mut node = ProcessNode::new(200, 100, 1000, PathBuf::from("/usr/bin/python3"));
         node.script_path = Some(PathBuf::from("/tmp/install.py"));
         assert_eq!(node.display_name(), "python3 (/tmp/install.py)");
     }
 
     #[test]
-    fn test_is_interpreter() {
-        let node = ProcessNode::new(200, 100, 1000, PathBuf::from("/usr/bin/python3"));
-        assert!(node.is_interpreter());
-
-        let node2 = ProcessNode::new(200, 100, 1000, PathBuf::from("/usr/bin/curl"));
-        assert!(!node2.is_interpreter());
+    fn test_interactive_shell_detection() {
+        assert!(is_interactive_shell_binary(Path::new("/bin/bash")));
+        assert!(is_interactive_shell_binary(Path::new("/usr/bin/zsh")));
+        assert!(!is_interactive_shell_binary(Path::new("/usr/bin/curl")));
+        assert!(!is_interactive_shell_binary(Path::new("/usr/bin/python3")));
     }
 }

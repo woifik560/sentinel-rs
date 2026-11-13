@@ -1,7 +1,8 @@
 //! sentineld — Root security daemon for Sentinel-RS.
 //!
-//! Integrates eBPF kernel probes, Causal Lineage DAG, Transparent Risk Engine,
-//! and Freeze & Inspect Interactive Prompt over Unix IPC.
+//! Integrates eBPF kernel object storages (TASK_STORAGE, INODE_STORAGE, SK_STORAGE),
+//! Causal Lineage DAG, LoLBin-hardened Risk Engine, Zero-Drop NFQUEUE network holding,
+//! and Never-Freeze interactive prompt over Unix IPC.
 
 #![allow(dead_code)]
 
@@ -14,9 +15,10 @@ use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 
 use sentinel_common::config::{RulesConfig, SentinelConfig};
-use sentinel_common::events::EbpfEvent;
+use sentinel_common::events::{EbpfEvent, MAY_READ};
 use sentinel_common::incident::IncidentReport;
 use sentinel_common::ipc::{IpcMessage, PromptRequest};
+use sentinel_common::process::SecretCategory;
 use sentinel_common::risk::Verdict;
 use sentinel_ebpf::loader::{EbpfLoader, LoaderConfig};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
@@ -49,6 +51,10 @@ struct Cli {
     #[arg(short, long, default_value = "/etc/sentinel/rules.toml")]
     rules: PathBuf,
 
+    /// Run in silent observer / soak audit mode (Milestone 1)
+    #[arg(long)]
+    audit_only: bool,
+
     /// Enable verbose debug logging
     #[arg(short, long)]
     verbose: bool,
@@ -73,10 +79,14 @@ async fn main() -> anyhow::Result<()> {
     let config_path = resolve_config_path(&cli.config, "config/config.toml");
     let rules_path = resolve_config_path(&cli.rules, "config/rules.toml");
 
-    let config = SentinelConfig::load_from_file(&config_path).unwrap_or_else(|e| {
+    let mut config = SentinelConfig::load_from_file(&config_path).unwrap_or_else(|e| {
         warn!("Could not load config from {}: {}. Using defaults.", config_path.display(), e);
         SentinelConfig::default()
     });
+
+    if cli.audit_only {
+        config.general.audit_only = true;
+    }
 
     let rules = RulesConfig::load_from_file(&rules_path).unwrap_or_else(|e| {
         warn!("Could not load rules from {}: {}. Using defaults.", rules_path.display(), e);
@@ -85,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Loaded configuration from {}", config_path.display());
     info!("Loaded rules from {}", rules_path.display());
+    if config.general.audit_only {
+        info!("RUNNING IN AUDIT-ONLY / SOAK MODE (Milestone 1): Actions will be logged without blocking.");
+    }
 
     // 2. Initialize Core Engine Modules
     let dpkg_checker = DpkgChecker::new();
@@ -93,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
     let risk_engine = Arc::new(RiskEngine::new(rules.clone(), dpkg_checker));
     let verdict_router = Arc::new(VerdictRouter::new(rules));
     let freeze_orchestrator = FreezeInspectOrchestrator::new(config.general.prompt_timeout_secs);
+
+    // Initialize nftables holding rule for NFQUEUE
+    let _ = freeze_orchestrator.init_network_holding();
 
     // 3. Initialize and Start IPC Server
     let ipc_server = Arc::new(IpcServer::new(
@@ -116,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             let expired = freeze_reaper.check_timeouts();
             if !expired.is_empty() {
-                warn!("Fail-Closed reaper terminated expired TGIDs: {:?}", expired);
+                warn!("Fail-Closed reaper dropped held packets for expired TGIDs: {:?}", expired);
             }
         }
     });
@@ -157,6 +173,38 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            EbpfEvent::FilePermission { tgid, uid: _, ref path, dev, ino, mask, is_pipe, is_fifo } => {
+                if let Some(_taint) = taint_mgr.handle_file_permission(tgid, dev, ino, path, mask, is_pipe, is_fifo) {
+                    let is_read = (mask & MAY_READ) != 0;
+                    if is_read {
+                        warn!(
+                            "Data-flow taint propagation: TGID {} inherited taint via pipe/file {}",
+                            tgid, path.display()
+                        );
+                        let now_ns = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        lineage_tracker.record_secret_access(
+                            tgid,
+                            path.clone(),
+                            SecretCategory::Other(format!("Pipe/FIFO Taint: {}", path.display())),
+                            now_ns,
+                        );
+                    }
+                }
+            }
+
+            EbpfEvent::BprmCheckSecurity { tgid, uid: _, ref exe_path, dev: _, ino: _, is_memfd } => {
+                if is_memfd {
+                    warn!("LSM bprm_check_security: anonymous memfd_create execution detected for TGID {}", tgid);
+                    if let Some(mut node) = lineage_tracker.get(tgid) {
+                        node.is_memfd = true;
+                        lineage_tracker.insert(node);
+                    }
+                }
+            }
+
             EbpfEvent::ProcessFork { parent_tgid, child_tgid } => {
                 taint_mgr.inherit_fork(parent_tgid, child_tgid);
                 lineage_tracker.handle_fork(parent_tgid, child_tgid);
@@ -166,10 +214,15 @@ async fn main() -> anyhow::Result<()> {
                 lineage_tracker.handle_exec(tgid, exe_path, cmdline);
             }
 
-            EbpfEvent::SocketConnect { tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _ } => {
+            EbpfEvent::SocketConnect { tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark: _ } => {
                 let dest_ip = dst_ipv4
                     .map(|ip| ip.to_string())
                     .or_else(|| dst_ipv6.map(|ip| ip.to_string()));
+
+                let is_first_seen_ip = dest_ip
+                    .as_ref()
+                    .map(|ip| lineage_tracker.record_ip_contact(tgid, ip))
+                    .unwrap_or(false);
 
                 let now_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -180,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
                     dest_ip: dest_ip.clone(),
                     dest_port: dst_port,
                     has_dns_record: false,
+                    is_first_seen_ip,
                     current_time_ns: now_ns,
                 };
 
@@ -223,6 +277,16 @@ async fn main() -> anyhow::Result<()> {
                     ipc_server.store_incident_json(incident_id.clone(), json).await;
                 }
 
+                if config.general.audit_only {
+                    info!("[AUDIT ONLY] Verdict {:?} for TGID {} (score: {})", verdict, tgid, score.total);
+                    ipc_server.broadcast_event(IpcMessage::Event {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        summary: format!("[AUDIT] {}", report.human_summary),
+                        risk_score: Some(score.total),
+                    });
+                    continue;
+                }
+
                 match verdict {
                     Verdict::Low => {
                         // Allow and broadcast event
@@ -233,9 +297,14 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                     Verdict::Grey => {
-                        // Freeze process and present prompt
-                        let _ = freeze_orchestrator.freeze(tgid);
-                        freeze_orchestrator.register_prompt(incident_id.clone(), tgid);
+                        // Hold network packet in NFQUEUE via SO_MARK (0x5E170001) without freezing process
+                        let exe_name = node
+                            .exe_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        freeze_orchestrator.hold_network(incident_id.clone(), tgid, exe_name, None);
 
                         let expires_at = SystemTime::now()
                             .checked_add(Duration::from_secs(config.general.prompt_timeout_secs))
@@ -260,8 +329,8 @@ async fn main() -> anyhow::Result<()> {
                         ipc_server.broadcast_prompt(prompt);
                     }
                     Verdict::High => {
-                        // Immediate freeze and block
-                        let _ = freeze_orchestrator.freeze(tgid);
+                        // Immediate freeze and block (respecting Never-Freeze Allowlist)
+                        let _ = freeze_orchestrator.freeze_process(tgid, &node.exe_path);
                         ipc_server.broadcast_event(IpcMessage::Event {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             summary: report.human_summary,
@@ -271,8 +340,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::SocketSendmsg { tgid, addr_family: _, dst_ipv4: _, dst_ipv6: _, dst_port } => {
-                // Similar handling for connectionless UDP
+            EbpfEvent::SocketSendmsg { tgid, addr_family: _, dst_ipv4: _, dst_ipv6: _, dst_port, so_mark: _ } => {
                 warn!("Intercepted UDP sendmsg for TGID {} -> port {}", tgid, dst_port);
             }
         }

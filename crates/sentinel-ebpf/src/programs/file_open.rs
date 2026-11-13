@@ -1,17 +1,20 @@
 //! eBPF LSM hook: `lsm/file_open` (`security_file_open`)
 //!
 //! # Kernel Logic:
-//! 1. Inspects the file path opened by `current->tgid`.
-//! 2. Matches against known sensitive paths:
-//!    - SSH keys: `~/.ssh/id_*`, `~/.ssh/config`
-//!    - GPG keys: `~/.gnupg/private-keys-v1.d/`, `secring.gpg`
-//!    - Telegram: `~/.local/share/TelegramDesktop/tdata/`
-//!    - Browsers: `~/.config/google-chrome/*/Cookies`, `~/.mozilla/firefox/*.default*/cookies.sqlite`
+//! 1. Intercepts file open operations for `current->tgid`.
+//! 2. Matches against strictly private credentials using Taint Hygiene rules:
+//!    - Strictly private SSH keys: `~/.ssh/id_*` (excludes `*.pub`, `config`, `known_hosts`)
+//!    - GPG private keys: `~/.gnupg/private-keys-v1.d/`, `secring.gpg`
+//!    - Telegram desktop session data: `~/.local/share/TelegramDesktop/tdata/`
+//!    - Browser login credentials and cookies: `Cookies`, `cookies.sqlite`, `Login Data`
 //!    - Crypto wallets: `~/.electrum/wallets/`, `~/.bitcoin/wallets/`
-//! 3. Checks if the binary has legitimate App Scope ownership.
+//! 3. Checks if caller binary has legitimate App Scope ownership.
 //! 4. If non-owner access is detected:
-//!    - Sets the `TAINTED` flag for the current TGID in the `tainted_processes` eBPF map.
+//!    - Marks the calling task in `BPF_MAP_TYPE_TASK_STORAGE` with the `TAINTED` bitflag.
 //!    - Submits a `RawFileOpenEvent` to the eBPF `RingBuffer` for daemon analysis.
+
+use crate::maps::TaintHygiene;
+use sentinel_common::process::SecretCategory;
 
 /// Description of the `lsm/file_open` eBPF hook configuration.
 #[derive(Debug, Clone)]
@@ -29,37 +32,57 @@ impl Default for FileOpenHookConfig {
     }
 }
 
-/// Simulation helper for validating file_open events in user-space testing.
+/// Simulation helper for validating file_open events in user-space testing and runtime.
 pub fn simulate_file_open_check(
     path_str: &str,
     current_exe: &str,
-) -> Option<sentinel_common::process::SecretCategory> {
-    use sentinel_common::process::SecretCategory;
+) -> Option<SecretCategory> {
+    // 1. Enforce Taint Hygiene: Ignore non-private files (.pub, config, known_hosts)
+    if !TaintHygiene::is_strictly_private_secret(path_str) {
+        return None;
+    }
 
-    if path_str.contains("/.ssh/id_") || path_str.ends_with("/.ssh/id_rsa") || path_str.ends_with("/.ssh/id_ed25519") {
-        if !current_exe.ends_with("/ssh") && !current_exe.ends_with("/ssh-add") && !current_exe.ends_with("/git") {
+    // 2. SSH Keys App Scope validation
+    if path_str.contains("/.ssh/") {
+        if !current_exe.ends_with("/ssh")
+            && !current_exe.ends_with("/ssh-add")
+            && !current_exe.ends_with("/scp")
+            && !current_exe.ends_with("/sftp")
+            && !current_exe.ends_with("/git")
+        {
             return Some(SecretCategory::SshKey);
         }
     }
 
+    // 3. GPG Keys App Scope validation
     if path_str.contains("/.gnupg/") {
-        if !current_exe.ends_with("/gpg") && !current_exe.ends_with("/gpg-agent") {
+        if !current_exe.ends_with("/gpg")
+            && !current_exe.ends_with("/gpg-agent")
+            && !current_exe.ends_with("/gpg2")
+        {
             return Some(SecretCategory::GpgKey);
         }
     }
 
+    // 4. Telegram Desktop App Scope validation
     if path_str.contains("/TelegramDesktop/tdata") {
         if !current_exe.ends_with("/Telegram") && !current_exe.ends_with("/telegram-desktop") {
             return Some(SecretCategory::TelegramData);
         }
     }
 
+    // 5. Browser Credentials App Scope validation
     if path_str.contains("cookies.sqlite") || path_str.contains("/Cookies") || path_str.contains("/Login Data") {
-        if !current_exe.ends_with("/firefox") && !current_exe.ends_with("/chrome") && !current_exe.ends_with("/chromium") {
+        if !current_exe.ends_with("/firefox")
+            && !current_exe.ends_with("/chrome")
+            && !current_exe.ends_with("/chromium")
+            && !current_exe.ends_with("/brave")
+        {
             return Some(SecretCategory::BrowserCookies);
         }
     }
 
+    // 6. Crypto Wallets
     if path_str.contains("/.electrum/wallets") || path_str.contains("/.bitcoin/wallets") {
         return Some(SecretCategory::CryptoWallet);
     }

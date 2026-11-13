@@ -4,6 +4,9 @@
 mode = "balanced"            # strict | balanced | learning
 prompt_timeout_secs = 30     # Таймаут интерактивного ответа до Fail-Closed (сек)
 ring_buffer_size = 8192      # Размер LRU кэша цепочки процессов
+so_mark = 0x5E170001         # Ядерная метка пакетов для Netfilter (SO_MARK)
+nfqueue_num = 100            # Номер очереди NFQUEUE для бесшовного удержания SYN-пакетов
+audit_only = false           # Режим "Тихий наблюдатель" (Веха 1 / Soak Mode)
 
 [socket]
 path = "/run/sentinel/sentinel.sock"

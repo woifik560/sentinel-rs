@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::events::{SENTINEL_NFQUEUE_NUM, SENTINEL_SO_MARK};
 use crate::risk::RiskThresholds;
 
 /// General daemon configuration.
@@ -18,6 +19,14 @@ pub struct GeneralConfig {
     pub prompt_timeout_secs: u64,
     #[serde(default = "default_ring_buffer_size")]
     pub ring_buffer_size: usize,
+    #[serde(default = "default_so_mark")]
+    pub so_mark: u32,
+    #[serde(default = "default_nfqueue_num")]
+    pub nfqueue_num: u16,
+    #[serde(default = "default_false")]
+    pub audit_only: bool,
+    #[serde(default = "default_never_freeze_list")]
+    pub never_freeze_allowlist: Vec<String>,
 }
 
 fn default_mode() -> String {
@@ -32,12 +41,63 @@ fn default_ring_buffer_size() -> usize {
     8192
 }
 
+fn default_so_mark() -> u32 {
+    SENTINEL_SO_MARK
+}
+
+fn default_nfqueue_num() -> u16 {
+    SENTINEL_NFQUEUE_NUM
+}
+
+fn default_false() -> bool {
+    false
+}
+
+pub fn default_never_freeze_list() -> Vec<String> {
+    vec![
+        "systemd".into(),
+        "systemd-journald".into(),
+        "systemd-logind".into(),
+        "systemd-resolved".into(),
+        "systemd-udevd".into(),
+        "dbus-daemon".into(),
+        "dbus-broker".into(),
+        "gnome-shell".into(),
+        "kwin_x11".into(),
+        "kwin_wayland".into(),
+        "sway".into(),
+        "hyprland".into(),
+        "mutter".into(),
+        "weston".into(),
+        "Xwayland".into(),
+        "Xorg".into(),
+        "pipewire".into(),
+        "pipewire-pulse".into(),
+        "wireplumber".into(),
+        "NetworkManager".into(),
+        "wpa_supplicant".into(),
+        "sentinel-gui".into(),
+        "sentinelctl".into(),
+        "gnome-terminal".into(),
+        "kitty".into(),
+        "alacritty".into(),
+        "konsole".into(),
+        "foot".into(),
+        "wezterm".into(),
+        "xterm".into(),
+    ]
+}
+
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             mode: default_mode(),
             prompt_timeout_secs: default_prompt_timeout(),
             ring_buffer_size: default_ring_buffer_size(),
+            so_mark: default_so_mark(),
+            nfqueue_num: default_nfqueue_num(),
+            audit_only: default_false(),
+            never_freeze_allowlist: default_never_freeze_list(),
         }
     }
 }

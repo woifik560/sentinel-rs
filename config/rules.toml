@@ -2,28 +2,33 @@
 
 [thresholds]
 low_max = 39      # 0..39: Разрешить и записать в аудит-лог
-grey_max = 74     # 40..74: Интерактивный запрос пользователю (Freeze & Inspect)
-high_min = 75     # 75..100: Мгновенная блокировка (-EPERM) и SIGSTOP
+grey_max = 74     # 40..74: Интерактивный запрос пользователю (Freeze & Inspect via NFQUEUE)
+high_min = 75     # 75..100: Мгновенная блокировка (NF_DROP / -EPERM) и опциональный SIGSTOP/SIGKILL
 
 [rules.fileless_memfd]
 id = "FILELESS_MEMFD"
 weight = 50
-description = "Исполнение кода напрямую из оперативной памяти (memfd_create)"
+description = "Исполнение кода напрямую из оперативной памяти (memfd_create / anonymous memory)"
 
 [rules.secret_non_owner]
 id = "SECRET_NON_OWNER"
 weight = 40
-description = "Чтение защищённого секрета процессом, не являющимся владельцем по App Scope"
+description = "Чтение защищённого секрета или наследование taint через pipe/файл процессом вне App Scope"
 
 [rules.untrusted_binary_origin]
 id = "UNTRUSTED_BINARY_ORIGIN"
 weight = 25
-description = "Исполняемый файл или скрипт запущен из /tmp, /dev/shm, ~/Downloads или не принадлежит dpkg"
+description = "Исполняемый файл или скрипт запущен из /tmp, /dev/shm, ~/Downloads или не верифицирован в dpkg"
 
 [rules.suspicious_interpreter]
 id = "SUSPICIOUS_INTERPRETER"
 weight = 20
 description = "Интерпретатор запущен с inline-кодом (-c, -e), eval, base64 или получен через pipe"
+
+[rules.first_seen_destination]
+id = "FIRST_SEEN_DESTINATION"
+weight = 15
+description = "Первое подключение процесса к внешнему публичному IP-адресу (вне RFC1918 и loopback)"
 
 [rules.fast_exfil_burst]
 id = "FAST_EXFIL_BURST"
@@ -38,4 +43,4 @@ description = "Подключение напрямую по IP-адресу бе
 [rules.trusted_package_context]
 id = "TRUSTED_PACKAGE_CONTEXT"
 weight = -35
-description = "Бинарник верифицирован в пакетах системы (dpkg) и запущен в штатном контексте"
+description = "Бинарник верифицирован в пакетах системы (dpkg) и запущен в штатном контексте (не действует при наличии Taint!)"

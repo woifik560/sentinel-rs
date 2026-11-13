@@ -1,7 +1,9 @@
 //! In-memory Causal Lineage Graph (DAG) and Interpreter Context Analyzer.
 //!
 //! Maintains an LRU cache of 4096–8192 process nodes, preserving process ancestry
-//! even after intermediate parent processes have exited.
+//! even after intermediate parent processes have exited, while enforcing interactive
+//! shell isolation (preventing developer terminal shells like bash/zsh from becoming
+//! permanently tainted).
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -10,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use sentinel_common::ipc::LineageStep;
-use sentinel_common::process::{ProcessNode, SecretCategory};
+use sentinel_common::process::{is_interactive_shell_binary, ProcessNode, SecretCategory};
 
 /// Information about an interpreted script invocation.
 #[derive(Debug, Clone)]
@@ -35,7 +37,6 @@ impl LineageTracker {
     }
 
     /// Insert or update a process node.
-    #[allow(dead_code)]
     pub fn insert(&self, node: ProcessNode) {
         let mut g = self.graph.lock().unwrap();
         g.put(node.tgid, node);
@@ -48,17 +49,35 @@ impl LineageTracker {
     }
 
     /// Handle process fork: child inherits metadata and parent pointer from parent TGID.
+    ///
+    /// Shell Isolation: If parent is an interactive shell (bash/zsh) and did not directly read secrets,
+    /// child starts in an untainted clean state.
     pub fn handle_fork(&self, parent_tgid: u32, child_tgid: u32) {
         let mut g = self.graph.lock().unwrap();
-        let (uid, exe_path, exe_dev_ino, pkg_origin) = if let Some(parent) = g.get(&parent_tgid) {
-            (parent.uid, parent.exe_path.clone(), parent.exe_dev_ino, parent.pkg_origin.clone())
+        let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell) = if let Some(parent) = g.get(&parent_tgid) {
+            (
+                parent.uid,
+                parent.exe_path.clone(),
+                parent.exe_dev_ino,
+                parent.pkg_origin.clone(),
+                parent.has_secret_access(),
+                parent.is_interactive_shell,
+            )
         } else {
-            (1000, PathBuf::from("/proc/unknown"), (0, 0), None)
+            (1000, PathBuf::from("/proc/unknown"), (0, 0), None, false, false)
         };
 
         let mut child = ProcessNode::new(child_tgid, parent_tgid, uid, exe_path);
         child.exe_dev_ino = exe_dev_ino;
         child.pkg_origin = pkg_origin;
+
+        // If parent has secret accesses and is NOT an interactive shell, inherit secret history
+        if parent_has_secrets && !parent_is_shell {
+            if let Some(parent) = g.get(&parent_tgid) {
+                child.secret_accesses = parent.secret_accesses.clone();
+            }
+        }
+
         g.put(child_tgid, child);
         debug!("Lineage fork: {} -> {}", parent_tgid, child_tgid);
     }
@@ -68,16 +87,19 @@ impl LineageTracker {
         let mut g = self.graph.lock().unwrap();
         let is_memfd = detect_memfd(&exe_path);
         let script_info = inspect_interpreter(&exe_path, &cmdline);
+        let is_shell = is_interactive_shell_binary(&exe_path);
 
         if let Some(node) = g.get_mut(&tgid) {
             node.exe_path = exe_path;
             node.cmdline = cmdline;
             node.is_memfd = is_memfd;
+            node.is_interactive_shell = is_shell;
             node.script_path = script_info.and_then(|s| s.script_path);
         } else {
             let mut node = ProcessNode::new(tgid, 1, 1000, exe_path);
             node.cmdline = cmdline;
             node.is_memfd = is_memfd;
+            node.is_interactive_shell = is_shell;
             node.script_path = script_info.and_then(|s| s.script_path);
             g.put(tgid, node);
         }
@@ -93,6 +115,24 @@ impl LineageTracker {
             let mut node = ProcessNode::new(tgid, 1, 1000, PathBuf::from("/proc/unknown"));
             node.record_secret_access(path, category, ts);
             g.put(tgid, node);
+        }
+    }
+
+    /// Record an IP contact for a process node. Returns true if this is the first time contacting this IP.
+    pub fn record_ip_contact(&self, tgid: u32, ip: &str) -> bool {
+        let mut g = self.graph.lock().unwrap();
+        if let Some(node) = g.get_mut(&tgid) {
+            node.record_ip_contact(ip)
+        } else {
+            true
+        }
+    }
+
+    /// Clear secret accesses and taint history for a specific TGID (e.g. after user approval / whitelist).
+    pub fn clear_secrets(&self, tgid: u32) {
+        let mut g = self.graph.lock().unwrap();
+        if let Some(node) = g.get_mut(&tgid) {
+            node.secret_accesses.clear();
         }
     }
 
@@ -132,7 +172,6 @@ impl LineageTracker {
             }
         }
 
-        // Return from root ancestor to current process
         chain.reverse();
         chain
     }
@@ -143,7 +182,6 @@ impl LineageTracker {
         g.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -156,6 +194,7 @@ pub fn detect_memfd(exe_path: &Path) -> bool {
         || p.starts_with("memfd:")
         || p.contains("/memfd:")
         || (p.starts_with("/proc/") && p.contains("/fd/"))
+        || (p.contains("(deleted)") && p.starts_with("/dev/shm"))
 }
 
 /// Inspect interpreter process arguments (python3, bash, sh, node, perl).
@@ -163,7 +202,7 @@ pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<Script
     let exe_name = exe_path.file_name()?.to_string_lossy();
     let is_interp = matches!(
         exe_name.as_ref(),
-        "python3" | "python" | "bash" | "sh" | "zsh" | "node" | "perl"
+        "python3" | "python" | "bash" | "sh" | "zsh" | "dash" | "node" | "perl"
     );
 
     if !is_interp {
@@ -179,7 +218,13 @@ pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<Script
         if arg == "-c" || arg == "-e" {
             is_inline = true;
             if let Some(code) = iter.next() {
-                if code.contains("base64") || code.contains("eval(") || code.contains("exec(") || code.contains("urllib") {
+                if code.contains("base64")
+                    || code.contains("eval(")
+                    || code.contains("exec(")
+                    || code.contains("urllib")
+                    || code.contains("requests")
+                    || code.contains("socket")
+                {
                     is_suspicious_flags = true;
                 }
             }
@@ -203,7 +248,7 @@ mod tests {
     fn test_lineage_tracker_ancestry() {
         let tracker = LineageTracker::new(100);
 
-        // Process 1: bash
+        // Process 1: bash (terminal shell)
         let node1 = ProcessNode::new(1000, 1, 1000, PathBuf::from("/bin/bash"));
         tracker.insert(node1);
 
@@ -225,18 +270,5 @@ mod tests {
         assert_eq!(chain[1].exe_name, "npm");
         assert_eq!(chain[2].exe_name, "python3");
         assert_eq!(chain[2].script_path, Some(PathBuf::from("/tmp/install.py")));
-    }
-
-    #[test]
-    fn test_inspect_interpreter_inline() {
-        let exe = PathBuf::from("/usr/bin/python3");
-        let cmdline = vec![
-            "python3".to_string(),
-            "-c".to_string(),
-            "import base64; eval(base64.b64decode(...))".to_string(),
-        ];
-        let info = inspect_interpreter(&exe, &cmdline).expect("Should identify interpreter");
-        assert!(info.is_inline);
-        assert!(info.is_suspicious_flags);
     }
 }

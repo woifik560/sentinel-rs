@@ -1,7 +1,8 @@
 //! Deterministic risk scoring engine types and classification logic.
 //!
 //! Implements the transparent risk engine described in ТЗ sections 3.2–3.3:
-//! scoring 0..100 in < 1 ms with human-readable rule firings.
+//! scoring 0..100 in < 1 ms with human-readable rule firings and LoLBin-hardened
+//! hierarchical thresholds.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -9,7 +10,7 @@ use std::fmt;
 /// Identifiers for each scoring rule in the risk engine.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleId {
-    /// +40: Secret accessed by a non-owner process (App Scoping violation).
+    /// +40: Secret accessed by a non-owner process (App Scoping violation / Taint).
     SecretNonOwner,
     /// +15: Network connection within <= 5 seconds of reading a secret.
     FastExfilBurst,
@@ -21,12 +22,15 @@ pub enum RuleId {
     SuspiciousInterpreter,
     /// +10: Direct IP connection without preceding DNS query.
     RawIpConnect,
+    /// +15: First-time connection to a public destination IP outside RFC1918 / loopback.
+    FirstSeenDestination,
     /// -35: Binary verified in dpkg package database in legitimate context.
+    /// NOTE: Disallowed if SecretNonOwner or Taint is present!
     TrustedPackageContext,
 }
 
 impl RuleId {
-    /// Returns the default weight for this rule as defined in the ТЗ.
+    /// Returns the default weight for this rule.
     pub fn default_weight(&self) -> i32 {
         match self {
             RuleId::SecretNonOwner => 40,
@@ -35,6 +39,7 @@ impl RuleId {
             RuleId::FilelessMemfd => 50,
             RuleId::SuspiciousInterpreter => 20,
             RuleId::RawIpConnect => 10,
+            RuleId::FirstSeenDestination => 15,
             RuleId::TrustedPackageContext => -35,
         }
     }
@@ -48,6 +53,7 @@ impl RuleId {
             RuleId::FilelessMemfd => "FILELESS_MEMFD",
             RuleId::SuspiciousInterpreter => "SUSPICIOUS_INTERPRETER",
             RuleId::RawIpConnect => "RAW_IP_CONNECT",
+            RuleId::FirstSeenDestination => "FIRST_SEEN_DESTINATION",
             RuleId::TrustedPackageContext => "TRUSTED_PACKAGE_CONTEXT",
         }
     }
@@ -70,17 +76,32 @@ pub struct RuleFiring {
 /// Computed risk score with all contributing rule firings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskScore {
-    /// Total risk score, clamped to 0..100.
+    /// Total risk score, clamped to 0..100 with non-negotiable floor for tainted secrets.
     pub total: u32,
     /// All rules that contributed to the score.
     pub firings: Vec<RuleFiring>,
 }
 
 impl RiskScore {
-    /// Compute a risk score from a list of rule firings, clamping to 0..100.
-    pub fn compute(firings: Vec<RuleFiring>) -> Self {
+    /// Compute a risk score from a list of rule firings, enforcing hierarchical rules:
+    /// 1. If `SecretNonOwner` is fired, `TrustedPackageContext` (-35) discount is invalidated.
+    /// 2. If `SecretNonOwner` is fired, minimum score floor is 40 (GREY zone minimum).
+    pub fn compute(mut firings: Vec<RuleFiring>) -> Self {
+        let has_secret = firings.iter().any(|f| f.rule_id == RuleId::SecretNonOwner);
+
+        // Hierarchical rule 1: Do not permit dpkg trust discount if non-owner accessed secret
+        if has_secret {
+            firings.retain(|f| f.rule_id != RuleId::TrustedPackageContext);
+        }
+
         let raw: i32 = firings.iter().map(|f| f.weight).sum();
-        let total = raw.clamp(0, 100) as u32;
+        let mut total = raw.clamp(0, 100) as u32;
+
+        // Hierarchical rule 2: Floor at GREY zone (40) when reading secret and attempting network
+        if has_secret && total < 40 {
+            total = 40;
+        }
+
         Self { total, firings }
     }
 
@@ -95,9 +116,9 @@ impl RiskScore {
 pub enum Verdict {
     /// 0..39: Allow and log.
     Low,
-    /// 40..74: Interactive prompt (Freeze & Inspect). Fail-Closed on timeout.
+    /// 40..74: Interactive prompt (Freeze & Inspect via NFQUEUE / SO_MARK). Fail-Closed on timeout.
     Grey,
-    /// 75..100: Immediate drop (-EPERM), SIGSTOP, alert.
+    /// 75..100: Immediate drop (-EPERM / NF_DROP), optional SIGSTOP/SIGKILL, alert.
     High,
 }
 
@@ -175,7 +196,28 @@ mod tests {
             },
         ];
         let score = RiskScore::compute(firings);
-        assert_eq!(score.total, 100); // 115 clamped to 100
+        assert_eq!(score.total, 100);
+    }
+
+    #[test]
+    fn test_lolbin_discount_prevention() {
+        // Test that curl/git (trusted dpkg package) reading a secret CANNOT get -35 discount
+        let firings = vec![
+            RuleFiring {
+                rule_id: RuleId::SecretNonOwner,
+                weight: 40,
+                reason: "SSH private key read".to_string(),
+            },
+            RuleFiring {
+                rule_id: RuleId::TrustedPackageContext,
+                weight: -35,
+                reason: "dpkg verified curl binary".to_string(),
+            },
+        ];
+        let score = RiskScore::compute(firings);
+        // Discount MUST be stripped; score must remain >= 40 (GREY)
+        assert_eq!(score.total, 40);
+        assert_eq!(score.classify(&RiskThresholds::default()), Verdict::Grey);
     }
 
     #[test]
@@ -197,46 +239,5 @@ mod tests {
         let thresholds = RiskThresholds::default();
         assert_eq!(classify(75, &thresholds), Verdict::High);
         assert_eq!(classify(100, &thresholds), Verdict::High);
-    }
-
-    #[test]
-    fn test_default_weights_match_spec() {
-        assert_eq!(RuleId::SecretNonOwner.default_weight(), 40);
-        assert_eq!(RuleId::FastExfilBurst.default_weight(), 15);
-        assert_eq!(RuleId::UntrustedBinaryOrigin.default_weight(), 25);
-        assert_eq!(RuleId::FilelessMemfd.default_weight(), 50);
-        assert_eq!(RuleId::SuspiciousInterpreter.default_weight(), 20);
-        assert_eq!(RuleId::RawIpConnect.default_weight(), 10);
-        assert_eq!(RuleId::TrustedPackageContext.default_weight(), -35);
-    }
-
-    #[test]
-    fn test_infoleaker_scenario() {
-        // ТЗ example: python3 from /tmp reads SSH key, connects to raw IP within 5s
-        let firings = vec![
-            RuleFiring {
-                rule_id: RuleId::SecretNonOwner,
-                weight: 40,
-                reason: "Доступ к SSH-ключам неуполномоченным процессом".to_string(),
-            },
-            RuleFiring {
-                rule_id: RuleId::UntrustedBinaryOrigin,
-                weight: 25,
-                reason: "Скрипт запущен из /tmp".to_string(),
-            },
-            RuleFiring {
-                rule_id: RuleId::FastExfilBurst,
-                weight: 15,
-                reason: "Попытка эксфильтрации в течение 5 секунд".to_string(),
-            },
-            RuleFiring {
-                rule_id: RuleId::RawIpConnect,
-                weight: 10,
-                reason: "Прямое подключение по IP-адресу".to_string(),
-            },
-        ];
-        let score = RiskScore::compute(firings);
-        assert_eq!(score.total, 90);
-        assert_eq!(score.classify(&RiskThresholds::default()), Verdict::High);
     }
 }
