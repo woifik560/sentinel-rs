@@ -10,6 +10,11 @@ id = "FILELESS_MEMFD"
 weight = 50
 description = "Исполнение кода напрямую из оперативной памяти (memfd_create / anonymous memory)"
 
+[rules.fileless_anon_exec]
+id = "FILELESS_ANON_EXEC"
+weight = 35
+description = "Исполнение исполняемой памяти через mmap PROT_EXEC на анонимную память, удалённый (deleted) файл или tmpfs без имени"
+
 [rules.secret_non_owner]
 id = "SECRET_NON_OWNER"
 weight = 40
@@ -19,6 +24,11 @@ description = "Чтение защищённого секрета или нас�
 id = "UNTRUSTED_BINARY_ORIGIN"
 weight = 25
 description = "Исполняемый файл или скрипт запущен из /tmp, /dev/shm, ~/Downloads или не верифицирован в dpkg"
+
+[rules.suspicious_script_execution]
+id = "SUSPICIOUS_SCRIPT_EXECUTION"
+weight = 25
+description = "Выполнение скрипта из анонимного источника, пайпа stdin или с подозрительными флагами запуска (-c, -e, eval)"
 
 [rules.suspicious_interpreter]
 id = "SUSPICIOUS_INTERPRETER"

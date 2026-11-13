@@ -13,6 +13,8 @@ min_kernel_version = "6.1"   # Минимальная безопасная ве�
 
 [socket]
 path = "/run/sentinel/sentinel.sock"
+readonly_path = "/run/sentinel/sentinel-ro.sock"
+gui_binary_path = "/usr/bin/sentinel-gui"
 
 [targets]
 protect_telegram = true

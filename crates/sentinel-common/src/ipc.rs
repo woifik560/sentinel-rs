@@ -50,6 +50,12 @@ pub struct PromptRequest {
     pub reasons: Vec<String>,
     /// Unix timestamp when this prompt expires (Fail-Closed).
     pub expires_at_unix: u64,
+    /// Indicates whether the active desktop session is running under X11.
+    /// If true, GUI requires entry of `auth_pin` to prevent X11 synthetic input injection.
+    #[serde(default)]
+    pub is_x11_session: bool,
+    /// Ephemeral 4-digit verification PIN required for sensitive verdicts under X11.
+    pub auth_pin: Option<String>,
 }
 
 /// Possible user actions in response to a prompt (ТЗ 4.2).
@@ -61,6 +67,10 @@ pub enum PromptAction {
     DenyOnce,
     /// Allow this single connection (add temporary token).
     AllowOnce,
+    /// Temporarily allow network flows for this process for the given duration in seconds (e.g. 300s for builds).
+    AllowForDuration { seconds: u64 },
+    /// Allow connections to this specific destination host / IP.
+    AllowHost { host: String },
     /// Allow all connections from this specific process instance.
     AllowProcess,
     /// Add process to App Scope whitelist in config.toml.
@@ -74,6 +84,20 @@ pub struct PromptVerdict {
     pub incident_id: String,
     /// The chosen action.
     pub action: PromptAction,
+    /// Optional authorization PIN entered by user under X11 sessions.
+    #[serde(default)]
+    pub auth_pin: Option<String>,
+}
+
+/// Verified authorization level of an IPC client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientRole {
+    /// Read-only monitor (sentinelctl monitor, status, export).
+    ReadOnly,
+    /// Cryptographically verified GUI process (sentinel-gui).
+    AuthorizedGui,
+    /// Superuser root administrator (UID 0).
+    RootAdmin,
 }
 
 /// Top-level IPC message envelope for bidirectional communication.
@@ -122,5 +146,9 @@ pub enum IpcMessage {
     ExportResponse {
         /// The serialized incident report JSON.
         report_json: String,
+    },
+    /// Security / Authorization error returned when unauthenticated peer sends privileged command.
+    AuthError {
+        message: String,
     },
 }

@@ -63,6 +63,17 @@ impl ShaCache {
         }
     }
 
+    /// Invalidate cache for a specific path upon unlink or rename.
+    pub fn invalidate_path(&self, path: &Path) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                self.invalidate_inode(meta.dev(), meta.ino());
+            }
+        }
+    }
+
     /// Read filesystem metadata and compute or retrieve SHA-256.
     pub fn get_for_path(&self, path: &Path) -> Option<(u64, u64, u64, u64, String)> {
         #[cfg(unix)]

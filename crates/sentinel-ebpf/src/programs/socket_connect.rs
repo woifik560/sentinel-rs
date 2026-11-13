@@ -24,8 +24,10 @@ use sentinel_common::events::SENTINEL_SO_MARK;
 pub enum SocketConnectVerdict {
     /// Fast-Path: Allow connection immediately with zero latency.
     FastPathAllow,
-    /// Slow-Path: Hold initial SYN packet in Netfilter queue via SO_MARK (0x5E170001).
+    /// Slow-Path: Hold initial SYN packet in Netfilter queue via SO_MARK (0x5E170001 or dynamic).
     SlowPathHoldNfqueue { so_mark: u32 },
+    /// Established connection requiring re-evaluation in NFQUEUE (0x40000000 | flow_id).
+    RevalidateHoldNfqueue { so_mark: u32 },
     /// Strict/Legacy fallback: Deny connection with -EPERM.
     DenyEperm,
 }
@@ -37,6 +39,23 @@ pub fn evaluate_socket_connect(
     is_trusted_profile: bool,
     use_nfqueue: bool,
 ) -> SocketConnectVerdict {
+    evaluate_socket_connect_with_mark(
+        is_tainted,
+        is_allowed,
+        is_trusted_profile,
+        use_nfqueue,
+        SENTINEL_SO_MARK,
+    )
+}
+
+/// Evaluates network connection request with explicit dynamic mark.
+pub fn evaluate_socket_connect_with_mark(
+    is_tainted: bool,
+    is_allowed: bool,
+    is_trusted_profile: bool,
+    use_nfqueue: bool,
+    so_mark: u32,
+) -> SocketConnectVerdict {
     if is_allowed {
         return SocketConnectVerdict::FastPathAllow;
     }
@@ -47,9 +66,7 @@ pub fn evaluate_socket_connect(
     } else if is_tainted || !is_trusted_profile {
         // Slow-Path: mark socket for zero-drop packet holding in NFQUEUE
         if use_nfqueue {
-            SocketConnectVerdict::SlowPathHoldNfqueue {
-                so_mark: SENTINEL_SO_MARK,
-            }
+            SocketConnectVerdict::SlowPathHoldNfqueue { so_mark }
         } else {
             SocketConnectVerdict::DenyEperm
         }

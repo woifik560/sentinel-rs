@@ -96,6 +96,11 @@ impl NeverFreezeChecker {
             }
         }
 
+        // Sentinel infrastructure tools
+        if exe_name == "sntctl" || exe_name == "sentinelctl" || exe_name == "sentinel-gui" {
+            return true;
+        }
+
         // Desktop compositors and audio: allowed under session UID (>= 1000) or root
         if self.protected_names.contains(exe_name) {
             return true;
@@ -113,7 +118,8 @@ impl NeverFreezeChecker {
 /// NFQUEUE network holding manager for Netfilter integration.
 #[derive(Clone, Default)]
 pub struct NfqueueHoldManager {
-    held_packets: Arc<RwLock<HashMap<String, u32>>>,
+    /// Tracks held packets grouped by incident_id (supporting SYN retransmits).
+    held_packets: Arc<RwLock<HashMap<String, Vec<u32>>>>,
 }
 
 impl NfqueueHoldManager {
@@ -121,24 +127,28 @@ impl NfqueueHoldManager {
         Self::default()
     }
 
-    /// Configure kernel nftables rule for diverting SO_MARK 0x5E170001 traffic to NFQUEUE.
+    /// Configure kernel nftables rule for diverting SO_MARK traffic to NFQUEUE.
     ///
     /// # Performance & Fail-Closed Rules:
-    /// 1. Fast-Path: `ct state established,related accept` allows gigabit throughput without userspace overhead.
-    /// 2. Slow-Path: `ct state new meta mark 0x5E170001 counter queue num 100` diverts unapproved new flows.
-    /// 3. FAIL-CLOSED: No `bypass` flag in production so traffic cannot leak around daemon if attacked.
+    /// 1. Established Socket Re-evaluation: `meta mark & 0x40000000 != 0 counter queue num 100`
+    ///    is evaluated FIRST, before `ct state established accept`!
+    /// 2. Fast-Path: `ct state established accept` allows clean gigabit throughput inside the kernel.
+    ///    Notice: broad `related` is excluded to prevent conntrack helper bypasses!
+    /// 3. Slow-Path: `ct state new meta mark & 0xffff0000 == 0x5e170000 counter queue num 100`
+    ///    diverts all dynamic Sentinel flow marks to the userspace hold orchestrator.
     pub fn setup_nftables_rule() -> anyhow::Result<()> {
         info!(
-            "Configuring nftables hook for Sentinel SO_MARK (0x{:08X}) -> NFQUEUE ({})",
-            SENTINEL_SO_MARK, SENTINEL_NFQUEUE_NUM
+            "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({})",
+            SENTINEL_NFQUEUE_NUM
         );
 
         let setup_cmd = format!(
             "nft add table inet sentinel 2>/dev/null; \
              nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
-             nft add rule inet sentinel output ct state established,related accept 2>/dev/null; \
-             nft add rule inet sentinel output ct state new meta mark 0x{:x} counter queue num {}",
-            SENTINEL_SO_MARK, SENTINEL_NFQUEUE_NUM
+             nft add rule inet sentinel output meta mark & 0x40000000 != 0 counter queue num {} 2>/dev/null; \
+             nft add rule inet sentinel output ct state established accept 2>/dev/null; \
+             nft add rule inet sentinel output ct state new meta mark & 0xffff0000 == 0x5e170000 counter queue num {} 2>/dev/null",
+            SENTINEL_NFQUEUE_NUM, SENTINEL_NFQUEUE_NUM
         );
 
         let status = Command::new("sh")
@@ -147,7 +157,7 @@ impl NfqueueHoldManager {
             .status();
 
         match status {
-            Ok(s) if s.success() => info!("nftables NFQUEUE rule successfully active (Fast-Path ct state established)."),
+            Ok(s) if s.success() => info!("nftables NFQUEUE rule successfully active (Re-eval priority over established)."),
             _ => warn!("nftables command failed or unprivileged. Simulation mode active for NFQUEUE."),
         }
 
@@ -165,24 +175,30 @@ impl NfqueueHoldManager {
     }
 
     /// Register a packet currently held in NFQUEUE awaiting interactive verdict.
+    /// Supports aggregating multiple SYN retransmits under the same incident.
     pub fn register_packet(&self, incident_id: String, packet_id: u32) {
         let mut map = self.held_packets.write().unwrap();
-        map.insert(incident_id, packet_id);
+        let list = map.entry(incident_id).or_default();
+        list.push(packet_id);
     }
 
-    /// Release packet with NF_ACCEPT verdict (traffic allowed).
+    /// Release packet with NF_ACCEPT verdict (traffic allowed) for all aggregated packets in this incident.
     pub fn accept(&self, incident_id: &str) {
         let mut map = self.held_packets.write().unwrap();
-        if let Some(packet_id) = map.remove(incident_id) {
-            info!("NFQUEUE: Issuing NF_ACCEPT for packet {} (incident {})", packet_id, incident_id);
+        if let Some(packet_ids) = map.remove(incident_id) {
+            for packet_id in packet_ids {
+                info!("NFQUEUE: Issuing NF_ACCEPT for packet {} (incident {})", packet_id, incident_id);
+            }
         }
     }
 
-    /// Drop packet with NF_DROP verdict (traffic blocked).
+    /// Drop packet with NF_DROP verdict (or TCP reset) for all aggregated packets in this incident.
     pub fn drop(&self, incident_id: &str) {
         let mut map = self.held_packets.write().unwrap();
-        if let Some(packet_id) = map.remove(incident_id) {
-            info!("NFQUEUE: Issuing NF_DROP for packet {} (incident {})", packet_id, incident_id);
+        if let Some(packet_ids) = map.remove(incident_id) {
+            for packet_id in packet_ids {
+                info!("NFQUEUE: Issuing NF_DROP / TCP RST for packet {} (incident {})", packet_id, incident_id);
+            }
         }
     }
 }
@@ -194,6 +210,8 @@ pub enum HoldResult {
     NewPrompt(String),
     /// Aggregated into an existing pending prompt for the same target flow.
     Aggregated(String),
+    /// Pre-approved by an active temporary duration or host rule.
+    PreApproved,
     /// Queue capacity exceeded; packet dropped immediately (DoS mitigation).
     QueueFull,
 }
@@ -208,6 +226,8 @@ pub struct FreezeInspectOrchestrator {
     frozen_processes: Arc<RwLock<HashMap<u32, Instant>>>,
     pending_prompts: Arc<RwLock<HashMap<String, PendingPrompt>>>,
     aggregated_flows: Arc<RwLock<HashMap<(u32, String, u16), (String, Instant)>>>,
+    duration_allowlist: Arc<RwLock<HashMap<u32, Instant>>>,
+    host_allowlist: Arc<RwLock<HashMap<u32, HashSet<String>>>>,
 }
 
 impl FreezeInspectOrchestrator {
@@ -221,6 +241,8 @@ impl FreezeInspectOrchestrator {
             frozen_processes: Arc::new(RwLock::new(HashMap::new())),
             pending_prompts: Arc::new(RwLock::new(HashMap::new())),
             aggregated_flows: Arc::new(RwLock::new(HashMap::new())),
+            duration_allowlist: Arc::new(RwLock::new(HashMap::new())),
+            host_allowlist: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -231,6 +253,28 @@ impl FreezeInspectOrchestrator {
     /// Initialize Netfilter NFQUEUE rules.
     pub fn init_network_holding(&self) -> anyhow::Result<()> {
         NfqueueHoldManager::setup_nftables_rule()
+    }
+
+    /// Check if a flow is pre-approved for duration or host.
+    pub fn is_preapproved(&self, tgid: u32, dest: Option<&(String, u16)>) -> bool {
+        let now = Instant::now();
+        {
+            let map = self.duration_allowlist.read().unwrap();
+            if let Some(exp) = map.get(&tgid) {
+                if now < *exp {
+                    return true;
+                }
+            }
+        }
+        if let Some(ref d) = dest {
+            let map = self.host_allowlist.read().unwrap();
+            if let Some(hosts) = map.get(&tgid) {
+                if hosts.contains(&d.0) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Hold network traffic for a suspicious process in the GREY zone.
@@ -246,6 +290,19 @@ impl FreezeInspectOrchestrator {
         packet_id: Option<u32>,
         dest: Option<(String, u16)>,
     ) -> HoldResult {
+        // 0. Pre-approval Check: Active temporary duration or host rule
+        if self.is_preapproved(tgid, dest.as_ref()) {
+            info!(
+                "TGID {} ({}) is pre-approved by duration or host policy: releasing packet immediately",
+                tgid, exe_name
+            );
+            if let Some(pid) = packet_id {
+                self.nfqueue.register_packet(incident_id.clone(), pid);
+            }
+            self.nfqueue.accept(&incident_id);
+            return HoldResult::PreApproved;
+        }
+
         // 1. DoS Mitigation: Check pending queue limit
         {
             let map = self.pending_prompts.read().unwrap();
@@ -270,6 +327,9 @@ impl FreezeInspectOrchestrator {
                     let mut prompts = self.pending_prompts.write().unwrap();
                     if let Some(prompt) = prompts.get_mut(existing_id) {
                         prompt.aggregated_count += 1;
+                        if let Some(pid) = packet_id {
+                            self.nfqueue.register_packet(existing_id.clone(), pid);
+                        }
                         info!(
                             "Aggregated duplicate connection attempt from TGID {} to {}:{} (count: {})",
                             tgid, dest_info.0, dest_info.1, prompt.aggregated_count
@@ -383,12 +443,31 @@ impl FreezeInspectOrchestrator {
                 self.terminate_process(prompt.tgid, &prompt.exe_name, 1000)?;
             }
             PromptAction::DenyOnce => {
-                info!("Denied once for TGID {} (dropping packet)", prompt.tgid);
+                info!("Denied once for TGID {} (dropping packet with TCP RST)", prompt.tgid);
                 self.nfqueue.drop(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
-            PromptAction::AllowOnce | PromptAction::AllowProcess | PromptAction::AllowAppScope => {
-                info!("Allowing connection and releasing packet for TGID {}", prompt.tgid);
+            PromptAction::AllowOnce => {
+                info!("Allowing connection once and releasing packet for TGID {}", prompt.tgid);
+                self.nfqueue.accept(&verdict.incident_id);
+                let _ = self.unfreeze_process(prompt.tgid);
+            }
+            PromptAction::AllowForDuration { seconds } => {
+                info!("Allowing TGID {} for {} seconds (batch de-duplication)", prompt.tgid, seconds);
+                let mut map = self.duration_allowlist.write().unwrap();
+                map.insert(prompt.tgid, Instant::now() + Duration::from_secs(seconds));
+                self.nfqueue.accept(&verdict.incident_id);
+                let _ = self.unfreeze_process(prompt.tgid);
+            }
+            PromptAction::AllowHost { ref host } => {
+                info!("Allowing TGID {} to host {} (host de-duplication)", prompt.tgid, host);
+                let mut map = self.host_allowlist.write().unwrap();
+                map.entry(prompt.tgid).or_default().insert(host.clone());
+                self.nfqueue.accept(&verdict.incident_id);
+                let _ = self.unfreeze_process(prompt.tgid);
+            }
+            PromptAction::AllowProcess | PromptAction::AllowAppScope => {
+                info!("Allowing process connection and releasing packet for TGID {}", prompt.tgid);
                 self.nfqueue.accept(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }

@@ -137,11 +137,30 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     });
 
-    // 4. Initialize and Start IPC Server
+    // 4. Initialize eBPF Loader
+    let mut ebpf_loader = EbpfLoader::new(LoaderConfig {
+        ring_buffer_size: config.general.ring_buffer_size,
+        enable_lsm: true,
+        enable_tracepoints: true,
+        strict_preflight: false,
+        min_kernel_version: config.general.min_kernel_version.clone(),
+    });
+    ebpf_loader.load_and_attach().await?;
+    let mut event_rx = ebpf_loader.take_event_receiver().expect("Receiver must be present");
+    let taint_mgr = ebpf_loader.taint_manager();
+
+    // Register daemon PID for kernel self-defense and systemd as IPC broker
+    taint_mgr.set_daemon_pid(std::process::id());
+    taint_mgr.register_ipc_broker(1);
+
+    // 5. Initialize and Start IPC Server (Dual Socket: Privileged Management & Read-Only Monitor)
     let ipc_server = Arc::new(IpcServer::new(
         config.socket.path.clone(),
+        config.socket.readonly_path.clone(),
+        config.socket.gui_binary_path.clone(),
         freeze_orchestrator.clone(),
         lineage_tracker.clone(),
+        taint_mgr.clone(),
     ));
 
     let ipc_runner = ipc_server.clone();
@@ -151,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 5. Start Fail-Closed Background Timeout Reaper
+    // 6. Start Fail-Closed Background Timeout Reaper
     let freeze_reaper = freeze_orchestrator.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -163,18 +182,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    // 6. Initialize eBPF Loader
-    let mut ebpf_loader = EbpfLoader::new(LoaderConfig {
-        ring_buffer_size: config.general.ring_buffer_size,
-        enable_lsm: true,
-        enable_tracepoints: true,
-        strict_preflight: false,
-        min_kernel_version: config.general.min_kernel_version.clone(),
-    });
-    ebpf_loader.load_and_attach().await?;
-    let mut event_rx = ebpf_loader.take_event_receiver().expect("Receiver must be present");
-    let taint_mgr = ebpf_loader.taint_manager();
 
     info!("Sentinel-RS daemon fully initialized and operational.");
 
@@ -262,6 +269,56 @@ async fn main() -> anyhow::Result<()> {
                 taint_mgr.mark_tainted(reader_tgid);
             }
 
+            EbpfEvent::MmapFile { tgid, uid: _, ref path, dev, ino, prot, flags, is_secret: _, is_write_shared: _, is_exec: _ } => {
+                let verdict = taint_mgr.handle_mmap_file(tgid, dev, ino, path, prot, flags);
+                match verdict {
+                    sentinel_ebpf::MmapVerdict::TaintTask => {
+                        warn!("mmap Secret Access: TGID {} mapped secret {}", tgid, path.display());
+                        let now_ns = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        lineage_tracker.record_secret_access(
+                            tgid,
+                            path.clone(),
+                            SecretCategory::Other(format!("mmap Secret: {}", path.display())),
+                            now_ns,
+                        );
+                    }
+                    sentinel_ebpf::MmapVerdict::TaintInode => {
+                        warn!("mmap Shared Memory Taint: Tainted TGID {} mapped {} with PROT_WRITE | MAP_SHARED", tgid, path.display());
+                    }
+                    sentinel_ebpf::MmapVerdict::FlagAnonExec => {
+                        warn!("mmap Fileless Execution: TGID {} mapped executable memory on unlinked/tmpfs file {}", tgid, path.display());
+                        if let Some(mut node) = lineage_tracker.get(tgid) {
+                            node.is_anon_exec = true;
+                            lineage_tracker.insert(node);
+                        }
+                    }
+                    sentinel_ebpf::MmapVerdict::Allow => {}
+                }
+            }
+
+            EbpfEvent::FileReceive { receiver_tgid, sender_tgid, ref path, dev, ino, is_tainted: _ } => {
+                let verdict = taint_mgr.handle_file_receive(receiver_tgid, sender_tgid, dev, ino, path);
+                if verdict == sentinel_ebpf::FileReceiveVerdict::TaintReceiver {
+                    warn!(
+                        "SCM_RIGHTS Taint Propagation: TGID {} inherited descriptor to {} from TGID {}",
+                        receiver_tgid, path.display(), sender_tgid
+                    );
+                    let now_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    lineage_tracker.record_secret_access(
+                        receiver_tgid,
+                        path.clone(),
+                        SecretCategory::Other(format!("SCM_RIGHTS: {}", path.display())),
+                        now_ns,
+                    );
+                }
+            }
+
             EbpfEvent::BprmCheckSecurity { tgid, uid: _, ref exe_path, dev: _, ino: _, is_memfd } => {
                 if is_memfd {
                     warn!("LSM bprm_check_security: anonymous memfd_create execution detected for TGID {}", tgid);
@@ -282,8 +339,15 @@ async fn main() -> anyhow::Result<()> {
                 lineage_tracker.handle_exec(tgid, exe_path, cmdline);
             }
 
-            EbpfEvent::SocketConnect { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark: _ }
-            | EbpfEvent::SocketSendmsg { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, so_mark: _, is_preopened: _ } => {
+            EbpfEvent::SocketConnect { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark }
+            | EbpfEvent::SocketSendmsg { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, so_mark, is_preopened: _ } => {
+                // Synchronous FlowContext lookup from flow_mark_ctx eBPF map:
+                let _flow_ctx = taint_mgr.lookup_flow_context(so_mark);
+                let is_reval = (so_mark & sentinel_common::events::SENTINEL_MARK_REVAL_BIT) != 0;
+                if is_reval {
+                    warn!("Established Socket Re-evaluation: intercepted established flow with mark 0x{:08X} for TGID {}", so_mark, tgid);
+                }
+
                 let dest_ip = dst_ipv4
                     .map(|ip| ip.to_string())
                     .or_else(|| dst_ipv6.map(|ip| ip.to_string()));
@@ -431,6 +495,22 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or_default()
                                     .as_secs();
 
+                                // X11 Clickjacking Defense: Generate ephemeral PIN if running in X11
+                                let is_x11 = std::env::var("WAYLAND_DISPLAY").is_err()
+                                    && (std::env::var("XDG_SESSION_TYPE").map(|v| v == "x11").unwrap_or(false)
+                                        || std::env::var("DISPLAY").is_ok());
+
+                                let auth_pin = if is_x11 {
+                                    let seed = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_micros();
+                                    let pin = 1000 + (seed % 9000);
+                                    Some(pin.to_string())
+                                } else {
+                                    None
+                                };
+
                                 let prompt = PromptRequest {
                                     incident_id: inc_id,
                                     risk_score: score.total,
@@ -442,12 +522,17 @@ async fn main() -> anyhow::Result<()> {
                                     dest_domain: None,
                                     reasons,
                                     expires_at_unix: expires_at,
+                                    is_x11_session: is_x11,
+                                    auth_pin,
                                 };
 
-                                ipc_server.broadcast_prompt(prompt);
+                                ipc_server.broadcast_prompt(prompt).await;
                             }
                             HoldResult::Aggregated(existing_id) => {
                                 info!("Request aggregated into active prompt {}", existing_id);
+                            }
+                            HoldResult::PreApproved => {
+                                info!("TGID {} connection was pre-approved by active duration/host policy", tgid);
                             }
                             HoldResult::QueueFull => {
                                 warn!("Connection dropped immediately due to queue saturation DoS defense.");

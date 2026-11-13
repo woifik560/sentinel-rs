@@ -54,6 +54,16 @@ impl RiskEngine {
             });
         }
 
+        // 1b. [+35] FILELESS_ANON_EXEC (Anonymous memory execution or unlinked tmpfs mapping)
+        if node.is_anon_exec {
+            let weight = self.get_weight(RuleId::FilelessAnonExec.as_str(), 35);
+            firings.push(RuleFiring {
+                rule_id: RuleId::FilelessAnonExec,
+                weight,
+                reason: "Исполнение кода из анонимного отображения или удалённого файла tmpfs (mmap PROT_EXEC)".to_string(),
+            });
+        }
+
         // 2. [+40] SECRET_NON_OWNER / TAINTED
         let has_secret = !node.secret_accesses.is_empty();
         if has_secret {
@@ -112,6 +122,16 @@ impl RiskEngine {
                     reason: "Интерпретатор запущен с inline-кодом, eval, base64 или через pipe".to_string(),
                 });
             }
+
+            // 5b. [+25] SUSPICIOUS_SCRIPT_EXECUTION (reading secrets via pipe stdin or inline script)
+            if (info.is_inline || info.script_path.is_none()) && has_secret {
+                let weight = self.get_weight(RuleId::SuspiciousScriptExecution.as_str(), 25);
+                firings.push(RuleFiring {
+                    rule_id: RuleId::SuspiciousScriptExecution,
+                    weight,
+                    reason: "Интерпретатор прочитал секрет при запуске через stdin pipe или inline-скрипт".to_string(),
+                });
+            }
         }
 
         // 6. [+15] FIRST_SEEN_DESTINATION (Public IP destination outside RFC1918 / loopback seen first time)
@@ -160,7 +180,7 @@ impl RiskEngine {
         // 10. [-35] TRUSTED_PACKAGE_CONTEXT
         // Legitimate binary in dpkg context, and NOT an interpreter executing an untrusted script,
         // AND ONLY if NO SECRET / TAINT IS PRESENT, and no tampering/laundering detected!
-        let is_script_untrusted = node.script_path.is_some() || node.is_memfd;
+        let is_script_untrusted = node.script_path.is_some() || node.is_memfd || node.is_anon_exec || node.is_interpreter();
         if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret && !net.is_tofu_tampered && !net.is_ipc_laundered {
             let weight = self.get_weight(RuleId::TrustedPackageContext.as_str(), -35);
             firings.push(RuleFiring {

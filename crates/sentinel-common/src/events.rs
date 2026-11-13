@@ -7,9 +7,53 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-/// Sentinel SO_MARK tag placed on suspicious or tainted sockets.
-/// Unprivileged processes cannot spoof or clear this mark without CAP_NET_ADMIN.
+/// Legacy/Default Sentinel SO_MARK tag placed on suspicious or tainted sockets.
 pub const SENTINEL_SO_MARK: u32 = 0x5E170001;
+
+/// 16-bit Magic prefix identifying Sentinel-RS marks: 0x5E17xxxx.
+pub const SENTINEL_SO_MARK_PREFIX: u32 = 0x5E170000;
+pub const SENTINEL_SO_MARK_MASK: u32 = 0xFFFF0000;
+
+/// Re-evaluation bit (0x40000000) for packets belonging to already-established connections
+/// where a process subsequently became tainted. Placed higher than `ct state established` in Netfilter!
+pub const SENTINEL_MARK_REVAL_BIT: u32 = 0x40000000;
+
+/// 16-bit mask for dynamic flow sequence IDs.
+pub const SENTINEL_MARK_FLOW_ID_MASK: u32 = 0x0000FFFF;
+
+/// Encode dynamic socket / packet mark with monotonic flow sequence ID.
+pub fn encode_flow_mark(flow_id: u16, requires_reval: bool) -> u32 {
+    let mut mark = SENTINEL_SO_MARK_PREFIX | (flow_id as u32 & SENTINEL_MARK_FLOW_ID_MASK);
+    if requires_reval {
+        mark |= SENTINEL_MARK_REVAL_BIT;
+    }
+    mark
+}
+
+/// Decode a packet mark to determine whether it is managed by Sentinel, whether it requires re-eval, and its flow_id.
+pub fn decode_flow_mark(mark: u32) -> (bool, bool, u16) {
+    let is_sentinel = (mark & SENTINEL_SO_MARK_MASK) == SENTINEL_SO_MARK_PREFIX;
+    let requires_reval = (mark & SENTINEL_MARK_REVAL_BIT) != 0;
+    let flow_id = (mark & SENTINEL_MARK_FLOW_ID_MASK) as u16;
+    (is_sentinel, requires_reval, flow_id)
+}
+
+/// Synchronous flow context stored in eBPF map `flow_mark_ctx` (mark -> FlowContext).
+///
+/// Written synchronously in kernel eBPF before setting socket mark, eliminating any race
+/// condition with asynchronous RingBuffer consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FlowContext {
+    pub mark: u32,
+    pub tgid: u32,
+    pub pid: u32,
+    pub uid: u32,
+    pub cgroup_id: u64,
+    pub sock_cookie: u64,
+    pub taint_flags: u32,
+    pub exe_inode: u64,
+    pub exec_id: u64,
+}
 
 /// Default Netfilter Queue number for holding packets in userspace.
 pub const SENTINEL_NFQUEUE_NUM: u16 = 100;
@@ -126,6 +170,33 @@ pub enum EbpfEvent {
         path: PathBuf,
         is_blocked: bool,
     },
+
+    /// LSM hook `lsm/mmap_file` — memory-mapping of files or anonymous memory.
+    /// Intercepts secret reading via mmap(MAP_SHARED), shared memory taint writing,
+    /// and executable mmap of unlinked/tmpfs files (fileless JIT / loader detection).
+    MmapFile {
+        tgid: u32,
+        uid: u32,
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        prot: u32,
+        flags: u32,
+        is_secret: bool,
+        is_write_shared: bool,
+        is_exec: bool,
+    },
+
+    /// LSM hook `lsm/file_receive` — receiving a file descriptor passed via SCM_RIGHTS over AF_UNIX.
+    /// Propagates taint to the receiving process if the transferred descriptor is tainted or a secret.
+    FileReceive {
+        receiver_tgid: u32,
+        sender_tgid: u32,
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        is_tainted: bool,
+    },
 }
 
 /// Raw C-compatible structure for ring buffer transport (file_open).
@@ -240,4 +311,36 @@ pub struct RawPtraceAccessCheckEvent {
     pub mode: u32,
     pub is_blocked: u8,
     pub _pad: [u8; 3],
+}
+
+/// Raw C-compatible structure for ring buffer transport (mmap_file).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawMmapFileEvent {
+    pub tgid: u32,
+    pub uid: u32,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub prot: u32,
+    pub flags: u32,
+    pub is_secret: u8,
+    pub is_write_shared: u8,
+    pub is_exec: u8,
+    pub _pad: [u8; 5],
+}
+
+/// Raw C-compatible structure for ring buffer transport (file_receive / SCM_RIGHTS).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawFileReceiveEvent {
+    pub receiver_tgid: u32,
+    pub sender_tgid: u32,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub is_tainted: u8,
+    pub _pad: [u8; 7],
 }

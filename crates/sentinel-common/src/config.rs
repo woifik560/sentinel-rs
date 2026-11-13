@@ -95,6 +95,7 @@ pub fn default_never_freeze_list() -> Vec<String> {
         "NetworkManager".into(),
         "wpa_supplicant".into(),
         "sentinel-gui".into(),
+        "sntctl".into(),
         "sentinelctl".into(),
         "gnome-terminal".into(),
         "kitty".into(),
@@ -126,18 +127,35 @@ impl Default for GeneralConfig {
 /// IPC socket configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocketConfig {
+    /// Privileged management socket for verdicts and unfreezes (restricted permissions).
     #[serde(default = "default_socket_path")]
     pub path: PathBuf,
+    /// Read-only status & monitor socket accessible to desktop session users.
+    #[serde(default = "default_readonly_socket_path")]
+    pub readonly_path: PathBuf,
+    /// Expected canonical path of the trusted GUI binary.
+    #[serde(default = "default_gui_binary_path")]
+    pub gui_binary_path: PathBuf,
 }
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/sentinel/sentinel.sock")
 }
 
+fn default_readonly_socket_path() -> PathBuf {
+    PathBuf::from("/run/sentinel/sentinel-ro.sock")
+}
+
+fn default_gui_binary_path() -> PathBuf {
+    PathBuf::from("/usr/bin/sentinel-gui")
+}
+
 impl Default for SocketConfig {
     fn default() -> Self {
         Self {
             path: default_socket_path(),
+            readonly_path: default_readonly_socket_path(),
+            gui_binary_path: default_gui_binary_path(),
         }
     }
 }

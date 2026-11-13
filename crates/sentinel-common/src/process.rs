@@ -81,6 +81,9 @@ pub struct ProcessNode {
     pub script_path: Option<PathBuf>,
     /// Whether the binary was loaded from anonymous memory (memfd_create).
     pub is_memfd: bool,
+    /// Whether the process has executed anonymous memory or unlinked tmpfs mapping (mmap PROT_EXEC).
+    #[serde(default)]
+    pub is_anon_exec: bool,
     /// Pre-evaluated baseline profile in TASK_STORAGE.
     pub baseline_profile: u32,
     /// Whether this process is an interactive shell (e.g. bash/zsh), protected from upward taint.
@@ -113,6 +116,7 @@ impl ProcessNode {
             cmdline: Vec::new(),
             script_path: None,
             is_memfd: false,
+            is_anon_exec: false,
             baseline_profile: PROFILE_UNKNOWN,
             is_interactive_shell: is_shell,
             contacted_ips: HashSet::new(),

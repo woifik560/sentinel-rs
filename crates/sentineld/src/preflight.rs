@@ -2,7 +2,10 @@
 //!
 //! Enforces:
 //! 1. BPF LSM presence in `/sys/kernel/security/lsm`.
-//! 2. Minimum safe kernel version (Linux 6.1+) to mitigate uninitialized BPF_LSM panics (CVE-2026-64192).
+//!    CVE-2026-64192 arises when `bpf` is absent from the LSM stack on unpatched older kernels
+//!    (resolved upstream in updates like 6.1.184+ and newer releases in July 2026).
+//!    The primary defense is the preflight verification of `/sys/kernel/security/lsm` for `bpf`.
+//! 2. Safe kernel version baseline (Linux 6.1.184+ / 6.6+).
 //! 3. Netfilter / nftables userspace availability.
 
 use std::fs;
@@ -55,10 +58,11 @@ pub fn run_preflight_checks(strict: bool, min_version: &str) -> anyhow::Result<P
     if strict {
         if !report.lsm_active {
             anyhow::bail!(
-                "PREFLIGHT ERROR: BPF LSM is not enabled in the current kernel!\n\
+                "PREFLIGHT ERROR: BPF LSM is not active in the current kernel!\n\
                  Current /sys/kernel/security/lsm contents: '{}'\n\
-                 Fix: Append 'lsm=...,bpf' to your kernel cmdline in /etc/default/grub (GRUB_CMDLINE_LINUX) \
-                 and run 'sudo update-grub && sudo reboot'.",
+                 CVE-2026-64192 mitigation requires 'bpf' to be active in the LSM stack.\n\
+                 Fix (Ubuntu/Debian): Append 'lsm=...,bpf' to GRUB_CMDLINE_LINUX in /etc/default/grub \
+                 and execute 'sudo update-grub && sudo reboot'.",
                 lsm_content.trim()
             );
         }
@@ -66,15 +70,15 @@ pub fn run_preflight_checks(strict: bool, min_version: &str) -> anyhow::Result<P
         if !report.is_kernel_safe {
             anyhow::bail!(
                 "PREFLIGHT ERROR: Kernel version '{}' is below required safe threshold '{}'!\n\
-                 Loading BPF_MAP_TYPE_INODE_STORAGE on unpatched older kernels risks kernel panic (CVE-2026-64192).\n\
-                 Please upgrade to Linux 6.1 or newer.",
+                 Unpatched older kernels without BPF in the LSM stack risk kernel panics (CVE-2026-64192).\n\
+                 Please update to Linux kernel 6.1.184+ or 6.6+.",
                 kernel_version,
                 min_version
             );
         }
     } else {
         if !report.lsm_active {
-            warn!("BPF LSM is not active. Running in simulated fallback mode.");
+            warn!("BPF LSM is not active in /sys/kernel/security/lsm. Running in simulated fallback mode.");
         }
         if !report.is_kernel_safe {
             warn!("Kernel version check skipped or warning issued.");

@@ -18,8 +18,12 @@ pub enum RuleId {
     UntrustedBinaryOrigin,
     /// +50: Fileless execution from anonymous memory (memfd_create).
     FilelessMemfd,
+    /// +35: Executable anonymous mapping or unlinked tmpfs file (mmap PROT_EXEC on i_nlink==0 or memfd dlopen).
+    FilelessAnonExec,
     /// +20: Interpreter with inline code (-c, -e), base64/eval, or piped input.
     SuspiciousInterpreter,
+    /// +25: Interpreter reading secrets while running via stdin pipe or inline script.
+    SuspiciousScriptExecution,
     /// +10: Direct IP connection without preceding DNS query.
     RawIpConnect,
     /// +15: First-time connection to a public destination IP outside RFC1918 / loopback.
@@ -41,7 +45,9 @@ impl RuleId {
             RuleId::FastExfilBurst => 15,
             RuleId::UntrustedBinaryOrigin => 25,
             RuleId::FilelessMemfd => 50,
+            RuleId::FilelessAnonExec => 35,
             RuleId::SuspiciousInterpreter => 20,
+            RuleId::SuspiciousScriptExecution => 25,
             RuleId::RawIpConnect => 10,
             RuleId::FirstSeenDestination => 15,
             RuleId::TofuTamperedBinary => 40,
@@ -57,7 +63,9 @@ impl RuleId {
             RuleId::FastExfilBurst => "FAST_EXFIL_BURST",
             RuleId::UntrustedBinaryOrigin => "UNTRUSTED_BINARY_ORIGIN",
             RuleId::FilelessMemfd => "FILELESS_MEMFD",
+            RuleId::FilelessAnonExec => "FILELESS_ANON_EXEC",
             RuleId::SuspiciousInterpreter => "SUSPICIOUS_INTERPRETER",
+            RuleId::SuspiciousScriptExecution => "SUSPICIOUS_SCRIPT_EXECUTION",
             RuleId::RawIpConnect => "RAW_IP_CONNECT",
             RuleId::FirstSeenDestination => "FIRST_SEEN_DESTINATION",
             RuleId::TofuTamperedBinary => "TOFU_TAMPERED_BINARY",

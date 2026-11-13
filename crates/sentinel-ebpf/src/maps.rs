@@ -6,9 +6,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 
-use sentinel_common::events::{MAY_READ, MAY_WRITE};
+use sentinel_common::events::{
+    encode_flow_mark, FlowContext, MAY_EXEC, MAY_READ, MAY_WRITE, SENTINEL_MARK_REVAL_BIT,
+    SENTINEL_SO_MARK_PREFIX,
+};
 
 /// Bitflags representing taint states of a task or inode object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -24,6 +28,8 @@ impl TaintFlags {
     pub const TAINTED_PIPE: u32 = 1 << 5;
     pub const TAINTED_TEMPFILE: u32 = 1 << 6;
     pub const PENDING_INSPECT: u32 = 1 << 7;
+    pub const TAINT_MMAP_SHARED: u32 = 1 << 8;
+    pub const TAINT_SCM_RIGHTS: u32 = 1 << 9;
 
     pub fn is_empty(&self) -> bool {
         self.0 == Self::NONE
@@ -48,7 +54,9 @@ impl TaintFlags {
             | Self::TAINTED_TELEGRAM
             | Self::TAINTED_CRYPTO
             | Self::TAINTED_PIPE
-            | Self::TAINTED_TEMPFILE)) != 0
+            | Self::TAINTED_TEMPFILE
+            | Self::TAINT_MMAP_SHARED
+            | Self::TAINT_SCM_RIGHTS)) != 0
     }
 }
 
@@ -82,6 +90,7 @@ pub struct SkStorageEntry {
     pub tgid: u32,
     pub so_mark: u32,
     pub held_in_nfqueue: bool,
+    pub requires_reval: bool,
 }
 
 /// Verdict for `lsm/unix_may_send` hook.
@@ -104,6 +113,28 @@ pub enum PtraceVerdict {
     Deny,
     /// Tracer inherits taint from target process.
     TaintTracer,
+}
+
+/// Verdict for `lsm/mmap_file` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmapVerdict {
+    /// Normal file mapping allowed.
+    Allow,
+    /// Reading mapped secret: taint reader task.
+    TaintTask,
+    /// Tainted task mapped file with PROT_WRITE | MAP_SHARED: mark target inode tainted.
+    TaintInode,
+    /// Executable mapping on unlinked/tmpfs file: flag potential fileless execution (+35).
+    FlagAnonExec,
+}
+
+/// Verdict for `lsm/file_receive` (SCM_RIGHTS) hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileReceiveVerdict {
+    /// Clean descriptor transfer allowed.
+    Allow,
+    /// Transferred descriptor is tainted or a secret: taint receiver task.
+    TaintReceiver,
 }
 
 /// Taint Hygiene validator to prevent over-tainting the entire desktop OS.
@@ -192,12 +223,36 @@ impl TaintHygiene {
 
         false
     }
+
+    /// Determines whether a process is an OS-level IPC broker or graphical compositor.
+    /// Used to prevent "Taint Explosion" where messaging a system broker taints the entire OS.
+    pub fn is_ipc_broker_name(exe_name: &str) -> bool {
+        matches!(
+            exe_name,
+            "dbus-daemon"
+                | "dbus-broker"
+                | "systemd"
+                | "pipewire"
+                | "pipewire-pulse"
+                | "wireplumber"
+                | "xdg-desktop-portal"
+                | "gnome-shell"
+                | "kwin"
+                | "kwin_wayland"
+                | "kwin_x11"
+                | "sway"
+                | "hyprland"
+                | "mutter"
+                | "wayland"
+        )
+    }
 }
 
 /// Unified userspace manager and simulation mirror for Kernel Object Storages:
 /// - BPF_MAP_TYPE_TASK_STORAGE (resolved through task->group_leader)
 /// - BPF_MAP_TYPE_INODE_STORAGE
 /// - BPF_MAP_TYPE_SK_STORAGE
+/// - flow_mark_ctx (BPF_MAP_TYPE_HASH / LRU_HASH: mark -> FlowContext)
 #[derive(Debug, Clone, Default)]
 pub struct TaintMapManager {
     /// Mirror of `BPF_MAP_TYPE_TASK_STORAGE` keyed by group leader TGID.
@@ -208,11 +263,102 @@ pub struct TaintMapManager {
     inodes: Arc<RwLock<HashMap<(u64, u64), InodeStorageEntry>>>,
     /// Active allowlist for whitelisted TGIDs.
     allowed_tgids: Arc<RwLock<HashSet<u32>>>,
+    /// Synchronous eBPF map `flow_mark_ctx` (mark -> FlowContext).
+    flow_mark_ctx: Arc<RwLock<HashMap<u32, FlowContext>>>,
+    /// Monotonic sequence generator for dynamic flow marks.
+    flow_seq: Arc<AtomicU16>,
+    /// PID of the verified sentinel-gui process for in-kernel ptrace protection.
+    gui_pid: Arc<RwLock<Option<u32>>>,
+    /// PID of the sentineld daemon process for self-defense.
+    daemon_pid: Arc<RwLock<Option<u32>>>,
+    /// Explicitly registered IPC broker TGIDs (anti-taint explosion).
+    ipc_brokers: Arc<RwLock<HashSet<u32>>>,
+    /// Sockets tracked in SK_STORAGE keyed by socket cookie.
+    sockets: Arc<RwLock<HashMap<u64, SkStorageEntry>>>,
 }
 
 impl TaintMapManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register verified GUI process PID for in-kernel ptrace and memory protection.
+    pub fn set_gui_pid(&self, pid: u32) {
+        let mut g = self.gui_pid.write().unwrap();
+        *g = Some(pid);
+    }
+
+    /// Get current registered GUI PID.
+    pub fn get_gui_pid(&self) -> Option<u32> {
+        *self.gui_pid.read().unwrap()
+    }
+
+    /// Register daemon PID for kernel self-defense.
+    pub fn set_daemon_pid(&self, pid: u32) {
+        let mut d = self.daemon_pid.write().unwrap();
+        *d = Some(pid);
+    }
+
+    /// Register an IPC broker process to prevent transitive taint explosion.
+    pub fn register_ipc_broker(&self, tgid: u32) {
+        let leader = self.resolve_group_leader(tgid);
+        let mut b = self.ipc_brokers.write().unwrap();
+        b.insert(leader);
+    }
+
+    /// Check if a process is an active IPC broker.
+    pub fn is_ipc_broker(&self, tgid: u32) -> bool {
+        let leader = self.resolve_group_leader(tgid);
+        let b = self.ipc_brokers.read().unwrap();
+        b.contains(&leader)
+    }
+
+    /// Register a new flow context synchronously before setting mark on the socket/packet.
+    ///
+    /// # Synchronous eBPF Map Flow:
+    /// In kernel eBPF, the program first inserts `FlowContext` into `flow_mark_ctx` by mark,
+    /// and then applies the mark to the socket/packet. When sentineld receives the packet
+    /// from NFQUEUE, it looks up `FlowContext` by `NFQA_MARK` immediately, eliminating any
+    /// race condition with RingBuffer!
+    pub fn register_flow_context(
+        &self,
+        tgid: u32,
+        pid: u32,
+        uid: u32,
+        sock_cookie: u64,
+        exe_inode: u64,
+        requires_reval: bool,
+    ) -> u32 {
+        let leader_tgid = self.resolve_group_leader(tgid);
+        let taint_flags = self
+            .get_task_storage(leader_tgid)
+            .map(|t| t.taint_flags.0)
+            .unwrap_or(0);
+
+        let seq = self.flow_seq.fetch_add(1, Ordering::SeqCst);
+        let mark = encode_flow_mark(seq, requires_reval);
+
+        let ctx = FlowContext {
+            mark,
+            tgid: leader_tgid,
+            pid,
+            uid,
+            cgroup_id: 0,
+            sock_cookie,
+            taint_flags,
+            exe_inode,
+            exec_id: 0,
+        };
+
+        let mut map = self.flow_mark_ctx.write().unwrap();
+        map.insert(mark, ctx);
+        mark
+    }
+
+    /// Look up FlowContext by packet mark (instant synchronous retrieval upon NFQUEUE arrival).
+    pub fn lookup_flow_context(&self, mark: u32) -> Option<FlowContext> {
+        let map = self.flow_mark_ctx.read().unwrap();
+        map.get(&mark).copied()
     }
 
     /// Register a thread (TID) under its process group leader (TGID).
@@ -400,6 +546,124 @@ impl TaintMapManager {
         None
     }
 
+    /// Process `lsm/mmap_file` hook:
+    /// - Detects reading secrets via `mmap` (MAP_SHARED or MAP_PRIVATE)
+    /// - Detects writing to shared memory / files from tainted processes (`MAP_SHARED | PROT_WRITE`)
+    /// - Detects executable mappings (`PROT_EXEC`) on anonymous memory or unlinked tmpfs files
+    pub fn handle_mmap_file(
+        &self,
+        id: u32,
+        dev: u64,
+        ino: u64,
+        path: &Path,
+        prot: u32,
+        flags: u32,
+    ) -> MmapVerdict {
+        let leader_tgid = self.resolve_group_leader(id);
+        let path_str = path.to_string_lossy();
+
+        if TaintHygiene::is_exempt_path(&path_str) {
+            return MmapVerdict::Allow;
+        }
+
+        let is_write_shared = (prot & MAY_WRITE != 0 || (prot & 0x2) != 0) && (flags & 0x1 != 0 /* MAP_SHARED */);
+        let is_exec = (prot & MAY_EXEC != 0) || ((prot & 0x4) != 0);
+
+        // 1. Executable mapping on unlinked file or tmpfs / memfd -> FlagAnonExec
+        if is_exec {
+            let is_unlinked_or_tmpfs = path_str.contains("(deleted)")
+                || path_str.starts_with("/dev/shm")
+                || path_str.starts_with("/memfd:")
+                || path_str.contains("/memfd:");
+            if is_unlinked_or_tmpfs {
+                return MmapVerdict::FlagAnonExec;
+            }
+        }
+
+        // 2. Secret file mapped -> Taint reader process
+        if TaintHygiene::is_strictly_private_secret(&path_str) {
+            let mut taint = TaintFlags::default();
+            taint.insert(TaintFlags::TAINTED_SSH);
+            taint.insert(TaintFlags::TAINT_MMAP_SHARED);
+            self.set_task_taint(leader_tgid, taint);
+            return MmapVerdict::TaintTask;
+        }
+
+        // 3. Tainted process maps normal file with PROT_WRITE | MAP_SHARED -> Taint target inode
+        if is_write_shared && self.is_tainted(leader_tgid) {
+            let parent_flags = self
+                .get_task_storage(leader_tgid)
+                .map(|t| t.taint_flags)
+                .unwrap_or(TaintFlags(TaintFlags::TAINT_MMAP_SHARED));
+
+            let mut inodes = self.inodes.write().unwrap();
+            let inode_entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
+                taint_flags: TaintFlags::default(),
+                source_tgid: leader_tgid,
+                dev,
+                ino,
+                is_pipe: false,
+                is_fifo: false,
+            });
+
+            inode_entry.taint_flags.0 |= parent_flags.0;
+            inode_entry.taint_flags.insert(TaintFlags::TAINT_MMAP_SHARED);
+            return MmapVerdict::TaintInode;
+        }
+
+        // 4. Any process maps an already-tainted inode -> inherit taint
+        let inode_tainted = {
+            let inodes = self.inodes.read().unwrap();
+            inodes.get(&(dev, ino)).map(|e| e.taint_flags)
+        };
+
+        if let Some(taint) = inode_tainted {
+            if taint.is_tainted() {
+                self.set_task_taint(leader_tgid, taint);
+                return MmapVerdict::TaintTask;
+            }
+        }
+
+        MmapVerdict::Allow
+    }
+
+    /// Process `lsm/file_receive` hook: intercepts descriptor passing via SCM_RIGHTS over AF_UNIX.
+    pub fn handle_file_receive(
+        &self,
+        receiver_id: u32,
+        sender_id: u32,
+        dev: u64,
+        ino: u64,
+        path: &Path,
+    ) -> FileReceiveVerdict {
+        let receiver_leader = self.resolve_group_leader(receiver_id);
+        let sender_leader = self.resolve_group_leader(sender_id);
+        let path_str = path.to_string_lossy();
+
+        if TaintHygiene::is_exempt_path(&path_str) {
+            return FileReceiveVerdict::Allow;
+        }
+
+        let is_secret = TaintHygiene::is_strictly_private_secret(&path_str);
+        let inode_tainted = {
+            let inodes = self.inodes.read().unwrap();
+            inodes.get(&(dev, ino)).map(|e| e.taint_flags.is_tainted()).unwrap_or(false)
+        };
+        let sender_tainted = self.is_tainted(sender_leader);
+
+        if is_secret || inode_tainted || (sender_tainted && !path_str.starts_with("/usr")) {
+            let mut taint = self
+                .get_task_storage(sender_leader)
+                .map(|t| t.taint_flags)
+                .unwrap_or(TaintFlags(TaintFlags::TAINT_SCM_RIGHTS));
+            taint.insert(TaintFlags::TAINT_SCM_RIGHTS);
+            self.set_task_taint(receiver_leader, taint);
+            return FileReceiveVerdict::TaintReceiver;
+        }
+
+        FileReceiveVerdict::Allow
+    }
+
     /// Process `lsm/unix_may_send` hook: prevents IPC taint laundering via AF_UNIX domain sockets.
     pub fn handle_unix_may_send(
         &self,
@@ -421,6 +685,12 @@ impl TaintMapManager {
             return UnixSendVerdict::Allow;
         }
 
+        // Anti-Taint Explosion: System IPC brokers (dbus-daemon, systemd, pipewire)
+        // must not spread taint to all other clean clients across the session!
+        if self.is_ipc_broker(receiver_leader) {
+            return UnixSendVerdict::Allow;
+        }
+
         // If communicating with an untainted peer, propagate taint or block transfer
         if !self.is_tainted(receiver_leader) {
             // Propagate taint to receiver to close taint laundering loophole
@@ -435,6 +705,11 @@ impl TaintMapManager {
     }
 
     /// Process `lsm/ptrace_access_check` hook: prevents memory inspection and process injection.
+    ///
+    /// # Kernel Self-Defense for GUI & Daemon:
+    /// Protects `sentinel-gui` and `sentineld` from memory tampering (`ptrace`, `process_vm_readv/writev`,
+    /// `/proc/<pid>/mem`). Any unprivileged peer of the same UID attempting to attach is immediately
+    /// denied (-EPERM), closing the P0 attack surface!
     pub fn handle_ptrace_access_check(
         &self,
         tracer_id: u32,
@@ -444,15 +719,28 @@ impl TaintMapManager {
         let tracer_leader = self.resolve_group_leader(tracer_id);
         let tracee_leader = self.resolve_group_leader(tracee_id);
 
+        // 1. Nuclear GUI & Daemon Self-Defense:
+        // Protected processes (sentinel-gui, sentineld) CANNOT be attached or snooped by unprivileged processes,
+        // even if running under the same user UID!
+        let gui_pid = self.get_gui_pid();
+        let daemon_pid = *self.daemon_pid.read().unwrap();
+
+        if Some(tracee_leader) == gui_pid || Some(tracee_leader) == daemon_pid {
+            // Only root debugger (UID 0 / CAP_SYS_PTRACE) is permitted
+            if tracer_leader != 0 {
+                return PtraceVerdict::Deny;
+            }
+        }
+
         let tracer_tainted = self.is_tainted(tracer_leader);
         let tracee_tainted = self.is_tainted(tracee_leader);
 
-        // A tainted process must NOT attach to or snoop memory of clean processes
+        // 2. A tainted process must NOT attach to or snoop memory of clean processes
         if tracer_tainted && !tracee_tainted {
             return PtraceVerdict::Deny;
         }
 
-        // If a clean process attaches to a tainted process, it inherits the taint
+        // 3. If a clean process attaches to a tainted process, it inherits the taint
         if !tracer_tainted && tracee_tainted {
             if let Some(tracee_storage) = self.get_task_storage(tracee_leader) {
                 self.set_task_taint(tracer_leader, tracee_storage.taint_flags);
@@ -645,5 +933,76 @@ mod tests {
         // Infected process tries to attach or snoop clean system process
         let verdict = manager.handle_ptrace_access_check(infected_tgid, clean_system_tgid, 0);
         assert_eq!(verdict, PtraceVerdict::Deny);
+    }
+
+    #[test]
+    fn test_nuclear_gui_self_defense() {
+        let manager = TaintMapManager::new();
+        let gui_tgid = 8000;
+        manager.set_gui_pid(gui_tgid);
+
+        let unprivileged_stealer = 8050; // Same UID, not root
+
+        // Stealer tries to attach / snoop sentinel-gui memory
+        let verdict = manager.handle_ptrace_access_check(unprivileged_stealer, gui_tgid, 0);
+        assert_eq!(verdict, PtraceVerdict::Deny, "Nuclear GUI self-defense failed!");
+
+        // Root debugger (tgid 0) is allowed
+        let root_verdict = manager.handle_ptrace_access_check(0, gui_tgid, 0);
+        assert_eq!(root_verdict, PtraceVerdict::Allow);
+    }
+
+    #[test]
+    fn test_flow_mark_context_synchronous() {
+        let manager = TaintMapManager::new();
+        let tgid = 9500;
+        manager.mark_tainted(tgid);
+
+        // Register flow synchronously in eBPF map
+        let mark = manager.register_flow_context(tgid, 9500, 1000, 0x12345678, 9999, false);
+
+        // Immediate lookup by mark returns exact FlowContext with no race
+        let ctx = manager.lookup_flow_context(mark);
+        assert!(ctx.is_some());
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.tgid, tgid);
+        assert_eq!(ctx.mark, mark);
+        assert_ne!(ctx.taint_flags, 0);
+    }
+
+    #[test]
+    fn test_mmap_secret_and_shared_memory() {
+        let manager = TaintMapManager::new();
+        let reader_tgid = 4500;
+        let writer_tgid = 4501;
+        let shm_path = Path::new("/dev/shm/payload_shared");
+
+        // 1. Reading secret via mmap
+        let res = manager.handle_mmap_file(reader_tgid, 1, 100, Path::new("/home/user/.ssh/id_rsa"), MAY_READ, 0);
+        assert_eq!(res, MmapVerdict::TaintTask);
+        assert!(manager.is_tainted(reader_tgid));
+
+        // 2. Tainted writer maps /dev/shm with PROT_WRITE | MAP_SHARED
+        let res2 = manager.handle_mmap_file(reader_tgid, 2, 200, shm_path, MAY_WRITE, 1);
+        assert_eq!(res2, MmapVerdict::TaintInode);
+
+        // 3. Clean process maps the shared memory -> becomes tainted
+        let res3 = manager.handle_mmap_file(writer_tgid, 2, 200, shm_path, MAY_READ, 1);
+        assert_eq!(res3, MmapVerdict::TaintTask);
+        assert!(manager.is_tainted(writer_tgid));
+    }
+
+    #[test]
+    fn test_anti_taint_explosion_dbus_broker() {
+        let manager = TaintMapManager::new();
+        let tainted_app = 3300;
+        let dbus_broker = 105; // dbus-daemon system bus
+        manager.mark_tainted(tainted_app);
+        manager.register_ipc_broker(dbus_broker);
+
+        let verdict = manager.handle_unix_may_send(tainted_app, dbus_broker, Path::new("/run/dbus/system_bus_socket"));
+        assert_eq!(verdict, UnixSendVerdict::Allow);
+        // DBus broker MUST NOT become tainted!
+        assert!(!manager.is_tainted(dbus_broker));
     }
 }

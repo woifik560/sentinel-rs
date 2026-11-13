@@ -55,9 +55,12 @@ impl DpkgChecker {
 }
 
 fn query_and_verify_dpkg(path: &Path) -> Option<DpkgInfo> {
+    // Resolve symlinks to canonical path to prevent symlink traversal/aliasing bypasses
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
     let output = Command::new("dpkg")
         .arg("-S")
-        .arg(path)
+        .arg(&canonical_path)
         .output()
         .ok()?;
 
@@ -70,11 +73,21 @@ fn query_and_verify_dpkg(path: &Path) -> Option<DpkgInfo> {
     if let Some((pkg_part, _)) = stdout.split_once(':') {
         let clean_pkg = pkg_part.split(':').next().unwrap_or(pkg_part).trim();
         if !clean_pkg.is_empty() {
-            let is_verified = verify_dpkg_checksum(clean_pkg, path);
-            let sha256 = compute_sha256(path);
+            // Verify path is in root:root system paths and not user-writable
+            let is_root_system_path = canonical_path.starts_with("/usr/bin")
+                || canonical_path.starts_with("/bin")
+                || canonical_path.starts_with("/usr/lib");
+
+            let is_md5_verified = verify_dpkg_checksum(clean_pkg, &canonical_path);
+            let sha256 = compute_sha256(&canonical_path);
+
+            // SHA-256 is the single source of truth for runtime integrity
+            let is_verified = is_root_system_path && is_md5_verified && sha256.is_some();
+
             debug!(
-                "dpkg matched {} -> {} (verified_integrity: {}, sha256: {:?})",
+                "dpkg matched {} (canonical: {}) -> {} (verified_integrity: {}, sha256: {:?})",
                 path.display(),
+                canonical_path.display(),
                 clean_pkg,
                 is_verified,
                 sha256

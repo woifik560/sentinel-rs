@@ -2,7 +2,8 @@
 //! sentinel-gui — Native Slint desktop UI for Sentinel-RS.
 //!
 //! Provides interactive incident alerts with process lineage breadcrumbs,
-//! risk score gauges, and Fail-Closed countdown timers (< 30 MB RAM).
+//! risk score gauges, X11 anti-clickjacking PIN confirmation, and
+//! Fail-Closed countdown timers (< 30 MB RAM).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use tracing::{info, warn};
 use sentinel_common::ipc::{IpcMessage, PromptAction, PromptRequest, PromptVerdict};
 
 slint::slint! {
-    import { Button } from "std-widgets.slint";
+    import { Button, LineEdit } from "std-widgets.slint";
 
     export component IncidentPromptWindow inherits Window {
         in-out property <string> incident_id: "inc-000";
@@ -24,25 +25,56 @@ slint::slint! {
         in-out property <string> target_text: "185.220.101.5:443 (Без DNS)";
         in-out property <string> reasons_text: "• Чтение SSH ключей\n• Скрипт из /tmp\n• Прямой IP";
         in-out property <int> remaining_seconds: 30;
+        in-out property <bool> is_x11: false;
+        in-out property <string> auth_pin_expected: "";
+        in-out property <string> auth_pin_input: "";
 
         callback kill_clicked();
         callback deny_clicked();
         callback allow_once_clicked();
+        callback allow_duration_clicked();
+        callback allow_host_clicked();
         callback allow_scope_clicked();
 
         title: "Sentinel-RS — Инцидент Безопасности";
-        min_width: 620px;
-        min_height: 480px;
+        min_width: 680px;
+        min_height: 540px;
 
         VerticalLayout {
             padding: 24px;
-            spacing: 14px;
+            spacing: 12px;
 
             Text {
                 text: "ПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ (FREEZE & INSPECT)";
                 font_size: 16px;
                 font_weight: 700;
                 color: #d32f2f;
+            }
+
+            if root.is_x11: Rectangle {
+                background: #fff3cd;
+                border_radius: 6px;
+                border_width: 1px;
+                border_color: #ffeeba;
+                height: 48px;
+
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "⚠️ X11 СЕССИЯ: Возможно фальшивое нажатие! Введите PIN [" + root.auth_pin_expected + "]:";
+                        color: #856404;
+                        font_weight: 600;
+                        vertical_alignment: center;
+                    }
+
+                    LineEdit {
+                        width: 100px;
+                        text <=> root.auth_pin_input;
+                        placeholder_text: "PIN";
+                    }
+                }
             }
 
             Rectangle {
@@ -104,14 +136,14 @@ slint::slint! {
             }
 
             HorizontalLayout {
-                spacing: 12px;
+                spacing: 8px;
 
                 Button {
                     text: "Убить (SIGKILL)";
                     clicked => { root.kill_clicked(); }
                 }
                 Button {
-                    text: "Блокировать";
+                    text: "Блок (TCP RST)";
                     clicked => { root.deny_clicked(); }
                 }
                 Button {
@@ -119,7 +151,15 @@ slint::slint! {
                     clicked => { root.allow_once_clicked(); }
                 }
                 Button {
-                    text: "Добавить в Scope";
+                    text: "На 5 минут";
+                    clicked => { root.allow_duration_clicked(); }
+                }
+                Button {
+                    text: "Для хоста";
+                    clicked => { root.allow_host_clicked(); }
+                }
+                Button {
+                    text: "В Scope";
                     clicked => { root.allow_scope_clicked(); }
                 }
             }
@@ -127,10 +167,28 @@ slint::slint! {
     }
 }
 
+/// Detects if the current desktop session is running on X11 instead of Wayland.
+fn detect_x11_session() -> bool {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        return false;
+    }
+    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
+        if session_type.to_lowercase() == "x11" {
+            return true;
+        }
+    }
+    std::env::var("DISPLAY").is_ok()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     info!("Starting Sentinel-RS Desktop GUI (Slint UI)...");
+
+    let is_x11 = detect_x11_session();
+    if is_x11 {
+        warn!("Running under X11 desktop environment. Synthetic input protection (one-time PIN) will be enforced.");
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -152,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let window = IncidentPromptWindow::new()?;
+    window.set_is_x11(is_x11);
 
     if is_demo {
         info!("Running in GUI demo mode");
@@ -163,19 +222,14 @@ async fn main() -> anyhow::Result<()> {
         window.set_reasons_text(
             "• Доступ к SSH-ключам неуполномоченным процессом (+40)\n• Скрипт запущен из /tmp (+25)\n• Попытка эксфильтрации в течение 5 секунд (+15)\n• Прямое подключение по IP-адресу (+10)".into()
         );
+        window.set_auth_pin_expected("7491".into());
 
-        window.on_kill_clicked(|| {
-            info!("User clicked Kill in demo");
-        });
-        window.on_deny_clicked(|| {
-            info!("User clicked Deny in demo");
-        });
-        window.on_allow_once_clicked(|| {
-            info!("User clicked Allow Once in demo");
-        });
-        window.on_allow_scope_clicked(|| {
-            info!("User clicked Allow Scope in demo");
-        });
+        window.on_kill_clicked(|| info!("User clicked Kill in demo"));
+        window.on_deny_clicked(|| info!("User clicked Deny in demo"));
+        window.on_allow_once_clicked(|| info!("User clicked Allow Once in demo"));
+        window.on_allow_duration_clicked(|| info!("User clicked Allow Duration in demo"));
+        window.on_allow_host_clicked(|| info!("User clicked Allow Host in demo"));
+        window.on_allow_scope_clicked(|| info!("User clicked Allow Scope in demo"));
 
         window.run()?;
         return Ok(());
@@ -202,54 +256,35 @@ async fn main() -> anyhow::Result<()> {
     let window_handle = window.as_weak();
     let writer_clone = writer.clone();
 
-    // Wire action callbacks
-    let w_kill = window_handle.clone();
-    let wr_kill = writer_clone.clone();
-    window.on_kill_clicked(move || {
-        if let Some(w) = w_kill.upgrade() {
-            let id = w.get_incident_id().to_string();
-            let wr = wr_kill.clone();
-            tokio::spawn(async move {
-                send_verdict(wr, id, PromptAction::Kill).await;
-            });
+    // Helper macro/closure for verdict submission
+    let wire_action = |w_weak: slint::Weak<IncidentPromptWindow>, wr: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, act_factory: Box<dyn Fn(&IncidentPromptWindow) -> PromptAction + Send + 'static>| {
+        move || {
+            if let Some(w) = w_weak.upgrade() {
+                let id = w.get_incident_id().to_string();
+                let pin = if w.get_is_x11() {
+                    Some(w.get_auth_pin_input().to_string())
+                } else {
+                    None
+                };
+                let action = act_factory(&w);
+                let wr = wr.clone();
+                tokio::spawn(async move {
+                    send_verdict(wr, id, action, pin).await;
+                });
+            }
         }
-    });
+    };
 
-    let w_deny = window_handle.clone();
-    let wr_deny = writer_clone.clone();
-    window.on_deny_clicked(move || {
-        if let Some(w) = w_deny.upgrade() {
-            let id = w.get_incident_id().to_string();
-            let wr = wr_deny.clone();
-            tokio::spawn(async move {
-                send_verdict(wr, id, PromptAction::DenyOnce).await;
-            });
-        }
-    });
-
-    let w_allow = window_handle.clone();
-    let wr_allow = writer_clone.clone();
-    window.on_allow_once_clicked(move || {
-        if let Some(w) = w_allow.upgrade() {
-            let id = w.get_incident_id().to_string();
-            let wr = wr_allow.clone();
-            tokio::spawn(async move {
-                send_verdict(wr, id, PromptAction::AllowOnce).await;
-            });
-        }
-    });
-
-    let w_scope = window_handle.clone();
-    let wr_scope = writer_clone.clone();
-    window.on_allow_scope_clicked(move || {
-        if let Some(w) = w_scope.upgrade() {
-            let id = w.get_incident_id().to_string();
-            let wr = wr_scope.clone();
-            tokio::spawn(async move {
-                send_verdict(wr, id, PromptAction::AllowAppScope).await;
-            });
-        }
-    });
+    window.on_kill_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::Kill)));
+    window.on_deny_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::DenyOnce)));
+    window.on_allow_once_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowOnce)));
+    window.on_allow_duration_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowForDuration { seconds: 300 })));
+    window.on_allow_host_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|w| {
+        let tgt = w.get_target_text().to_string();
+        let host = tgt.split(':').next().unwrap_or("").trim().to_string();
+        PromptAction::AllowHost { host }
+    })));
+    window.on_allow_scope_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowAppScope)));
 
     // Background task to read incoming prompt requests from sentineld
     let w_incoming = window_handle.clone();
@@ -317,14 +352,20 @@ fn populate_prompt(w: &IncidentPromptWindow, p: PromptRequest) {
         .collect::<Vec<_>>()
         .join("\n");
     w.set_reasons_text(reasons.into());
+
+    w.set_is_x11(p.is_x11_session);
+    if let Some(pin) = p.auth_pin {
+        w.set_auth_pin_expected(pin.into());
+    }
 }
 
 async fn send_verdict(
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     incident_id: String,
     action: PromptAction,
+    auth_pin: Option<String>,
 ) {
-    let msg = IpcMessage::Verdict(PromptVerdict { incident_id, action });
+    let msg = IpcMessage::Verdict(PromptVerdict { incident_id, action, auth_pin });
     if let Ok(json) = serde_json::to_string(&msg) {
         let payload = json + "\n";
         let mut w = writer.lock().await;

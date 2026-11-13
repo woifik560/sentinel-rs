@@ -15,6 +15,6 @@ pub mod programs;
 
 pub use loader::EbpfLoader;
 pub use maps::{
-    InodeStorageEntry, PtraceVerdict, SkStorageEntry, TaskStorageEntry, TaintFlags, TaintHygiene,
-    TaintMapManager, UnixSendVerdict,
+    FileReceiveVerdict, InodeStorageEntry, MmapVerdict, PtraceVerdict, SkStorageEntry,
+    TaskStorageEntry, TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict,
 };

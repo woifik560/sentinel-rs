@@ -1,5 +1,5 @@
 [package]
-name = "sentinelctl"
+name = "sntctl"
 description = "Terminal CLI client for Sentinel-RS (watch, monitor, unfreeze, export, whitelist)"
 version.workspace = true
 edition.workspace = true

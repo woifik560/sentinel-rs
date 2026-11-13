@@ -15,6 +15,8 @@
 pub mod bprm_check_security;
 pub mod file_open;
 pub mod file_permission;
+pub mod file_receive;
+pub mod mmap_file;
 pub mod process_exec;
 pub mod process_fork;
 pub mod ptrace_access_check;

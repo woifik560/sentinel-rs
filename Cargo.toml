@@ -4,7 +4,7 @@ members = [
     "crates/sentinel-common",
     "crates/sentinel-ebpf",
     "crates/sentineld",
-    "crates/sentinelctl",
+    "crates/sntctl",
     "crates/sentinel-gui",
 ]
 
