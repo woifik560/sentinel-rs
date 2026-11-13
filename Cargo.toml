@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentinel-common",
+    "crates/sentinel-ebpf",
+    "crates/sentineld",
+    "crates/sentinelctl",
+    "crates/sentinel-gui",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+authors = ["woifik560"]
+license = "MIT OR GPL-2.0-only"
+repository = "https://github.com/woifik560/sentinel-rs"
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+anyhow = "1.0"

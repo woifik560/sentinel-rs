@@ -1,0 +1,21 @@
+# Sentinel-RS Configuration File (/etc/sentinel/config.toml)
+
+[general]
+mode = "balanced"            # strict | balanced | learning
+prompt_timeout_secs = 30     # Таймаут интерактивного ответа до Fail-Closed (сек)
+ring_buffer_size = 8192      # Размер LRU кэша цепочки процессов
+
+[socket]
+path = "/run/sentinel/sentinel.sock"
+
+[targets]
+protect_telegram = true
+protect_browsers = true
+protect_ssh = true
+protect_crypto = true
+
+[whitelist]
+binaries = [
+    "/usr/bin/apt",
+    "/usr/lib/firefox/firefox"
+]
