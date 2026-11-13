@@ -48,6 +48,7 @@ pub struct IpcServer {
     event_tx: broadcast::Sender<IpcMessage>,
     active_incidents: Arc<RwLock<std::collections::HashMap<String, String>>>,
     active_prompts: Arc<RwLock<std::collections::HashMap<String, PromptRequest>>>,
+    failed_pin_attempts: Arc<RwLock<std::collections::HashMap<String, u32>>>,
 }
 
 impl IpcServer {
@@ -73,6 +74,7 @@ impl IpcServer {
             event_tx,
             active_incidents: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_prompts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            failed_pin_attempts: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -141,6 +143,7 @@ impl IpcServer {
         let mgmt_event_tx = self.event_tx.clone();
         let mgmt_incidents = self.active_incidents.clone();
         let mgmt_prompts = self.active_prompts.clone();
+        let mgmt_failed_pins = self.failed_pin_attempts.clone();
         let expected_gui_path = self.gui_binary_path.clone();
 
         tokio::spawn(async move {
@@ -170,6 +173,7 @@ impl IpcServer {
                         let mut event_rx = mgmt_event_tx.subscribe();
                         let incidents = mgmt_incidents.clone();
                         let prompts = mgmt_prompts.clone();
+                        let failed_pins = mgmt_failed_pins.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(
@@ -181,6 +185,7 @@ impl IpcServer {
                                 &mut event_rx,
                                 incidents,
                                 prompts,
+                                failed_pins,
                             ).await {
                                 debug!("Management IPC client disconnected: {}", e);
                             }
@@ -209,6 +214,7 @@ impl IpcServer {
                     let mut event_rx = ro_event_tx.subscribe();
                     let incidents = ro_incidents.clone();
                     let prompts = ro_prompts.clone();
+                    let failed_pins = self.failed_pin_attempts.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
@@ -220,6 +226,7 @@ impl IpcServer {
                             &mut event_rx,
                             incidents,
                             prompts,
+                            failed_pins,
                         ).await {
                             debug!("Read-Only IPC client disconnected: {}", e);
                         }
@@ -404,6 +411,7 @@ async fn handle_client(
     event_rx: &mut broadcast::Receiver<IpcMessage>,
     incidents: Arc<RwLock<std::collections::HashMap<String, String>>>,
     active_prompts: Arc<RwLock<std::collections::HashMap<String, PromptRequest>>>,
+    failed_pin_attempts: Arc<RwLock<std::collections::HashMap<String, u32>>>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -458,12 +466,34 @@ async fn handle_client(
                                     if let Some(expected_pin) = prompt.auth_pin {
                                         let matches_pin = verdict.auth_pin.as_deref() == Some(&expected_pin);
                                         if !matches_pin {
+                                            let attempts = {
+                                                let mut map = failed_pin_attempts.write().await;
+                                                let count = map.entry(verdict.incident_id.clone()).or_insert(0);
+                                                *count += 1;
+                                                *count
+                                            };
+
+                                            if attempts >= 3 {
+                                                warn!(
+                                                    "X11 SECURITY ALERT: Incident {} exceeded maximum PIN attempts (3/3). Auto-dropping packet to prevent brute-force!",
+                                                    verdict.incident_id
+                                                );
+                                                freeze.drop(&verdict.incident_id);
+                                                let err_resp = IpcMessage::AuthError {
+                                                    message: "Maximum PIN attempts exceeded (3/3). Incident locked and network flow dropped.".into(),
+                                                };
+                                                let json = serde_json::to_string(&err_resp)? + "\n";
+                                                writer.write_all(json.as_bytes()).await?;
+                                                line.clear();
+                                                continue;
+                                            }
+
                                             warn!(
-                                                "X11 SECURITY ALERT: Verdict for incident {} rejected due to PIN mismatch!",
-                                                verdict.incident_id
+                                                "X11 SECURITY ALERT: Verdict for incident {} rejected due to PIN mismatch (attempt {}/3)!",
+                                                verdict.incident_id, attempts
                                             );
                                             let err_resp = IpcMessage::AuthError {
-                                                message: "X11 Security: One-time PIN mismatch. Verdict rejected.".into(),
+                                                message: format!("X11 Security: One-time PIN mismatch (attempt {}/3).", attempts),
                                             };
                                             let json = serde_json::to_string(&err_resp)? + "\n";
                                             writer.write_all(json.as_bytes()).await?;

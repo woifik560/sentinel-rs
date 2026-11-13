@@ -138,18 +138,28 @@ impl NfqueueHoldManager {
     ///
     /// Uses disjoint bitmasks ([31:24]=0x5E, [23]=reval flag, [22:0]=flow_id) to eliminate any bit collision!
     pub fn setup_nftables_rule() -> anyhow::Result<()> {
+        Self::setup_nftables_rule_with_bypass(true)
+    }
+
+    /// Configure kernel nftables rule with optional Fail-Safe queue bypass.
+    ///
+    /// When `use_bypass` is true (recommended for desktop), if sentineld is stopped or crashes,
+    /// Netfilter automatically bypasses the queue instead of dropping all desktop network traffic.
+    pub fn setup_nftables_rule_with_bypass(use_bypass: bool) -> anyhow::Result<()> {
         info!(
-            "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({})",
-            SENTINEL_NFQUEUE_NUM
+            "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({}, bypass={})",
+            SENTINEL_NFQUEUE_NUM, use_bypass
         );
+
+        let bypass_str = if use_bypass { " bypass" } else { "" };
 
         let setup_cmd = format!(
             "nft add table inet sentinel 2>/dev/null; \
              nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
-             nft add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {} 2>/dev/null; \
+             nft add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {}{} 2>/dev/null; \
              nft add rule inet sentinel output ct state established,related accept 2>/dev/null; \
-             nft add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {} 2>/dev/null",
-            SENTINEL_NFQUEUE_NUM, SENTINEL_NFQUEUE_NUM
+             nft add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{} 2>/dev/null",
+            SENTINEL_NFQUEUE_NUM, bypass_str, SENTINEL_NFQUEUE_NUM, bypass_str
         );
 
         let status = Command::new("sh")

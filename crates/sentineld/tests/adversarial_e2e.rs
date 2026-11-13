@@ -446,3 +446,53 @@ fn test_12_ld_preload_toctou_maps_defense() {
         "/proc/<pid>/maps inspection must detect hostile shared library even after environ wipe!"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Test 13: D-Bus / systemd Broker Escape Prevention
+// -----------------------------------------------------------------------------
+#[test]
+fn test_13_dbus_systemd_spawn_link() {
+    use crate::lineage::LineageTracker;
+
+    let tracker = LineageTracker::new(128);
+    let attacker_tgid = 9100;
+    let spawned_tgid = 9101;
+
+    // 1. Attacker directly accesses SSH secret
+    tracker.record_secret_access(
+        attacker_tgid,
+        PathBuf::from("/home/user/.ssh/id_rsa"),
+        SecretCategory::SshKey,
+        1000,
+    );
+
+    let attacker_node = tracker.get(attacker_tgid).unwrap();
+    assert!(attacker_node.has_secret_access());
+
+    // 2. Spawned process was launched via D-Bus / systemd-run (PPID is PID 1)
+    tracker.handle_fork(1, spawned_tgid);
+    let initial_spawned = tracker.get(spawned_tgid).unwrap();
+    assert!(!initial_spawned.has_secret_access(), "Initial process before broker link has no secrets");
+
+    // 3. Sentinel-RS detects the IPC spawn invocation and links them
+    tracker.link_ipc_spawn(attacker_tgid, spawned_tgid);
+
+    let linked_spawned = tracker.get(spawned_tgid).unwrap();
+    assert!(
+        linked_spawned.has_secret_access(),
+        "Spawned process must inherit secret taint through D-Bus/systemd broker link!"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 14: JIT Runtime Legitimate Memory Execution Compatibility
+// -----------------------------------------------------------------------------
+#[test]
+fn test_14_jit_runtime_allow() {
+    assert!(TaintHygiene::is_known_jit_runtime("chrome"));
+    assert!(TaintHygiene::is_known_jit_runtime("firefox"));
+    assert!(TaintHygiene::is_known_jit_runtime("node"));
+    assert!(TaintHygiene::is_known_jit_runtime("java"));
+    assert!(!TaintHygiene::is_known_jit_runtime("stealer"));
+    assert!(!TaintHygiene::is_known_jit_runtime("sh"));
+}

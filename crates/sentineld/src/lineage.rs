@@ -90,6 +90,30 @@ impl LineageTracker {
         debug!("Lineage fork: {} -> {}", parent_tgid, child_tgid);
     }
 
+    /// Link an indirect spawn via D-Bus / systemd broker to its initiator.
+    ///
+    /// When a tainted process calls `systemd-run` or invokes `org.freedesktop.systemd1` / portals
+    /// to spawn a helper process (whose apparent PPID is PID 1 or systemd), this method propagates
+    /// the initiator's taint and secret history to the spawned process, preventing broker escape!
+    pub fn link_ipc_spawn(&self, initiator_tgid: u32, spawned_tgid: u32) {
+        let mut g = self.graph.lock().unwrap();
+        let (has_secrets, secrets) = if let Some(initiator) = g.get(&initiator_tgid) {
+            (initiator.has_secret_access(), initiator.secret_accesses.clone())
+        } else {
+            (false, Vec::new())
+        };
+
+        if has_secrets {
+            if let Some(spawned) = g.get_mut(&spawned_tgid) {
+                spawned.secret_accesses.extend(secrets);
+                debug!(
+                    "Lineage IPC spawn linked: {} -> {} (inherited taint via D-Bus/systemd broker)",
+                    initiator_tgid, spawned_tgid
+                );
+            }
+        }
+    }
+
     /// Register a thread under its process group leader.
     pub fn register_thread(&self, tid: u32, leader_tgid: u32) {
         let mut g = self.graph.lock().unwrap();

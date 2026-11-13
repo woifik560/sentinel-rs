@@ -246,6 +246,26 @@ impl TaintHygiene {
                 | "wayland"
         )
     }
+
+    /// Recognizes legitimate JIT runtimes (browsers, Electron, JVM, Node.js)
+    /// which legitimately allocate dynamic code pages in memory (V8, SpiderMonkey, HotSpot).
+    pub fn is_known_jit_runtime(exe_name: &str) -> bool {
+        matches!(
+            exe_name,
+            "chrome"
+                | "google-chrome"
+                | "firefox"
+                | "firefox-bin"
+                | "chromium"
+                | "node"
+                | "nodejs"
+                | "java"
+                | "code"
+                | "discord"
+                | "slack"
+                | "electron"
+        )
+    }
 }
 
 /// Unified userspace manager and simulation mirror for Kernel Object Storages:

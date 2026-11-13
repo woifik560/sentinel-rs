@@ -7,7 +7,7 @@ Before=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sentineld --config /etc/sentinel/config.toml --rules /etc/sentinel/rules.toml
-ExecStopPost=/usr/sbin/nft delete table inet sentinel
+ExecStopPost=-/usr/sbin/nft delete table inet sentinel
 Restart=on-failure
 RestartSec=5s
 

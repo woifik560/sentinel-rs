@@ -1,0 +1,18 @@
+[Unit]
+Description=Sentinel-RS Desktop Alert GUI
+Documentation=https://github.com/woifik560/sentinel-rs
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sentinel-gui
+Restart=on-failure
+RestartSec=3s
+
+# Clean environment execution (anti-injection defense)
+UnsetEnvironment=LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH
+Environment=SLINT_BACKEND=winit
+
+[Install]
+WantedBy=graphical-session.target

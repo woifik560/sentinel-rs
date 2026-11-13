@@ -15,7 +15,14 @@
 
 ## About the Project (Version 2.0)
 
-**Sentinel-RS** is an ultra-lightweight host firewall and integrity monitor for Linux Desktop specifically engineered to prevent **Infostealers** and unauthorized credential exfiltration.
+**Sentinel-RS** is an ultra-lightweight host firewall and integrity monitor for Linux Desktop specifically engineered for **deterministic prevention of unauthorized credential exfiltration** by unprivileged user-space processes and Infostealers.
+
+### Threat Model Boundaries
+Sentinel-RS protects sensitive user data (`~/.ssh`, browser profiles/cookies, Telegram `tdata`, cryptocurrency wallets) from malicious code executed under the same user UID (including npm/pip/cargo build scripts, phishing payloads, and browser extensions):
+* **Within Scope**: Isolation of unprivileged user processes, taint-tracking across pipes, AF_UNIX sockets, and `ptrace`, network hold on new and pre-opened connections, cryptographic integrity enforcement.
+* **Out of Scope / Architectural Constraints**:
+  * *Root Compromise*: If malware gains root access (`sudo` or kernel exploitation), host security is fundamentally compromised at the kernel level.
+  * *X11 Session Limitations*: In X11 sessions, process window and input isolation are absent by design (`XGetImage`, key snooping). Sentinel-RS mitigates clickjacking with a one-time PIN and lockout after 3 failed attempts, but **Wayland is required for complete graphical isolation**.
 
 Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data provenance context, or bloated endpoint agents with opaque heuristics or nondeterministic LLMs, Sentinel-RS combines:
 1. **eBPF In-Kernel Object Storage**:
@@ -24,28 +31,30 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
 2. **End-to-End Data Flow Taint Tracking & Anti-Bypass Hooks**:
    - `lsm/file_permission`: Tracks secret leakage across pipes (`cat ~/.ssh/id_rsa | curl ...`), FIFOs, and temporary files (`/tmp`).
    - `lsm/file_receive`: Tracks file descriptor passing between processes via `SCM_RIGHTS` over AF_UNIX domain sockets.
-   - `lsm/mmap_file`: Tracks memory mappings of protected files and blocks execution (`PROT_EXEC`) on anonymous or tainted memory.
-   - `lsm/unix_may_send`: Prevents taint laundering across AF_UNIX sockets, isolating core desktop brokers (`dbus-daemon`, `systemd`, `pipewire`) from contaminating the entire desktop.
+   - `lsm/mmap_file`: Tracks memory mappings of protected files; blocks execution (`PROT_EXEC`) on anonymous or tainted memory while maintaining full compatibility with legitimate JIT runtimes (V8, SpiderMonkey, JVM, Node.js).
+   - `lsm/unix_may_send` & `LineageTracker`: Prevents taint laundering across AF_UNIX sockets and closes D-Bus broker escapes (`systemd-run`, `org.freedesktop.systemd1`, portals) by causal lineage linking.
    - `lsm/ptrace_access_check` & Kernel Self-Defense: Blocks `ptrace`, `process_vm_readv/writev`, and `/proc/<pid>/mem` access against both `sentineld` and `sentinel-gui` from any process running under the same user UID.
-3. **Fast-Path & Slow-Path Separation via NFQUEUE**:
-   - *Fast-Path in eBPF*: **Sub-microsecond in-kernel fast-path** on clean regular files with zero allocations or locks, eliminating I/O regressions during large project builds.
-   - *Synchronous Dynamic Mark Correlation with Zero Bit Collisions*: Eliminates race conditions between NFQUEUE and RingBuffer. Distinct bit allocation:
+3. **Harmonized Network Hook Ordering & Fast-Path / Slow-Path Separation**:
+   - *Kernel Hook Ordering*: Accounts for the fact that `cgroup_skb/egress` executes in `ip_finish_output()` (after Netfilter output/postrouting chains). Sentinel-RS applies a two-phase architecture:
+     1. In `lsm/socket_sendmsg` syscall context: returns `-EPERM` immediately for HIGH-risk processes, preventing packet creation.
+     2. In `cgroup/sendmsg4|6`, `cgroup/connect4|6`, and `sock_ops`: sets `SO_MARK` via `bpf_setsockopt` directly on the socket structure **before** Netfilter traversal.
+     3. In `cgroup_skb/egress`: immediately drops packets (`return 0`) as a hardware-like fail-safe for tainted tasks with queued packets.
+   - *Synchronous Dynamic Mark Correlation with Zero Bit Collisions*:
      - Bits `[31:24]` = `0x5E` (Sentinel magic byte)
      - Bit `[23]` = `0x00800000` (`REVAL_PREOPENED` flag)
      - Bits `[22:0]` = `flow_id` (up to 8.3M active concurrent flows)
      - New flow mark: `0x5E000000 | flow_id`
      - Revalidation mark: `0x5E800000 | flow_id`
      - In-kernel context is synchronously saved in `flow_mark_ctx` map by `flow_id` before packet departure.
-   - *Closing the Established Socket (`ct state established`) & UDP/QUIC Bypass*: If a process attempts exfiltration over a pre-opened socket, `lsm/socket_sendmsg` and `cgroup_skb/egress` tag the packet with `0x5E800000 | flow_id`. Netfilter rules are ordered:
-     1. `meta mark & 0xff800000 == 0x5e800000 counter queue num 100` (Reval Pre-Opened — prioritized above established!)
+   - *Netfilter Rules with Queue Bypass Resilience*:
+     1. `meta mark & 0xff800000 == 0x5e800000 counter queue num 100 bypass` (Reval Pre-Opened)
      2. `ct state established,related accept` (Line-speed kernel fast-path)
-     3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100` (New SYN hold)
-     Zero bit collisions: clean flows (`0x5E00xxxx`) never trigger rule 1.
+     3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass` (New SYN hold)
+     The `bypass` flag ensures that if the daemon is stopped or crashes, system network traffic is not locked up indefinitely.
 4. **LoLBin Hardening & TOFU**:
+   - Package integrity provider abstraction (`PkgIntegrityProvider`): uses MD5 solely as a membership indicator, with local SHA-256 caching as the authoritative cryptographic standard.
    - Package trust discount (`-35`) is invalidated whenever a secret is accessed (`SECRET_NON_OWNER`) or when run via piped stdin or inline arguments.
-   - Cryptographic integrity verification via SHA-256 with symlink canonicalization, root-ownership verification, and cache invalidation on write (`MAY_WRITE`) and rename/unlink.
    - **Trust On First Use (TOFU)** for external tools (`~/.cargo/bin`, Flatpak, AppImage, local user builds).
-   - Contextual policies ("who + what secret + where to connect").
 5. **Dual-Socket Architecture & Strict GUI Peer Verification (P0)**:
    - **Dual Unix Domain Sockets**:
      - `/run/sentinel/sentinel-ro.sock` (0666): Public read-only socket for monitoring, status queries, and forensic exports (`sntctl monitor`, `sntctl status`, `sntctl export`).
@@ -53,6 +62,9 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
    - **Strict Peer Verification & TOCTOU Defense**:
      - Validates `SO_PEERCRED` (`uid` and `pid`). Root granted administrative rights.
      - Resolves canonical `/proc/<pid>/exe`, checks root ownership (`uid == 0`), non-writable permissions (`mode & 0o022 == 0`), and SHA-256.
+     - Inspects `/proc/<pid>/environ` to verify absence of `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`.
+     - **Anti-TOCTOU `/proc/<pid>/maps` Inspection**: Even if a hostile library's constructor wiped `environ` in memory prior to `connect()`, the daemon inspects process memory maps. Executable mappings (`r-xp`) from `/tmp`, `/dev/shm`, `~`, or deleted files immediately terminate authorization.
+   - **X11 Anti-Clickjacking Defense**: Detects X11 sessions, mandates entering an ephemeral 4-digit PIN, and locks out the prompt after 3 failed attempts.
      - Inspects `/proc/<pid>/environ` to verify absence of `LD_PRELOAD` / `LD_AUDIT`.
      - **Anti-TOCTOU `/proc/<pid>/maps` Inspection**: Even if a hostile library's constructor wiped `environ` in memory prior to `connect()`, the daemon inspects process memory maps. Executable mappings (`r-xp`) from `/tmp`, `/dev/shm`, `~`, or deleted files immediately terminate authorization.
    - **X11 Anti-Clickjacking Defense**: Detects X11 sessions and mandates entering an ephemeral 4-digit PIN for sensitive prompt actions.
@@ -198,4 +210,7 @@ sntctl export <INCIDENT_ID> --format json
 # Manage application whitelist
 sntctl whitelist list
 sudo sntctl whitelist add /usr/bin/curl
+
+# Run full system diagnostics and security preflight
+sntctl doctor
 ```
