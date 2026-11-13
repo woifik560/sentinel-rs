@@ -37,6 +37,11 @@ pub fn simulate_file_open_check(
     path_str: &str,
     current_exe: &str,
 ) -> Option<SecretCategory> {
+    // 0. Cross-process /proc/<pid>/environ or /proc/<pid>/mem snooping
+    if path_str.starts_with("/proc/") && (path_str.ends_with("/environ") || path_str.ends_with("/mem")) {
+        return Some(SecretCategory::Other(format!("Cross-Process Secret Snoop: {}", path_str)));
+    }
+
     // 1. Enforce Taint Hygiene: Ignore non-private files (.pub, config, known_hosts)
     if !TaintHygiene::is_strictly_private_secret(path_str) {
         return None;

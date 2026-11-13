@@ -51,6 +51,11 @@ pub struct SecretAccessEvent {
 pub struct ProcessNode {
     /// Thread Group ID (process PID in Linux).
     pub tgid: u32,
+    /// Group leader TGID (for threads in the same process group).
+    pub group_leader_tgid: u32,
+    /// Known thread IDs (TIDs) associated with this thread group.
+    #[serde(default)]
+    pub threads: HashSet<u32>,
     /// Parent process TGID.
     pub ppid: u32,
     /// User ID of the process.
@@ -61,7 +66,12 @@ pub struct ProcessNode {
     pub exe_path: PathBuf,
     /// Device and inode of the executable for identity tracking.
     pub exe_dev_ino: (u64, u64),
-    /// Lazily computed SHA-256 hash of the executable, cached by (dev, ino, mtime).
+    /// Modification and metadata change times for tamper detection.
+    #[serde(default)]
+    pub mtime_ns: u64,
+    #[serde(default)]
+    pub ctime_ns: u64,
+    /// Lazily computed SHA-256 hash of the executable, cached by (dev, ino, mtime, ctime).
     pub exe_sha256: Option<String>,
     /// Package origin from dpkg database (e.g. "firefox" from dpkg -S).
     pub pkg_origin: Option<String>,
@@ -85,13 +95,19 @@ impl ProcessNode {
     /// Create a new empty process node with the given identifiers.
     pub fn new(tgid: u32, ppid: u32, uid: u32, exe_path: PathBuf) -> Self {
         let is_shell = is_interactive_shell_binary(&exe_path);
+        let mut threads = HashSet::new();
+        threads.insert(tgid);
         Self {
             tgid,
+            group_leader_tgid: tgid,
+            threads,
             ppid,
             uid,
             start_time_ns: 0,
             exe_path,
             exe_dev_ino: (0, 0),
+            mtime_ns: 0,
+            ctime_ns: 0,
             exe_sha256: None,
             pkg_origin: None,
             cmdline: Vec::new(),
@@ -102,6 +118,16 @@ impl ProcessNode {
             contacted_ips: HashSet::new(),
             secret_accesses: Vec::new(),
         }
+    }
+
+    /// Register a new thread in this process group.
+    pub fn add_thread(&mut self, tid: u32) {
+        self.threads.insert(tid);
+    }
+
+    /// Check if a given TID belongs to this process.
+    pub fn contains_thread(&self, tid: u32) -> bool {
+        self.tgid == tid || self.threads.contains(&tid)
     }
 
     /// Returns the display name: the script path for interpreters, or exe basename.

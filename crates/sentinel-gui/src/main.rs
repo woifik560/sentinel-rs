@@ -273,35 +273,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Sanitize untrusted input strings to prevent UI injection, ANSI control spoofing, or script injection.
+fn sanitize_display_string(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(512)
+        .collect()
+}
+
 fn populate_prompt(w: &IncidentPromptWindow, p: PromptRequest) {
-    w.set_incident_id(p.incident_id.into());
-    w.set_risk_score(p.risk_score as i32);
+    let clean_incident_id = sanitize_display_string(&p.incident_id);
+    w.set_incident_id(clean_incident_id.into());
+    w.set_risk_score((p.risk_score as i32).clamp(0, 100));
 
     let lineage_str = p
         .lineage
         .iter()
-        .map(|s| s.to_string())
+        .map(|s| sanitize_display_string(&s.to_string()))
         .collect::<Vec<_>>()
         .join(" -> ");
     w.set_lineage_text(lineage_str.into());
 
     if let Some(sec) = p.secret_path {
+        let clean_sec = sanitize_display_string(&sec);
         let delta = p
             .time_delta_ms
             .map(|ms| format!(" ({:.2}s назад)", ms as f64 / 1000.0))
             .unwrap_or_default();
-        w.set_secret_text(format!("{}{}", sec, delta).into());
+        w.set_secret_text(format!("{}{}", clean_sec, delta).into());
     }
 
     if let Some(ip) = p.dest_ip {
+        let clean_ip = sanitize_display_string(&ip);
         let port_str = p.dest_port.map(|port| format!(":{}", port)).unwrap_or_default();
-        w.set_target_text(format!("{}{}", ip, port_str).into());
+        w.set_target_text(format!("{}{}", clean_ip, port_str).into());
     }
 
     let reasons = p
         .reasons
         .iter()
-        .map(|r| format!("• {}", r))
+        .map(|r| format!("• {}", sanitize_display_string(r)))
         .collect::<Vec<_>>()
         .join("\n");
     w.set_reasons_text(reasons.into());

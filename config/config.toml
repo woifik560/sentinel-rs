@@ -7,6 +7,9 @@ ring_buffer_size = 8192      # Размер LRU кэша цепочки проц
 so_mark = 0x5E170001         # Ядерная метка пакетов для Netfilter (SO_MARK)
 nfqueue_num = 100            # Номер очереди NFQUEUE для бесшовного удержания SYN-пакетов
 audit_only = false           # Режим "Тихий наблюдатель" (Веха 1 / Soak Mode)
+pending_queue_size = 512     # Защита от DoS: максимальный размер очереди ожидающих вердикта пакетов
+aggregate_window_ms = 2000   # Окно агрегации одинаковых сетевых запросов от одного процесса (мс)
+min_kernel_version = "6.1"   # Минимальная безопасная версия ядра для BPF_MAP_TYPE_INODE_STORAGE
 
 [socket]
 path = "/run/sentinel/sentinel.sock"
@@ -17,8 +20,28 @@ protect_browsers = true
 protect_ssh = true
 protect_crypto = true
 
+[tofu]
+enabled = true
+db_path = "/var/lib/sentinel/tofu.json"
+
 [whitelist]
 binaries = [
     "/usr/bin/apt",
     "/usr/lib/firefox/firefox"
 ]
+
+[[context_rules]]
+id = "DEV_SSH_GITHUB"
+binary_path = "/usr/bin/ssh"
+secret_category = "ssh"
+allowed_destinations = ["github.com", "gitlab.com", "bitbucket.org", "140.82.112.3", "140.82.112.4"]
+allowed_ports = [22, 443]
+description = "Предодобренный доступ SSH к удаленным репозиториям GitHub/GitLab"
+
+[[context_rules]]
+id = "DEV_GIT_REMOTES"
+binary_path = "/usr/bin/git"
+secret_category = "ssh"
+allowed_destinations = ["github.com", "gitlab.com", "bitbucket.org"]
+allowed_ports = [22, 443, 9418]
+description = "Предодобренная синхронизация Git с доверенными хостингами кода"

@@ -17,10 +17,13 @@ pub struct DpkgChecker {
     cache: Arc<RwLock<HashMap<PathBuf, Option<DpkgInfo>>>>,
 }
 
+use crate::sha_cache::compute_sha256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DpkgInfo {
     pub package_name: String,
     pub is_integrity_verified: bool,
+    pub sha256: Option<String>,
 }
 
 impl DpkgChecker {
@@ -43,6 +46,12 @@ impl DpkgChecker {
         cache.insert(path.to_path_buf(), info.clone());
         info
     }
+
+    /// Invalidate cache for a specific binary path upon modification or unlink.
+    pub fn invalidate_path(&self, path: &Path) {
+        let mut cache = self.cache.write().unwrap();
+        cache.remove(path);
+    }
 }
 
 fn query_and_verify_dpkg(path: &Path) -> Option<DpkgInfo> {
@@ -62,15 +71,18 @@ fn query_and_verify_dpkg(path: &Path) -> Option<DpkgInfo> {
         let clean_pkg = pkg_part.split(':').next().unwrap_or(pkg_part).trim();
         if !clean_pkg.is_empty() {
             let is_verified = verify_dpkg_checksum(clean_pkg, path);
+            let sha256 = compute_sha256(path);
             debug!(
-                "dpkg matched {} -> {} (verified_integrity: {})",
+                "dpkg matched {} -> {} (verified_integrity: {}, sha256: {:?})",
                 path.display(),
                 clean_pkg,
-                is_verified
+                is_verified,
+                sha256
             );
             return Some(DpkgInfo {
                 package_name: clean_pkg.to_string(),
                 is_integrity_verified: is_verified,
+                sha256,
             });
         }
     }
@@ -215,13 +227,14 @@ fn md5_digest(initial_msg: &[u8]) -> String {
         d = d.wrapping_add(dd);
     }
 
-    format!(
-        "{:08x}{:08x}{:08x}{:08x}",
-        a.to_le(),
-        b.to_le(),
-        c.to_le(),
-        d.to_le()
-    )
+    let mut out = String::with_capacity(32);
+    for word in [a, b, c, d] {
+        for byte in word.to_le_bytes() {
+            use std::fmt::Write;
+            let _ = write!(out, "{:02x}", byte);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

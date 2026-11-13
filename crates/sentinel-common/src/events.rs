@@ -80,6 +80,7 @@ pub enum EbpfEvent {
     /// LSM hook `lsm/socket_connect` — a process initiated a TCP/UDP connection.
     SocketConnect {
         tgid: u32,
+        group_leader_tgid: u32,
         addr_family: u16,
         dst_ipv4: Option<Ipv4Addr>,
         dst_ipv6: Option<Ipv6Addr>,
@@ -88,14 +89,42 @@ pub enum EbpfEvent {
         so_mark: u32,
     },
 
-    /// LSM hook `lsm/socket_sendmsg` — connectionless UDP sendmsg.
+    /// LSM hook `lsm/socket_sendmsg` — connectionless UDP or pre-opened socket transmission.
     SocketSendmsg {
         tgid: u32,
+        group_leader_tgid: u32,
         addr_family: u16,
         dst_ipv4: Option<Ipv4Addr>,
         dst_ipv6: Option<Ipv6Addr>,
         dst_port: u16,
         so_mark: u32,
+        is_preopened: bool,
+    },
+
+    /// LSM hook `lsm/unix_may_send` — IPC AF_UNIX message transfer between processes.
+    /// Intercepts taint laundering attempts via local Unix domain sockets.
+    UnixMaySend {
+        sender_tgid: u32,
+        receiver_tgid: u32,
+        sock_path: PathBuf,
+        is_blocked: bool,
+    },
+
+    /// LSM hook `lsm/ptrace_access_check` — inspects memory attachment or cross-process reading.
+    /// Blocks tainted processes from attaching to or snooping memory of clean processes.
+    PtraceAccessCheck {
+        tracer_tgid: u32,
+        tracee_tgid: u32,
+        mode: u32,
+        is_blocked: bool,
+    },
+
+    /// LSM hook `lsm/file_open` on /proc/*/environ or /proc/*/mem of another process.
+    ProcEnvironAccess {
+        reader_tgid: u32,
+        target_tgid: u32,
+        path: PathBuf,
+        is_blocked: bool,
     },
 }
 
@@ -185,6 +214,30 @@ pub struct RawSocketSendmsgEvent {
     pub dst_ipv4: u32,
     pub dst_ipv6: [u8; 16],
     pub dst_port: u16,
-    pub _pad: u16,
+    pub _pad: u8,
+    pub is_preopened: u8,
     pub so_mark: u32,
+}
+
+/// Raw C-compatible structure for ring buffer transport (unix_may_send).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawUnixMaySendEvent {
+    pub sender_tgid: u32,
+    pub receiver_tgid: u32,
+    pub sock_path: [u8; MAX_PATH_LEN],
+    pub sock_path_len: u32,
+    pub is_blocked: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Raw C-compatible structure for ring buffer transport (ptrace_access_check).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawPtraceAccessCheckEvent {
+    pub tracer_tgid: u32,
+    pub tracee_tgid: u32,
+    pub mode: u32,
+    pub is_blocked: u8,
+    pub _pad: [u8; 3],
 }

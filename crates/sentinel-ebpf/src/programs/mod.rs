@@ -17,5 +17,7 @@ pub mod file_open;
 pub mod file_permission;
 pub mod process_exec;
 pub mod process_fork;
+pub mod ptrace_access_check;
 pub mod socket_connect;
 pub mod socket_sendmsg;
+pub mod unix_may_send;

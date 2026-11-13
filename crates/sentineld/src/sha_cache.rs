@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
-type CacheKey = (u64, u64, u64); // (dev, ino, mtime_ns)
+type CacheKey = (u64, u64, u64, u64); // (dev, ino, mtime_ns, ctime_ns)
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -26,8 +26,15 @@ impl ShaCache {
     }
 
     /// Retrieve cached SHA-256 or compute and store it lazily.
-    pub fn get_or_compute<P: AsRef<Path>>(&self, path: P, dev: u64, ino: u64, mtime_ns: u64) -> Option<String> {
-        let key = (dev, ino, mtime_ns);
+    pub fn get_or_compute<P: AsRef<Path>>(
+        &self,
+        path: P,
+        dev: u64,
+        ino: u64,
+        mtime_ns: u64,
+        ctime_ns: u64,
+    ) -> Option<String> {
+        let key = (dev, ino, mtime_ns, ctime_ns);
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some(hash) = cache.get(&key) {
@@ -39,6 +46,53 @@ impl ShaCache {
         let mut cache = self.cache.lock().unwrap();
         cache.put(key, hash.clone());
         Some(hash)
+    }
+
+    /// Instantly invalidate all cached hashes for an inode upon write/delete/unlink events.
+    pub fn invalidate_inode(&self, dev: u64, ino: u64) {
+        let mut cache = self.cache.lock().unwrap();
+        // Remove keys matching (dev, ino)
+        let keys_to_remove: Vec<CacheKey> = cache
+            .iter()
+            .filter(|((k_dev, k_ino, _, _), _)| *k_dev == dev && *k_ino == ino)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for key in keys_to_remove {
+            cache.pop(&key);
+        }
+    }
+
+    /// Read filesystem metadata and compute or retrieve SHA-256.
+    pub fn get_for_path(&self, path: &Path) -> Option<(u64, u64, u64, u64, String)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let dev = meta.dev();
+                let ino = meta.ino();
+                let mtime_ns = meta.mtime_nsec() as u64;
+                let ctime_ns = meta.ctime_nsec() as u64;
+                if let Some(hash) = self.get_or_compute(path, dev, ino, mtime_ns, ctime_ns) {
+                    return Some((dev, ino, mtime_ns, ctime_ns, hash));
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mtime_ns = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                if let Some(hash) = self.get_or_compute(path, 0, 0, mtime_ns, 0) {
+                    return Some((0, 0, mtime_ns, 0, hash));
+                }
+            }
+        }
+
+        None
     }
 }
 

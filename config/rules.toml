@@ -40,6 +40,16 @@ id = "RAW_IP_CONNECT"
 weight = 10
 description = "Подключение напрямую по IP-адресу без зафиксированного DNS-запроса"
 
+[rules.tofu_tampered_binary]
+id = "TOFU_TAMPERED_BINARY"
+weight = 40
+description = "Криптографическое несоответствие SHA-256 бинарника в базе TOFU (бинарник был подменён или модифицирован после первого запуска)"
+
+[rules.ipc_taint_launder]
+id = "IPC_TAINT_LAUNDER"
+weight = 30
+description = "Попытка отмывания taint через передачу в AF_UNIX сокет или перехват памяти ptrace"
+
 [rules.trusted_package_context]
 id = "TRUSTED_PACKAGE_CONTEXT"
 weight = -35

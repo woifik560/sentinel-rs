@@ -18,16 +18,27 @@
 **Sentinel-RS** — это ультралегковесный хостовый фаервол и монитор целостности для Linux Desktop, нацеленный на гарантированное предотвращение работы **инфостилеров** (Infostealers) и несанкционированной эксфильтрации конфиденциальных данных.
 
 В отличие от классических пакетных фильтров (`iptables`, `nftables`, `ufw`), которые не знают происхождения данных, и тяжелых антивирусов с непрозрачными эвристиками или нестабильными LLM, Sentinel-RS сочетает:
-1. **Ядерные объектные хранилища (eBPF Object Storage)**: переход с PID/TGID карт на `BPF_MAP_TYPE_TASK_STORAGE`, `BPF_MAP_TYPE_INODE_STORAGE` и `BPF_MAP_TYPE_SK_STORAGE`. Это исключает утечки памяти и гонки при переиспользовании PID (PID reuse).
-2. **Сквозное отслеживание потока данных (Taint Tracking)**: хук `lsm/file_permission` перехватывает перетекание секретов через пайпы (`cat ~/.ssh/id_rsa | curl ...`), FIFO и временные файлы (`/tmp`).
+1. **Ядерные объектные хранилища (eBPF Object Storage)**:
+   - Переход с PID/TGID карт на `BPF_MAP_TYPE_TASK_STORAGE`, `BPF_MAP_TYPE_INODE_STORAGE` и `BPF_MAP_TYPE_SK_STORAGE`. Это исключает утечки памяти и гонки при переиспользовании PID (PID reuse).
+   - **Синхронизация taint между потоками (`task->group_leader`)**: taint-состояние привязано к лидеру группы потоков, поэтому чтение секрета одним потоком мгновенно блокирует сетевые сокеты всех остальных потоков этого процесса (Go goroutines, Tokio, Python, Node.js).
+2. **Сквозное отслеживание потока данных (Taint Tracking) и защита от отмывания taint (Anti-Laundering)**:
+   - Хук `lsm/file_permission` перехватывает перетекание секретов через пайпы (`cat ~/.ssh/id_rsa | curl ...`), FIFO и временные файлы (`/tmp`).
+   - Хук `lsm/unix_may_send`: блокирует или распространяет taint при попытке слить секрет через сокеты AF_UNIX незаражённому процессу.
+   - Хук `lsm/ptrace_access_check` и защита `/proc/<pid>/environ`: запрещает заражённым процессам считывать чужую память через `process_vm_readv`, ptrace или переменные окружения.
 3. **Разделение Fast-Path и Slow-Path с удержанием в NFQUEUE**:
-   - *Fast-Path*: легитимные процессы проходят сетевую проверку за наносекунды прямо в ядре без обращения к демону.
-   - *Slow-Path*: подозрительный и помеченный трафик маркируется тегом `SO_MARK` (`0x5E170001`) и бесшовно замораживается на уровне Netfilter `NFQUEUE` без разрыва соединения и без опасного `SIGSTOP`.
-4. **Защита от LoLBin-атак (Living off the Land)**:
-   - Скидка доверия пакету dpkg (`-35`) блокируется, если процесс прочитал секрет (`SECRET_NON_OWNER`). Системные `curl`, `git`, `python3` гарантированно требуют подтверждения.
-   - Проверка криптографической целостности бинарников по `/var/lib/dpkg/info/*.md5sums`.
-5. **Предохранитель Never-Freeze Allowlist**:
-   - Жесткий список защиты рабочего стола (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, эмуляторы терминалов). Они никогда не подвергаются `SIGSTOP`.
+   - *Fast-Path в eBPF*: hot-path проверка в `file_permission` выполняется за `< 5 наносекунд` без аллокаций и локов на чистых регулярных файлах, исключая I/O-просадки при компиляции проектов.
+   - *Fast-Path в Netfilter*: правило `ct state established,related accept` пропускает весь гигабитный трафик внутри ядра; в userspace NFQUEUE направляется только первый пакет `ct state new` с меткой `SO_MARK` (`0x5E170001`).
+   - *Поддержка UDP/QUIC/DNS и уже открытых сокетов*: перехват через `cgroup/sendmsg4/6` и `lsm/socket_sendmsg` мгновенно блокирует передачу даже в сокеты, открытые до чтения секрета.
+4. **Защита от LoLBin-атак (Living off the Land) и TOFU**:
+   - Скидка доверия пакету dpkg (`-35`) блокируется, если процесс прочитал секрет (`SECRET_NON_OWNER`).
+   - Проверка криптографической целостности бинарников по SHA-256 с кэшированием по `(dev, inode, mtime, ctime)` и мгновенной инвалидацией при записи.
+   - Механизм **TOFU (Trust On First Use)** для внешнего софта (`~/.cargo/bin`, Flatpak, AppImage, локальные бинарники): фиксация SHA-256 первого запуска и выявление подмены.
+   - Контекстные правила («кто + какой секрет + куда»): легитимный `ssh` с приватным ключом может без промпта подключаться к `github.com:22`, но блокируется при попытке уйти на неизвестный IP/порт.
+5. **Предохранитель Never-Freeze Allowlist и защита от DoS**:
+   - Жесткий список защиты рабочего стола (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`).
+   - **Anti-Spoofing**: валидация только по связке `(dev, inode)`, каноническому пути бинарника и системному UID. Подмена `comm` через `prctl(PR_SET_NAME)` или запуск из `/tmp` тривиально пресекаются.
+   - Защита очереди NFQUEUE от DoS-спама (лимит `pending_queue_size = 512`, агрегация дубликатов, `OOMScoreAdjust = -900`).
+   - Строгие preflight-проверки ядра: проверка наличия `bpf` в `/sys/kernel/security/lsm` и безопасной версии ядра (Linux 6.1+ для предотвращения CVE-2026-64192).
 
 > **Архитектурный принцип V2.0:** Никаких встроенных нейросетей (LLM) в ядре безопасности! Демон не подвержен галлюцинациям, не требует инструкций AVX2, принимает решения за **< 1 миллисекунды** и потребляет **менее 25–30 МБ оперативной памяти**.
 
@@ -36,10 +47,11 @@
 ## Ключевые возможности
 
 - **eBPF Object Storage & Taint Tracking**:
-  - `TASK_STORAGE`: хранит статус Taint и профиль доверия задачи, очищается ядром при завершении процесса.
+  - `TASK_STORAGE`: хранит статус Taint и профиль доверия задачи, синхронизируется через `task->group_leader`.
   - `INODE_STORAGE`: отслеживает заражение пайпов, FIFO и файлов.
   - `SK_STORAGE`: удерживает ядерную метку `SO_MARK` на сокете.
-  - `lsm/file_permission`: если процесс пишет секрет в pipe или файл, inode помечается taint; читающий процесс мгновенно наследует метку.
+  - `lsm/file_permission`: hot-path fast exit (< 5 ns) на чистых файлах; при записи секрета помечает inode, читающий процесс наследует метку.
+  - `lsm/unix_may_send` & `lsm/ptrace_access_check`: перекрытие отмывания taint через локальные сокеты и ptrace/память.
 - **Taint Hygiene (Гигиена меток)**:
   - Исключение из распространения псевдотерминалов (`/dev/pts/*`), `/dev/null`, системных журналов и сокетов Wayland/X11.
   - Строгая фильтрация секретов: защищаются только приватные ключи (`~/.ssh/id_*`), исключая публичные (`*.pub`), `known_hosts` и `config`.
@@ -49,14 +61,17 @@
 - **Глубокий анализ контекста запуска**:
   - `lsm/bprm_check_security`: ранняя детекция бесфайлового запуска из оперативной памяти (`memfd_create`) до завершения `execve`.
   - Инспекция скриптов интерпретаторов (`python3`, `bash`, `node`, `perl`).
+  - TOFU (Trust On First Use) фиксация SHA-256 для Cargo, Flatpak, AppImage.
 - **Детерминированный движок риска (0..100) за < 1 мс**:
   - Математически прозрачные веса правил без «черных ящиков».
   - Пороги: **LOW** (0..39), **GREY** (40..74), **HIGH** (75..100).
 - **Безопасный «Freeze & Inspect» через NFQUEUE**:
-  - Удержание первого SYN-пакета в очереди Netfilter без `SIGSTOP` и без зависания графической сессии.
+  - Удержание первого пакета нового соединения (`ct state new`) в очереди Netfilter без `SIGSTOP` и без зависания графической сессии.
   - Принцип **Fail-Closed**: автоматический сброс пакета при таймауте 30 секунд.
+  - Грамотное восстановление сети (`clean_nftables_rules`) при остановке службы.
 - **Защита IPC через `SO_PEERCRED`**:
   - Управляющие вердикты принимаются только от root или UID текущей активной десктопной сессии.
+  - Непривилегированный Slint GUI с санитаризацией входных строк от инъекций.
 - **Экстремальная легковесность**:
   - Фоновый демон: **< 25–30 МБ RAM**
   - Десктопный GUI: **< 30 МБ RAM**
@@ -207,40 +222,48 @@ sentinelctl whitelist add /usr/bin/curl
 sentinel-rs/
 ├── crates/
 │   ├── sentinel-common/            # Общая библиотека типов, протоколов и моделей
-│   │   ├── events.rs               # eBPF-события: file_permission, bprm_check_security, connect
-│   │   ├── process.rs              # ProcessNode, baseline profile, shell isolation
-│   │   ├── risk.rs                 # Детерминированный движок риска, LoLBin floor, RuleId
+│   │   ├── events.rs               # eBPF-события: file_permission, bprm_check_security, connect, unix_may_send
+│   │   ├── process.rs              # ProcessNode, baseline profile, shell isolation, group_leader
+│   │   ├── risk.rs                 # Детерминированный движок риска, LoLBin floor, TOFU, RuleId
 │   │   ├── ipc.rs                  # Форматы сообщений Unix IPC (PromptRequest, Verdict)
 │   │   ├── incident.rs             # Форматирование криминалистических отчетов
-│   │   └── config.rs               # Конфигурация SO_MARK, NFQUEUE, Never-Freeze allowlist
+│   │   └── config.rs               # Конфигурация SO_MARK, NFQUEUE, Never-Freeze allowlist, context_rules
 │   │
 │   ├── sentinel-ebpf/              # eBPF LSM хуки, tracepoints и объектные хранилища
-│   │   ├── maps.rs                 # TASK_STORAGE, INODE_STORAGE, SK_STORAGE, TaintHygiene
-│   │   ├── loader.rs               # Загрузчик программ и RingBuffer listener
+│   │   ├── maps.rs                 # TASK_STORAGE, INODE_STORAGE, SK_STORAGE, group_leader, TaintHygiene
+│   │   ├── loader.rs               # Загрузчик программ, preflight-проверки ядра, RingBuffer listener
 │   │   └── programs/
-│   │       ├── file_open.rs        # lsm/file_open: строго приватные секреты
-│   │       ├── file_permission.rs  # lsm/file_permission: отслеживание pipe (cat | curl)
+│   │       ├── file_open.rs        # lsm/file_open: строго приватные секреты & /proc/*/environ
+│   │       ├── file_permission.rs  # lsm/file_permission: hot-path fast exit (< 5 ns) & pipe taint
 │   │       ├── bprm_check_security.rs # lsm/bprm_check_security: раннее профилирование & memfd
-│   │       ├── process_fork.rs     # sched_process_fork: наследование с изоляцией shell
-│   │       ├── process_exec.rs     # sched_process_exec: отслеживание бинарников
+│   │       ├── unix_may_send.rs    # lsm/unix_may_send: защита от отмывания taint через AF_UNIX
+│   │       ├── ptrace_access_check.rs # lsm/ptrace_access_check: запрет snooping памяти clean-процессов
+│   │       ├── process_fork.rs     # sched_process_fork: наследование с изоляцией shell и потоками
+│   │       ├── process_exec.rs     # sched_process_exec: отслеживание бинарников и вычисление хеша
 │   │       ├── socket_connect.rs   # Fast-Path allow или Slow-Path SO_MARK (0x5E170001)
-│   │       └── socket_sendmsg.rs   # UDP sendmsg перехват
+│   │       └── socket_sendmsg.rs   # UDP/QUIC/DNS перехват и блокировка pre-opened сокетов
 │   │
 │   ├── sentineld/                  # Основной системный демон (Root, RAM < 30 MB)
 │   │   ├── main.rs                 # Точка входа, event loop, интеграция NFQUEUE
-│   │   ├── lineage.rs              # LRU DAG на 8192 узла с shell isolation
-│   │   ├── risk_engine.rs          # Расчет риска за < 1 мс, FirstSeenDestination
-│   │   ├── pkg_check.rs            # Верификация происхождения и MD5-хешей dpkg
-│   │   ├── freeze.rs               # NFQUEUE Hold Manager & Never-Freeze Safety
+│   │   ├── preflight.rs            # Строгие preflight-проверки ядра (/sys/kernel/security/lsm, Linux 6.1+)
+│   │   ├── lineage.rs              # LRU DAG на 8192 узла с shell isolation и group_leader
+│   │   ├── risk_engine.rs          # Расчет риска за < 1 мс, FirstSeenDestination, TOFU
+│   │   ├── pkg_check.rs            # Верификация происхождения и SHA-256/MD5 целостности
+│   │   ├── sha_cache.rs            # Кэш SHA-256 по (dev, ino, mtime, ctime) с мгновенной инвалидацией
+│   │   ├── tofu.rs                 # Trust-On-First-Use база для Cargo, Flatpak, AppImage
+│   │   ├── context_policy.rs       # Контекстные правила («кто + какой секрет + куда лезет»)
+│   │   ├── verdict_cache.rs        # Кэш решений пользователя с инвалидацией при перезаписи бинарника
+│   │   ├── freeze.rs               # NFQUEUE Hold Manager (ct state new), Never-Freeze Safety & DoS защита
 │   │   ├── ipc_server.rs           # Unix Domain Socket + SO_PEERCRED
 │   │   └── tests/
-│   │       └── red_team.rs         # Интеграционный тест-сьют атак (cat|curl, memfd, LoLBin)
+│   │       └── red_team.rs         # Red-Team сьют атак (многопоточный стилер, UDP/QUIC, AF_UNIX, DoS)
 │   │
 │   ├── sentinelctl/                # Консольная утилита управления (CLI Triage)
-│   └── sentinel-gui/               # Легковесный Desktop UI (Slint, RAM < 30 MB)
+│   └── sentinel-gui/               # Легковесный Desktop UI (Slint, RAM < 30 MB, санитаризация строк)
 │
 ├── config/
-│   ├── config.toml                 # SO_MARK, NFQUEUE, Never-Freeze список
-│   └── rules.toml                  # Веса правил (включая FIRST_SEEN_DESTINATION)
+│   ├── config.toml                 # SO_MARK, NFQUEUE, Never-Freeze список, DoS лимиты, context_rules
+│   ├── rules.toml                  # Веса правил (включая TOFU_TAMPERED_BINARY, IPC_TAINT_LAUNDER)
+│   └── sentineld.service           # Systemd unit с минимизацией capabilities и OOMScoreAdjust=-900
 └── ТЗ.txt                          # Полное техническое задание проекта
 ```

@@ -71,6 +71,14 @@ impl LineageTracker {
         child.exe_dev_ino = exe_dev_ino;
         child.pkg_origin = pkg_origin;
 
+        // Thread Group tracking
+        if parent_tgid == child_tgid {
+            // New thread in same process group
+            if let Some(parent) = g.get_mut(&parent_tgid) {
+                parent.add_thread(child_tgid);
+            }
+        }
+
         // If parent has secret accesses and is NOT an interactive shell, inherit secret history
         if parent_has_secrets && !parent_is_shell {
             if let Some(parent) = g.get(&parent_tgid) {
@@ -82,12 +90,21 @@ impl LineageTracker {
         debug!("Lineage fork: {} -> {}", parent_tgid, child_tgid);
     }
 
+    /// Register a thread under its process group leader.
+    pub fn register_thread(&self, tid: u32, leader_tgid: u32) {
+        let mut g = self.graph.lock().unwrap();
+        if let Some(node) = g.get_mut(&leader_tgid) {
+            node.add_thread(tid);
+        }
+    }
+
     /// Handle process exec: updates executable path, cmdline, script analysis, and memfd detection.
     pub fn handle_exec(&self, tgid: u32, exe_path: PathBuf, cmdline: Vec<String>) {
         let mut g = self.graph.lock().unwrap();
         let is_memfd = detect_memfd(&exe_path);
         let script_info = inspect_interpreter(&exe_path, &cmdline);
         let is_shell = is_interactive_shell_binary(&exe_path);
+        let sha256 = crate::sha_cache::compute_sha256(&exe_path);
 
         if let Some(node) = g.get_mut(&tgid) {
             node.exe_path = exe_path;
@@ -95,12 +112,14 @@ impl LineageTracker {
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
             node.script_path = script_info.and_then(|s| s.script_path);
+            node.exe_sha256 = sha256;
         } else {
             let mut node = ProcessNode::new(tgid, 1, 1000, exe_path);
             node.cmdline = cmdline;
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
             node.script_path = script_info.and_then(|s| s.script_path);
+            node.exe_sha256 = sha256;
             g.put(tgid, node);
         }
         debug!("Lineage exec for TGID {}", tgid);

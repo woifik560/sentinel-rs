@@ -24,6 +24,10 @@ pub enum RuleId {
     RawIpConnect,
     /// +15: First-time connection to a public destination IP outside RFC1918 / loopback.
     FirstSeenDestination,
+    /// +40: Binary hash mismatch against TOFU recorded SHA-256 (tampered non-dpkg binary).
+    TofuTamperedBinary,
+    /// +30: Taint laundering attempt via AF_UNIX or ptrace memory snooping.
+    IpcTaintLaunder,
     /// -35: Binary verified in dpkg package database in legitimate context.
     /// NOTE: Disallowed if SecretNonOwner or Taint is present!
     TrustedPackageContext,
@@ -40,6 +44,8 @@ impl RuleId {
             RuleId::SuspiciousInterpreter => 20,
             RuleId::RawIpConnect => 10,
             RuleId::FirstSeenDestination => 15,
+            RuleId::TofuTamperedBinary => 40,
+            RuleId::IpcTaintLaunder => 30,
             RuleId::TrustedPackageContext => -35,
         }
     }
@@ -54,6 +60,8 @@ impl RuleId {
             RuleId::SuspiciousInterpreter => "SUSPICIOUS_INTERPRETER",
             RuleId::RawIpConnect => "RAW_IP_CONNECT",
             RuleId::FirstSeenDestination => "FIRST_SEEN_DESTINATION",
+            RuleId::TofuTamperedBinary => "TOFU_TAMPERED_BINARY",
+            RuleId::IpcTaintLaunder => "IPC_TAINT_LAUNDER",
             RuleId::TrustedPackageContext => "TRUSTED_PACKAGE_CONTEXT",
         }
     }

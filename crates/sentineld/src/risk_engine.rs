@@ -20,6 +20,9 @@ pub struct NetworkContext {
     pub has_dns_record: bool,
     pub is_first_seen_ip: bool,
     pub current_time_ns: u64,
+    pub is_tofu_tampered: bool,
+    pub is_ipc_laundered: bool,
+    pub dest_domain: Option<String>,
 }
 
 pub struct RiskEngine {
@@ -134,11 +137,31 @@ impl RiskEngine {
             });
         }
 
-        // 8. [-35] TRUSTED_PACKAGE_CONTEXT
+        // 8. [+40] TOFU_TAMPERED_BINARY (Binary modified after initial Trust-On-First-Use)
+        if net.is_tofu_tampered {
+            let weight = self.get_weight(RuleId::TofuTamperedBinary.as_str(), 40);
+            firings.push(RuleFiring {
+                rule_id: RuleId::TofuTamperedBinary,
+                weight,
+                reason: "Криптографическое несоответствие SHA-256 бинарника в базе TOFU (бинарник был подменён или модифицирован)".to_string(),
+            });
+        }
+
+        // 9. [+30] IPC_TAINT_LAUNDER (Attempt to transfer/launder secrets via AF_UNIX or ptrace)
+        if net.is_ipc_laundered {
+            let weight = self.get_weight(RuleId::IpcTaintLaunder.as_str(), 30);
+            firings.push(RuleFiring {
+                rule_id: RuleId::IpcTaintLaunder,
+                weight,
+                reason: "Попытка отмывания taint через AF_UNIX сокет или перехват памяти ptrace".to_string(),
+            });
+        }
+
+        // 10. [-35] TRUSTED_PACKAGE_CONTEXT
         // Legitimate binary in dpkg context, and NOT an interpreter executing an untrusted script,
-        // AND ONLY if NO SECRET / TAINT IS PRESENT (LoLBin prevention)!
+        // AND ONLY if NO SECRET / TAINT IS PRESENT, and no tampering/laundering detected!
         let is_script_untrusted = node.script_path.is_some() || node.is_memfd;
-        if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret {
+        if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret && !net.is_tofu_tampered && !net.is_ipc_laundered {
             let weight = self.get_weight(RuleId::TrustedPackageContext.as_str(), -35);
             firings.push(RuleFiring {
                 rule_id: RuleId::TrustedPackageContext,
@@ -210,6 +233,9 @@ mod tests {
             has_dns_record: false,
             is_first_seen_ip: true,
             current_time_ns: 1_140_000_000,
+            is_tofu_tampered: false,
+            is_ipc_laundered: false,
+            dest_domain: None,
         };
 
         let score = engine.evaluate(&node, &net);
@@ -249,6 +275,9 @@ mod tests {
             has_dns_record: true,
             is_first_seen_ip: false,
             current_time_ns: 20_000_000_000, // 19s delta (> 5s)
+            is_tofu_tampered: false,
+            is_ipc_laundered: false,
+            dest_domain: Some("evil.tld".into()),
         };
 
         let score = engine.evaluate(&node, &net);
@@ -259,5 +288,29 @@ mod tests {
         assert!(score.total >= 40);
         assert!(!score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext));
         assert_eq!(score.classify(&sentinel_common::risk::RiskThresholds::default()), sentinel_common::risk::Verdict::Grey);
+    }
+
+    #[test]
+    fn test_tofu_tampered_binary_detection() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        let node = ProcessNode::new(3100, 1000, 1000, PathBuf::from("/home/user/.cargo/bin/tampered_tool"));
+
+        let net = NetworkContext {
+            dest_ip: Some("198.51.100.1".into()),
+            dest_port: 8080,
+            has_dns_record: false,
+            is_first_seen_ip: true,
+            current_time_ns: 10_000_000_000,
+            is_tofu_tampered: true,
+            is_ipc_laundered: false,
+            dest_domain: None,
+        };
+
+        let score = engine.evaluate(&node, &net);
+        assert!(score.firings.iter().any(|f| f.rule_id == RuleId::TofuTamperedBinary));
+        assert!(score.total >= 40);
     }
 }

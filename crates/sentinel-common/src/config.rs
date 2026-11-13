@@ -25,6 +25,12 @@ pub struct GeneralConfig {
     pub nfqueue_num: u16,
     #[serde(default = "default_false")]
     pub audit_only: bool,
+    #[serde(default = "default_pending_queue_size")]
+    pub pending_queue_size: usize,
+    #[serde(default = "default_aggregate_window_ms")]
+    pub aggregate_window_ms: u64,
+    #[serde(default = "default_min_kernel_version")]
+    pub min_kernel_version: String,
     #[serde(default = "default_never_freeze_list")]
     pub never_freeze_allowlist: Vec<String>,
 }
@@ -39,6 +45,18 @@ fn default_prompt_timeout() -> u64 {
 
 fn default_ring_buffer_size() -> usize {
     8192
+}
+
+fn default_pending_queue_size() -> usize {
+    512
+}
+
+fn default_aggregate_window_ms() -> u64 {
+    2000
+}
+
+fn default_min_kernel_version() -> String {
+    "6.1".to_string()
 }
 
 fn default_so_mark() -> u32 {
@@ -97,6 +115,9 @@ impl Default for GeneralConfig {
             so_mark: default_so_mark(),
             nfqueue_num: default_nfqueue_num(),
             audit_only: default_false(),
+            pending_queue_size: default_pending_queue_size(),
+            aggregate_window_ms: default_aggregate_window_ms(),
+            min_kernel_version: default_min_kernel_version(),
             never_freeze_allowlist: default_never_freeze_list(),
         }
     }
@@ -156,6 +177,47 @@ pub struct WhitelistConfig {
     pub binaries: Vec<PathBuf>,
 }
 
+/// Trust On First Use (TOFU) configuration for binaries outside dpkg (~/.cargo/bin, Flatpak, AppImage).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TofuConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_tofu_db_path")]
+    pub db_path: PathBuf,
+}
+
+fn default_tofu_db_path() -> PathBuf {
+    PathBuf::from("/var/lib/sentinel/tofu.json")
+}
+
+impl Default for TofuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db_path: default_tofu_db_path(),
+        }
+    }
+}
+
+/// Contextual rule for legitimate binaries accessing specific secrets:
+/// "Binary (SHA-256) + Secret Class -> Allowed Destination Domains/CIDRs/Ports"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRule {
+    pub id: String,
+    #[serde(default)]
+    pub binary_path: Option<PathBuf>,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    #[serde(default)]
+    pub secret_category: Option<String>,
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    #[serde(default)]
+    pub allowed_ports: Vec<u16>,
+    #[serde(default)]
+    pub description: String,
+}
+
 /// Main Sentinel configuration matching `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SentinelConfig {
@@ -167,6 +229,10 @@ pub struct SentinelConfig {
     pub targets: TargetsConfig,
     #[serde(default)]
     pub whitelist: WhitelistConfig,
+    #[serde(default)]
+    pub tofu: TofuConfig,
+    #[serde(default)]
+    pub context_rules: Vec<ContextRule>,
 }
 
 impl SentinelConfig {

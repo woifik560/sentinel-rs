@@ -1,0 +1,45 @@
+[Unit]
+Description=Sentinel-RS Host Firewall & Anti-Stealer Daemon
+Documentation=https://github.com/woifik560/sentinel-rs
+After=network.target network-pre.target local-fs.target
+Before=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentineld --config /etc/sentinel/config.toml --rules /etc/sentinel/rules.toml
+ExecStopPost=/usr/sbin/nft delete table inet sentinel
+Restart=on-failure
+RestartSec=5s
+
+# -------------------------------------------------------------
+# Privilege Separation & Linux Capabilities Minimization
+# -------------------------------------------------------------
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+
+# -------------------------------------------------------------
+# OS & Process Hardening Directives
+# -------------------------------------------------------------
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/run/sentinel /var/lib/sentinel /tmp
+PrivateTmp=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+SystemCallFilter=@system-service @network-io @bpf
+SystemCallErrorNumber=EPERM
+
+# -------------------------------------------------------------
+# OOM Killer & DoS Protection
+# -------------------------------------------------------------
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
