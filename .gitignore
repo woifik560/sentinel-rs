@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# eBPF Artifacts
+*.bpf.o
+vmlinux.h
+
+# AI Models & Weights (avoid committing huge GGUF weights to git)
+models/*.gguf
+models/*.bin
+*.gguf
+
+# Slint Cache & Build
+slint-output/
+
+# Runtime & Sockets
+/run/
+*.sock
+*.pid
+
+# Logs & Temp files
+*.log
+/tmp/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
