@@ -8,20 +8,21 @@
 //! 5. Taint Hygiene: `/dev/pts/*`, `/dev/null`, `~/.ssh/config`, `~/.ssh/*.pub` are exempt.
 //! 6. Never-Freeze Allowlist: `gnome-shell`, `dbus-daemon`, `systemd` are strictly protected from SIGSTOP.
 
-use std::path::{Path, PathBuf};
-use sentinel_common::config::RulesConfig;
+use std::path::Path;
 use sentinel_common::events::{MAY_READ, MAY_WRITE, SENTINEL_SO_MARK};
-use sentinel_common::process::{ProcessNode, SecretCategory};
+use sentinel_common::process::SecretCategory;
 use sentinel_common::risk::{RiskThresholds, RuleId, Verdict};
-use sentinel_ebpf::maps::{TaintFlags, TaintHygiene, TaintMapManager};
+use sentinel_ebpf::maps::{TaintHygiene, TaintMapManager};
 use sentinel_ebpf::programs::bprm_check_security::is_memfd_or_fileless;
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
 use sentinel_ebpf::programs::socket_connect::{evaluate_socket_connect, SocketConnectVerdict};
 
 // Mock DpkgChecker for standalone testing
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 struct MockDpkgChecker;
+#[allow(dead_code)]
 impl MockDpkgChecker {
     fn check_package(&self, path: &Path) -> Option<sentineld_mock_pkg::DpkgInfo> {
         if path.starts_with("/usr/bin/") || path.starts_with("/bin/") {
@@ -35,6 +36,7 @@ impl MockDpkgChecker {
     }
 }
 
+#[allow(dead_code)]
 mod sentineld_mock_pkg {
     #[derive(Clone, Debug)]
     pub struct DpkgInfo {
@@ -248,10 +250,11 @@ fn test_scenario_8_preopened_socket_exfiltration() {
         true, // is_preopened
     );
 
+    let expected_reval_mark = SENTINEL_SO_MARK | sentinel_common::events::SENTINEL_MARK_REVAL_BIT;
     assert_eq!(
         send_verdict,
-        SocketConnectVerdict::SlowPathHoldNfqueue {
-            so_mark: SENTINEL_SO_MARK
+        SocketConnectVerdict::RevalidateHoldNfqueue {
+            so_mark: expected_reval_mark
         }
     );
 }

@@ -32,7 +32,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
-use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptRequest, PromptVerdict};
+use sentinel_common::ipc::{ClientRole, IpcMessage, PromptRequest};
 use sentinel_ebpf::TaintMapManager;
 use crate::freeze::FreezeInspectOrchestrator;
 use crate::lineage::LineageTracker;

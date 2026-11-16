@@ -65,6 +65,7 @@ impl RiskEngine {
         }
 
         // 2. [+40] SECRET_NON_OWNER / TAINTED (with Scoped Taint Domains & Anti-Spoofing Owner Policy)
+        let has_secret = node.has_secret_access();
         let mut has_non_owner_secret = false;
         let mut has_owner_secret = false;
         let exe_name = node.exe_name();

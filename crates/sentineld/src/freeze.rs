@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use sentinel_common::config::default_never_freeze_list;
-use sentinel_common::events::{SENTINEL_NFQUEUE_NUM, SENTINEL_SO_MARK};
+use sentinel_common::events::SENTINEL_NFQUEUE_NUM;
 use sentinel_common::ipc::{PromptAction, PromptVerdict};
 
 #[derive(Debug, Clone)]
@@ -533,6 +533,11 @@ impl FreezeInspectOrchestrator {
     /// Unfreeze a process (alias for unfreeze_process).
     pub fn unfreeze(&self, tgid: u32) -> anyhow::Result<()> {
         self.unfreeze_process(tgid)
+    }
+
+    /// Drop held packet(s) for the specified incident (e.g. on PIN brute-force lockout).
+    pub fn drop(&self, incident_id: &str) {
+        self.nfqueue.drop(incident_id);
     }
 }
 

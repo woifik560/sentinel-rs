@@ -64,6 +64,7 @@ pub fn is_memfd_or_fileless(path_str: &str) -> bool {
     path_str.starts_with("/memfd:")
         || path_str.starts_with("memfd:")
         || path_str.contains("/memfd:")
+        || path_str.contains("anon_inode:[memfd]")
         || (path_str.starts_with("/proc/") && path_str.contains("/fd/"))
         || path_str.contains("(deleted)") && path_str.starts_with("/dev/shm")
 }

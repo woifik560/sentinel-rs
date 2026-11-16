@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use sentinel_common::events::{
     decode_flow_mark, encode_flow_mark, FlowContext, MAY_EXEC, MAY_READ, MAY_WRITE,
-    SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
+    SENTINEL_MARK_FLOW_ID_MASK,
 };
 
 /// Bitflags representing scoped taint states and secret domains of a task or inode object.
@@ -81,6 +81,34 @@ impl TaintFlags {
             | Self::BIT_MMAP_SHARED
             | Self::BIT_SCM_RIGHTS
             | Self::SECRET_NON_OWNER)) != 0
+    }
+}
+
+impl std::ops::BitAnd<u64> for TaintFlags {
+    type Output = u64;
+    fn bitand(self, rhs: u64) -> Self::Output {
+        self.0 & rhs
+    }
+}
+
+impl std::ops::BitAnd<TaintFlags> for TaintFlags {
+    type Output = TaintFlags;
+    fn bitand(self, rhs: TaintFlags) -> Self::Output {
+        TaintFlags(self.0 & rhs.0)
+    }
+}
+
+impl std::ops::BitOr<u64> for TaintFlags {
+    type Output = TaintFlags;
+    fn bitor(self, rhs: u64) -> Self::Output {
+        TaintFlags(self.0 | rhs)
+    }
+}
+
+impl std::ops::BitOr<TaintFlags> for TaintFlags {
+    type Output = TaintFlags;
+    fn bitor(self, rhs: TaintFlags) -> Self::Output {
+        TaintFlags(self.0 | rhs.0)
     }
 }
 
@@ -459,6 +487,7 @@ pub struct TaintMapManager {
     /// Explicitly registered IPC broker TGIDs (anti-taint explosion).
     ipc_brokers: Arc<RwLock<HashSet<u32>>>,
     /// Sockets tracked in SK_STORAGE keyed by socket cookie.
+    #[allow(dead_code)]
     sockets: Arc<RwLock<HashMap<u64, SkStorageEntry>>>,
     /// Inodes (dev, ino) of cryptographically verified GUI binary for BPF LSM attestation.
     gui_binary_inodes: Arc<RwLock<HashSet<(u64, u64)>>>,
@@ -846,22 +875,24 @@ impl TaintMapManager {
 
         let leader_tgid = self.resolve_group_leader(id);
         let is_special = is_pipe || is_fifo || path_str.starts_with("/tmp") || path_str.starts_with("/dev/shm");
+        let is_writing = (mask & MAY_WRITE) != 0;
+        let is_reading = (mask & MAY_READ) != 0;
 
         // 2. Hot-Path Fast Exit:
         // Regular files accessed by untainted processes that are not tainted in INODE_STORAGE
-        // exit immediately with zero writes and zero allocations.
+        // and do not require cache invalidation exit immediately with zero writes and zero allocations.
         if !is_special && !self.is_tainted(leader_tgid) {
-            let inode_is_tainted = {
+            let inode_needs_handling = {
                 let inodes = self.inodes.read().unwrap();
-                inodes.get(&(dev, ino)).map(|e| e.taint_flags.is_tainted()).unwrap_or(false)
+                inodes
+                    .get(&(dev, ino))
+                    .map(|e| e.taint_flags.is_tainted() || (is_writing && e.is_trusted_system_pkg))
+                    .unwrap_or(false)
             };
-            if !inode_is_tainted {
+            if !inode_needs_handling {
                 return None;
             }
         }
-
-        let is_writing = (mask & MAY_WRITE) != 0;
-        let is_reading = (mask & MAY_READ) != 0;
 
         // 3. Process Write Path:
         if is_writing {
@@ -952,8 +983,8 @@ impl TaintMapManager {
             return MmapVerdict::Allow;
         }
 
-        let is_write_shared = (prot & MAY_WRITE != 0 || (prot & 0x2) != 0) && (flags & 0x1 != 0 /* MAP_SHARED */);
-        let is_exec = (prot & MAY_EXEC != 0) || ((prot & 0x4) != 0);
+        let is_write_shared = (prot & 0x2 != 0) && (flags & 0x1 != 0 /* MAP_SHARED */);
+        let is_exec = (prot & 0x4) != 0;
 
         // 0. Zero-Userspace GUI Sealing:
         // Audited against Inode Attribute Whitelist:
@@ -1494,17 +1525,17 @@ mod tests {
         let writer_tgid = 4501;
         let shm_path = Path::new("/dev/shm/payload_shared");
 
-        // 1. Reading secret via mmap
-        let res = manager.handle_mmap_file(reader_tgid, 1, 100, Path::new("/home/user/.ssh/id_rsa"), MAY_READ, 0);
+        // 1. Reading secret via mmap (PROT_READ = 0x1)
+        let res = manager.handle_mmap_file(reader_tgid, 1, 100, Path::new("/home/user/.ssh/id_rsa"), 0x1, 0);
         assert_eq!(res, MmapVerdict::TaintTask);
         assert!(manager.is_tainted(reader_tgid));
 
-        // 2. Tainted writer maps /dev/shm with PROT_WRITE | MAP_SHARED
-        let res2 = manager.handle_mmap_file(reader_tgid, 2, 200, shm_path, MAY_WRITE, 1);
+        // 2. Tainted writer maps /dev/shm with PROT_WRITE | MAP_SHARED (PROT_WRITE = 0x2, MAP_SHARED = 0x1)
+        let res2 = manager.handle_mmap_file(reader_tgid, 2, 200, shm_path, 0x2, 1);
         assert_eq!(res2, MmapVerdict::TaintInode);
 
-        // 3. Clean process maps the shared memory -> becomes tainted
-        let res3 = manager.handle_mmap_file(writer_tgid, 2, 200, shm_path, MAY_READ, 1);
+        // 3. Clean process maps the shared memory -> becomes tainted (PROT_READ = 0x1)
+        let res3 = manager.handle_mmap_file(writer_tgid, 2, 200, shm_path, 0x1, 1);
         assert_eq!(res3, MmapVerdict::TaintTask);
         assert!(manager.is_tainted(writer_tgid));
     }

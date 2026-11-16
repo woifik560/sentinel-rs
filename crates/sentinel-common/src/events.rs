@@ -74,6 +74,11 @@ pub const MAY_READ: u32 = 0x00000004;
 pub const MAY_WRITE: u32 = 0x00000002;
 pub const MAY_EXEC: u32 = 0x00000001;
 
+/// Memory protection flags for `lsm/mmap_file` and `lsm/file_mprotect`.
+pub const PROT_READ: u32 = 0x00000001;
+pub const PROT_WRITE: u32 = 0x00000002;
+pub const PROT_EXEC: u32 = 0x00000004;
+
 /// Raw event structure as received from eBPF ring buffer.
 ///
 /// Fields use fixed-size types compatible with `#[repr(C)]` eBPF structs.

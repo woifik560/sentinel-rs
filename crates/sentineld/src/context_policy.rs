@@ -68,7 +68,12 @@ impl ContextPolicyEngine {
                     let cat_matches = match actual_cat {
                         SecretCategory::SshKey => cat_str.eq_ignore_ascii_case("ssh"),
                         SecretCategory::GpgKey => cat_str.eq_ignore_ascii_case("gpg"),
-                        SecretCategory::BrowserCookies => cat_str.eq_ignore_ascii_case("browser"),
+                        SecretCategory::BrowserCookies | SecretCategory::BrowserData => {
+                            cat_str.eq_ignore_ascii_case("browser")
+                        }
+                        SecretCategory::CloudCredentials => {
+                            cat_str.eq_ignore_ascii_case("cloud")
+                        }
                         SecretCategory::TelegramData => cat_str.eq_ignore_ascii_case("telegram"),
                         SecretCategory::CryptoWallet => cat_str.eq_ignore_ascii_case("crypto"),
                         SecretCategory::Other(s) => s.contains(cat_str),

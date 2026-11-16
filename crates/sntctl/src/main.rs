@@ -163,7 +163,7 @@ async fn run_watch(socket_path: &Path) -> anyhow::Result<()> {
             let payload = serde_json::to_string(&msg)? + "\n";
             writer.write_all(payload.as_bytes()).await?;
             println!("Verdict submitted successfully.\n");
-        } else if let Ok(IpcMessage::AuthError(err)) = serde_json::from_str::<IpcMessage>(trimmed) {
+        } else if let Ok(IpcMessage::AuthError { message: err }) = serde_json::from_str::<IpcMessage>(trimmed) {
             eprintln!("Authentication error from daemon: {}", err);
             break;
         }

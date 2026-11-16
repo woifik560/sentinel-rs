@@ -316,8 +316,10 @@ async fn main() -> anyhow::Result<()> {
                     sentinel_ebpf::MmapVerdict::TaintInode => {
                         warn!("mmap Shared Memory Taint: Tainted TGID {} mapped {} with PROT_WRITE | MAP_SHARED", tgid, path.display());
                     }
-                    sentinel_ebpf::MmapVerdict::FlagAnonExec => {
-                        warn!("mmap Fileless Execution: TGID {} mapped executable memory on unlinked/tmpfs file {}", tgid, path.display());
+                    sentinel_ebpf::MmapVerdict::FlagAnonExec
+                    | sentinel_ebpf::MmapVerdict::TaintedExecutionBlocked
+                    | sentinel_ebpf::MmapVerdict::DenyMmap => {
+                        warn!("mmap Blocked / Fileless Execution: TGID {} attempted unauthorized executable mapping on {}", tgid, path.display());
                         if let Some(mut node) = lineage_tracker.get(tgid) {
                             node.is_anon_exec = true;
                             lineage_tracker.insert(node);
@@ -347,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::BprmCheckSecurity { tgid, uid: _, ref exe_path, dev: _, ino: _, is_memfd } => {
+            EbpfEvent::BprmCheckSecurity { tgid, uid: _, exe_path: _, dev: _, ino: _, is_memfd } => {
                 if is_memfd {
                     warn!("LSM bprm_check_security: anonymous memfd_create execution detected for TGID {}", tgid);
                     if let Some(mut node) = lineage_tracker.get(tgid) {

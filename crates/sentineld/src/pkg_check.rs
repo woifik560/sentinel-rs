@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use flate2::read::GzDecoder;
 use sentinel_ebpf::TaintMapManager;
@@ -561,11 +561,11 @@ impl CompositePkgChecker {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             active_distro,
-            pacman: PacmanBackend,
-            rpm: RpmBackend,
+            pacman: PacmanBackend::default(),
+            rpm: RpmBackend::default(),
             nixos: NixOsBackend,
             immutable: ImmutableOsBackend,
-            dpkg: DpkgBackend,
+            dpkg: DpkgBackend::default(),
         }
     }
 

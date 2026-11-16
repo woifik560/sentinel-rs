@@ -17,7 +17,8 @@
 
 use std::path::Path;
 use sentinel_common::events::{RawMmapFileEvent, MAX_PATH_LEN};
-use crate::maps::{MmapVerdict, TaintMapManager};
+pub use crate::maps::MmapVerdict;
+use crate::maps::TaintMapManager;
 
 /// Evaluates a `mmap_file` LSM hook invocation.
 pub fn evaluate_mmap_file(

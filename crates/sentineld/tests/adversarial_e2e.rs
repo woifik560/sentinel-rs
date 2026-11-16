@@ -26,21 +26,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use sentinel_common::events::{
-    decode_flow_mark, encode_flow_mark, FlowContext, EbpfEvent, MAY_EXEC, MAY_READ, MAY_WRITE,
-    SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
+    decode_flow_mark, encode_flow_mark, FlowContext, MAY_READ, MAY_WRITE,
+    PROT_EXEC, SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
 };
-use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptRequest, PromptVerdict};
+use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptVerdict};
 use sentinel_common::process::{ProcessNode, SecretCategory};
 use sentinel_common::risk::{
     calculate_shannon_entropy, is_cumulative_dns_tunnel, is_suspicious_dns_query,
-    is_suspicious_dns_query_adaptive, RiskEngineConfig, RiskThresholds, RuleId, Verdict,
+    is_suspicious_dns_query_adaptive, RuleId,
 };
-use sentinel_ebpf::maps::{TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict};
+use sentinel_ebpf::maps::{PtraceVerdict, TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict};
 use sentinel_ebpf::programs::bprm_check_security::{bpf_get_file_hash_simulated, is_memfd_or_fileless};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
@@ -50,9 +49,9 @@ use sentinel_ebpf::programs::mmap_file::{
 };
 use sentinel_ebpf::programs::socket_connect::{evaluate_socket_connect, SocketConnectVerdict};
 use sentinel_ebpf::programs::socket_sendmsg::{
-    evaluate_socket_sendmsg_ext, evaluate_socket_sendmsg_watchdog, SocketSendmsgVerdict,
+    evaluate_socket_sendmsg_ext, evaluate_socket_sendmsg_watchdog, EgressAction,
+    SocketSendmsgVerdict,
 };
-use sentineld::lineage;
 
 // -----------------------------------------------------------------------------
 // Test 1: `cat secret | curl` (pipe taint inheritance)
@@ -83,7 +82,7 @@ fn test_1_cat_secret_pipe_curl() {
     assert!(taint_mgr.is_tainted(curl_tgid), "curl must be tainted after reading pipe");
 
     // 4. curl attempts outbound connection -> FastPath rejected, Hold in NFQUEUE
-    let flow_id = 42;
+    let _flow_id = 42;
     let verdict = evaluate_socket_connect(true, false, true, true);
     match verdict {
         SocketConnectVerdict::SlowPathHoldNfqueue { so_mark } => {
@@ -107,7 +106,7 @@ fn test_2_established_socket_bypass_sendmsg() {
 
     // 2. Process later accesses browser cookies/passwords
     let secret = simulate_file_open_check("/home/user/.config/google-chrome/Default/Login Data", "/tmp/stealer");
-    assert_eq!(secret, Some(SecretCategory::BrowserData));
+    assert_eq!(secret, Some(SecretCategory::BrowserCookies));
     taint_mgr.mark_tainted(tgid);
     assert!(taint_mgr.is_tainted(tgid));
 
@@ -163,14 +162,14 @@ fn test_3_scm_rights_and_mmap_file() {
 #[test]
 fn test_4_memfd_anon_exec() {
     // 1. memfd_create virtual executable
-    assert!(is_memfd_or_fileless(Path::new("/memfd:payload (deleted)")));
-    assert!(is_memfd_or_fileless(Path::new("anon_inode:[memfd]")));
-    assert!(!is_memfd_or_fileless(Path::new("/usr/bin/python3")));
+    assert!(is_memfd_or_fileless("/memfd:payload (deleted)"));
+    assert!(is_memfd_or_fileless("anon_inode:[memfd]"));
+    assert!(!is_memfd_or_fileless("/usr/bin/python3"));
 
     // 2. Risk evaluation: memfd triggers RuleId::FilelessMemfd (+50)
     let mut fired = Vec::new();
     let mut score = 0;
-    if is_memfd_or_fileless(Path::new("/memfd:stealer (deleted)")) {
+    if is_memfd_or_fileless("/memfd:stealer (deleted)") {
         score += 50;
         fired.push(RuleId::FilelessMemfd);
     }
@@ -184,7 +183,7 @@ fn test_4_memfd_anon_exec() {
 #[test]
 fn test_5_prctl_comm_spoofing_defense() {
     // An attacker sets comm to "ssh" or "gnome-shell" via prctl, but /proc/<pid>/exe is /tmp/evil
-    let spoofed_comm = "ssh";
+    let _spoofed_comm = "ssh";
     let real_exe = PathBuf::from("/tmp/evil");
 
     // Sentinel does not rely on comm! It checks real_exe against dpkg database and root ownership.
@@ -192,7 +191,7 @@ fn test_5_prctl_comm_spoofing_defense() {
     assert!(!is_trusted_dpkg, "Real exe in /tmp cannot claim dpkg trust even if comm is 'ssh'");
 
     // Node resolution
-    let node = ProcessNode::new(4040, None, 1000, real_exe.clone(), spoofed_comm.to_string());
+    let node = ProcessNode::new(4040, 1, 1000, real_exe.clone());
     assert_eq!(node.exe_path, PathBuf::from("/tmp/evil"));
     assert_ne!(node.exe_name(), "ssh", "exe_name must reflect binary file name, not spoofed comm");
 }
@@ -204,7 +203,7 @@ fn test_5_prctl_comm_spoofing_defense() {
 fn test_6_p0_unauthorized_sock_connect_rejection() {
     // An infostealer process of UID 1000 connects to management socket and tries to submit Verdict
     let attacker_uid = 1000;
-    let attacker_pid = 6666;
+    let _attacker_pid = 6666;
     let attacker_exe = Path::new("/home/user/.local/bin/infostealer");
     let gui_binary_canonical = Path::new("/usr/bin/sentinel-gui");
 
@@ -254,16 +253,16 @@ fn test_7_ptrace_memory_snooping_lsm_defense() {
     taint_mgr.set_daemon_pid(daemon_pid);
 
     // Attacker of the same UID tries to attach ptrace to GUI (caller_has_cap = false)
-    let gui_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, gui_pid, false);
-    assert_eq!(gui_target_blocked, -1, "-EPERM must be returned when same-UID process ptraces sentinel-gui");
+    let gui_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, gui_pid, 0);
+    assert_eq!(gui_target_blocked, PtraceVerdict::Deny, "-EPERM must be returned when same-UID process ptraces sentinel-gui");
 
     // Attacker tries to attach ptrace to sentineld
-    let daemon_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, daemon_pid, false);
-    assert_eq!(daemon_target_blocked, -1, "-EPERM must be returned when ptracing sentineld");
+    let daemon_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, daemon_pid, 0);
+    assert_eq!(daemon_target_blocked, PtraceVerdict::Deny, "-EPERM must be returned when ptracing sentineld");
 
     // Normal root debugger with CAP_SYS_PTRACE can attach
-    let root_allowed = taint_mgr.handle_ptrace_access_check(0, gui_pid, true);
-    assert_eq!(root_allowed, 0, "Root with CAP_SYS_PTRACE is permitted");
+    let root_allowed = taint_mgr.handle_ptrace_access_check(0, gui_pid, 0);
+    assert_eq!(root_allowed, PtraceVerdict::Allow, "Root with CAP_SYS_PTRACE is permitted");
 }
 
 // -----------------------------------------------------------------------------
@@ -280,13 +279,13 @@ fn test_8_ipc_broker_isolation_anti_explosion() {
     taint_mgr.register_ipc_broker(dbus_daemon_pid);
 
     // Tainted app sends IPC to dbus-daemon
-    let broker_tainted = taint_mgr.handle_unix_may_send(tainted_app, dbus_daemon_pid, "dbus-daemon");
-    assert!(!broker_tainted, "D-Bus daemon must NOT inherit taint");
+    let broker_verdict = taint_mgr.handle_unix_may_send(tainted_app, dbus_daemon_pid, "dbus-daemon");
+    assert_eq!(broker_verdict, UnixSendVerdict::Allow, "D-Bus daemon must NOT inherit taint");
     assert!(!taint_mgr.is_tainted(dbus_daemon_pid), "dbus-daemon must remain clean");
 
     // dbus-daemon delivers a message to other_clean_app
-    let other_tainted = taint_mgr.handle_unix_may_send(dbus_daemon_pid, other_clean_app, "gnome-calculator");
-    assert!(!other_tainted);
+    let other_verdict = taint_mgr.handle_unix_may_send(dbus_daemon_pid, other_clean_app, "gnome-calculator");
+    assert_eq!(other_verdict, UnixSendVerdict::Allow);
     assert!(!taint_mgr.is_tainted(other_clean_app), "Clean app must not become tainted via D-Bus");
 }
 
@@ -339,9 +338,10 @@ fn test_9_dynamic_mark_correlation_concurrent() {
 async fn test_10_syn_retransmit_dedup_and_duration_allow() {
     // Incident tracking simulation
     let incident_id = "inc-retrans-99";
-    let flow_mark = encode_flow_mark(15, false);
+    let _flow_mark = encode_flow_mark(15, false);
 
     struct PendingIncident {
+        #[allow(dead_code)]
         id: String,
         packet_queue: Vec<u32>, // Simulated packet IDs
     }
@@ -385,7 +385,7 @@ async fn test_10_syn_retransmit_dedup_and_duration_allow() {
     }
 
     // 4. User sends verdict: AllowForDuration (300 seconds)
-    let verdict_action = PromptAction::AllowForDuration { seconds: 300 };
+    let _verdict_action = PromptAction::AllowForDuration { seconds: 300 };
 
     // Simulate verdict application: flush all pending packets in group
     let mut released_packets = Vec::new();
@@ -606,7 +606,7 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         &taint_mgr,
         gui_tgid,
         hostile_so_cache,
-        MAY_EXEC,
+        PROT_EXEC,
         0,
         1000,   // non-root inode_uid
         0o755,  // inode_mode
@@ -628,7 +628,7 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         &taint_mgr,
         gui_tgid,
         hostile_so_vartmp,
-        MAY_EXEC,
+        PROT_EXEC,
         0,
         0,      // root owned...
         0o777,  // ...BUT world-writable (mode & 0o022 != 0)!
@@ -648,7 +648,7 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         gui_tgid,
         None::<&Path>,
         0,
-        MAY_EXEC,
+        PROT_EXEC,
         0,
         0,
     );
@@ -690,7 +690,7 @@ fn test_17_hybrid_watchdog_fail_safe_clean_fail_close_tainted() {
         Some("140.82.112.3"),
         443,
     );
-    assert_eq!(clean_alive_res, SocketSendmsgVerdict::Allow);
+    assert_eq!(clean_alive_res, EgressAction::Pass);
 
     // Case 2: Daemon crashed or hung! (now_ns is 3 seconds later, > 2.0s watchdog limit)
     let dead_now_ns = start_time_ns + 3_000_000_000;
@@ -706,7 +706,7 @@ fn test_17_hybrid_watchdog_fail_safe_clean_fail_close_tainted() {
     );
     assert_eq!(
         clean_dead_res,
-        SocketSendmsgVerdict::Allow,
+        EgressAction::Pass,
         "Clean processes must continue working (Fail-Safe) when daemon is down"
     );
 
@@ -720,7 +720,7 @@ fn test_17_hybrid_watchdog_fail_safe_clean_fail_close_tainted() {
     );
     assert_eq!(
         tainted_dead_res,
-        SocketSendmsgVerdict::Deny,
+        EgressAction::SyscallEperm,
         "Tainted processes must be blocked (Fail-Close) even when daemon is down!"
     );
 }
