@@ -1,201 +1,480 @@
 #![allow(dead_code)]
-//! sentinel-gui — Native Slint desktop UI for Sentinel-RS.
+//! sentinel-gui — Minimalist Dark Desktop UI for Sentinel-RS.
 //!
-//! Provides interactive incident alerts with process lineage breadcrumbs,
-//! risk score gauges, X11 anti-clickjacking PIN confirmation, and
-//! Fail-Closed countdown timers (< 30 MB RAM).
+//! Provides an ultra-minimalist dark dashboard in idle mode and clean,
+//! human-readable incident alert cards during active security freezes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use sentinel_common::ipc::{IpcMessage, PromptAction, PromptRequest, PromptVerdict};
+use sentinel_common::ipc::{IpcMessage, PromptAction, PromptVerdict};
 
 slint::slint! {
-    import { Button, LineEdit } from "std-widgets.slint";
+    component StatusPill inherits Rectangle {
+        in property <string> text;
+        in property <color> dot_color: #10b981;
+        in property <color> pill_bg: #141820;
+        in property <color> border_col: #1e2432;
 
-    export component IncidentPromptWindow inherits Window {
-        in-out property <string> incident_id: "inc-000";
-        in-out property <int> risk_score: 85;
-        in-out property <string> lineage_text: "bash -> npm -> python3 (/tmp/install.py)";
-        in-out property <string> secret_text: "~/.ssh/id_ed25519 (0.14s назад)";
-        in-out property <string> target_text: "185.220.101.5:443 (Без DNS)";
-        in-out property <string> reasons_text: "• Чтение SSH ключей\n• Скрипт из /tmp\n• Прямой IP";
-        in-out property <int> remaining_seconds: 30;
-        in-out property <bool> is_x11: false;
-        in-out property <string> auth_pin_expected: "";
-        in-out property <string> auth_pin_input: "";
+        background: root.pill_bg;
+        border_radius: 14px;
+        border_width: 1px;
+        border_color: root.border_col;
+        height: 28px;
 
+        HorizontalLayout {
+            padding_left: 12px;
+            padding_right: 12px;
+            spacing: 8px;
+            alignment: center;
+
+            Rectangle {
+                width: 7px;
+                height: 7px;
+                border_radius: 3.5px;
+                background: root.dot_color;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                text: root.text;
+                color: #e2e8f0;
+                font_size: 11px;
+                font_weight: 600;
+                vertical_alignment: center;
+            }
+        }
+    }
+
+    component MetricCard inherits Rectangle {
+        in property <string> label;
+        in property <string> val;
+        in property <color> val_color: #f8fafc;
+
+        background: #141820;
+        border_radius: 10px;
+        border_width: 1px;
+        border_color: #1e2533;
+        padding: 12px;
+
+        VerticalLayout {
+            spacing: 4px;
+            alignment: center;
+
+            Text {
+                text: root.label;
+                color: #64748b;
+                font_size: 11px;
+                font_weight: 500;
+                horizontal_alignment: center;
+            }
+            Text {
+                text: root.val;
+                color: root.val_color;
+                font_size: 14px;
+                font_weight: 700;
+                horizontal_alignment: center;
+            }
+        }
+    }
+
+    component ActionButton inherits Rectangle {
+        in property <string> text;
+        in property <color> bg_color: #dc2626;
+        in property <color> hover_color: #ef4444;
+        in property <color> text_color: #ffffff;
+        in property <length> font_size: 13px;
+        in property <int> font_weight: 600;
+        callback clicked();
+
+        border_radius: 8px;
+        background: ta.has-hover ? root.hover_color : root.bg_color;
+        animate background { duration: 120ms; }
+
+        ta := TouchArea {
+            clicked => { root.clicked(); }
+            mouse_cursor: pointer;
+        }
+
+        Text {
+            text: root.text;
+            color: root.text_color;
+            font_size: root.font_size;
+            font_weight: root.font_weight;
+            horizontal_alignment: center;
+            vertical_alignment: center;
+        }
+    }
+
+    export component MainWindow inherits Window {
+        title: "Sentinel-RS";
+        min_width: 620px;
+        min_height: 460px;
+        background: #0d0f14;
+
+        in-out property <bool> is_connected: true;
+        in-out property <bool> has_incident: false;
+
+        // Idle properties
+        in-out property <string> lsm_status: "LSM: Активен";
+        in-out property <string> tracked_count_text: "142 процесса";
+        in-out property <string> threat_count_text: "0 угроз";
+        in-out property <string> last_event_text: "Все сетевые вызовы контролируются ядром Linux";
+
+        // Incident properties
+        in-out property <string> incident_id: "";
+        in-out property <string> process_name: "curl";
+        in-out property <string> process_pid: "1420";
+        in-out property <string> process_path: "/usr/bin/curl";
+        in-out property <string> target_address: "185.220.101.5:443";
+        in-out property <string> reasons_text: "Прямое подключение по IP • Нестандартный порт";
+        in-out property <int> risk_score: 75;
+        in-out property <int> countdown_seconds: 30;
+
+        callback block_clicked();
+        callback allow_clicked();
         callback kill_clicked();
-        callback deny_clicked();
-        callback allow_once_clicked();
-        callback allow_duration_clicked();
-        callback allow_host_clicked();
-        callback allow_scope_clicked();
-
-        title: "Sentinel-RS — Инцидент Безопасности";
-        min_width: 680px;
-        min_height: 540px;
+        callback reconnect_clicked();
+        callback test_alert_clicked();
 
         VerticalLayout {
             padding: 24px;
-            spacing: 12px;
+            spacing: 16px;
 
-            Text {
-                text: "ПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ (FREEZE & INSPECT)";
-                font_size: 16px;
-                font_weight: 700;
-                color: #d32f2f;
+            // Top bar
+            HorizontalLayout {
+                alignment: space_between;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "SENTINEL-RS";
+                        font_size: 15px;
+                        font_weight: 800;
+                        color: #ffffff;
+                    }
+                    Text {
+                        text: "Автономный BPF LSM фаервол";
+                        font_size: 11px;
+                        color: #64748b;
+                    }
+                }
+
+                StatusPill {
+                    text: root.is_connected ? "Защита активна" : "Служба отключена";
+                    dot_color: root.is_connected ? #10b981 : #ef4444;
+                    pill_bg: root.is_connected ? #0d281e : #281114;
+                    border_col: root.is_connected ? #134e38 : #4a191e;
+                }
             }
 
-            if root.is_x11: Rectangle {
-                background: #fff3cd;
-                border_radius: 6px;
-                border_width: 1px;
-                border_color: #ffeeba;
-                height: 48px;
+            // Central view: IDLE
+            if !root.has_incident : VerticalLayout {
+                spacing: 16px;
 
+                if root.is_connected : Rectangle {
+                    background: #141820;
+                    border_radius: 12px;
+                    border_width: 1px;
+                    border_color: #1e2533;
+                    height: 180px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+
+                        Rectangle {
+                            width: 52px;
+                            height: 52px;
+                            border_radius: 26px;
+                            background: #064e3b;
+                            border_width: 1px;
+                            border_color: #059669;
+
+                            Text {
+                                text: "✓";
+                                color: #34d399;
+                                font_size: 24px;
+                                font_weight: 700;
+                                horizontal_alignment: center;
+                                vertical_alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "Система в безопасности";
+                            font_size: 17px;
+                            font_weight: 700;
+                            color: #f8fafc;
+                            horizontal_alignment: center;
+                        }
+
+                        Text {
+                            text: "Сетевые вызовы и процессы контролируются ядром. Угроз не обнаружено.";
+                            font_size: 12px;
+                            color: #94a3b8;
+                            horizontal_alignment: center;
+                        }
+                    }
+                }
+
+                if !root.is_connected : Rectangle {
+                    background: #181416;
+                    border_radius: 12px;
+                    border_width: 1px;
+                    border_color: #381a1e;
+                    height: 180px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Служба sentineld не подключена";
+                            font_size: 16px;
+                            font_weight: 700;
+                            color: #fca5a5;
+                            horizontal_alignment: center;
+                        }
+
+                        Text {
+                            text: "Запустите демон в терминале: sudo systemctl start sentineld";
+                            font_size: 12px;
+                            color: #94a3b8;
+                            horizontal_alignment: center;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            ActionButton {
+                                width: 200px;
+                                height: 38px;
+                                text: "Повторить подключение";
+                                bg_color: #1e2533;
+                                hover_color: #2b3548;
+                                text_color: #e2e8f0;
+                                clicked => { root.reconnect_clicked(); }
+                            }
+                        }
+                    }
+                }
+
+                // Stats row
                 HorizontalLayout {
-                    padding: 8px;
                     spacing: 12px;
+                    height: 70px;
 
+                    MetricCard {
+                        label: "ЯДРО EBPF";
+                        val: root.lsm_status;
+                        val_color: #10b981;
+                    }
+                    MetricCard {
+                        label: "МОНИТОРИНГ";
+                        val: root.tracked_count_text;
+                        val_color: #38bdf8;
+                    }
+                    MetricCard {
+                        label: "БЛОКИРОВКИ";
+                        val: root.threat_count_text;
+                        val_color: #a78bfa;
+                    }
+                }
+
+                // Footer
+                HorizontalLayout {
+                    alignment: space_between;
                     Text {
-                        text: "⚠️ X11 СЕССИЯ: Возможно фальшивое нажатие! Введите PIN [" + root.auth_pin_expected + "]:";
-                        color: #856404;
-                        font_weight: 600;
+                        text: root.last_event_text;
+                        font_size: 11px;
+                        color: #64748b;
                         vertical_alignment: center;
                     }
-
-                    LineEdit {
-                        width: 100px;
-                        text <=> root.auth_pin_input;
-                        placeholder_text: "PIN";
+                    ActionButton {
+                        width: 120px;
+                        height: 28px;
+                        font_size: 11px;
+                        text: "Тест тревоги";
+                        bg_color: #181d26;
+                        hover_color: #232a38;
+                        text_color: #94a3b8;
+                        clicked => { root.test_alert_clicked(); }
                     }
                 }
             }
 
-            Rectangle {
-                background: #f8f9fa;
-                border_radius: 6px;
-                border_width: 1px;
-                border_color: #e9ecef;
+            // Central view: INCIDENT ALERT
+            if root.has_incident : VerticalLayout {
+                spacing: 14px;
 
-                VerticalLayout {
-                    padding: 12px;
-                    spacing: 8px;
-
-                    Text {
-                        text: "Оценка риска: " + root.risk_score + " / 100 (" + (root.risk_score >= 75 ? "КРИТИЧЕСКИЙ" : "ПОДОЗРИТЕЛЬНЫЙ") + ")";
-                        font_size: 14px;
-                        font_weight: 700;
-                        color: root.risk_score >= 75 ? #b71c1c : #e65100;
+                HorizontalLayout {
+                    alignment: space_between;
+                    StatusPill {
+                        text: "ПОДОЗРИТЕЛЬНОЕ СОЕДИНЕНИЕ";
+                        dot_color: #ef4444;
+                        pill_bg: #2d1215;
+                        border_col: #5c1d24;
                     }
-                    Text {
-                        text: "Цепочка предков: " + root.lineage_text;
-                        font_size: 13px;
-                    }
-                    Text {
-                        text: "Секрет: " + root.secret_text;
-                        font_size: 13px;
-                    }
-                    Text {
-                        text: "Назначение: " + root.target_text;
-                        font_size: 13px;
-                    }
-                }
-            }
 
-            Text {
-                text: "Сработавшие правила детерминированного анализа:";
-                font_size: 13px;
-                font_weight: 600;
-            }
-
-            Rectangle {
-                background: #fdfdfe;
-                border_radius: 4px;
-                border_width: 1px;
-                border_color: #dee2e6;
-
-                VerticalLayout {
-                    padding: 10px;
                     Text {
-                        text: root.reasons_text;
+                        text: "Блокировка через " + root.countdown_seconds + "с";
+                        color: #94a3b8;
                         font_size: 12px;
+                        vertical_alignment: center;
                     }
                 }
-            }
 
-            Text {
-                text: "Автоматическая блокировка (Fail-Closed) через " + root.remaining_seconds + " сек...";
-                color: #6c757d;
-                font_size: 12px;
-            }
+                Rectangle {
+                    background: #141820;
+                    border_radius: 12px;
+                    border_width: 1px;
+                    border_color: #272f3d;
 
-            HorizontalLayout {
-                spacing: 8px;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 12px;
 
-                Button {
-                    text: "Убить (SIGKILL)";
-                    clicked => { root.kill_clicked(); }
+                        // Process details
+                        HorizontalLayout {
+                            alignment: space_between;
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text {
+                                    text: root.process_name;
+                                    font_size: 18px;
+                                    font_weight: 700;
+                                    color: #ffffff;
+                                }
+                                Text {
+                                    text: "PID " + root.process_pid + " • " + root.process_path;
+                                    font_size: 12px;
+                                    color: #94a3b8;
+                                }
+                            }
+
+                            Rectangle {
+                                background: #221c16;
+                                border_radius: 6px;
+                                border_width: 1px;
+                                border_color: #5c3818;
+                                height: 26px;
+                                HorizontalLayout {
+                                    padding_left: 8px;
+                                    padding_right: 8px;
+                                    Text {
+                                        text: "РИСК " + root.risk_score + "/100";
+                                        font_size: 11px;
+                                        font_weight: 700;
+                                        color: #fb923c;
+                                        vertical_alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Divider
+                        Rectangle {
+                            height: 1px;
+                            background: #1e2533;
+                        }
+
+                        // Target
+                        VerticalLayout {
+                            spacing: 3px;
+                            Text {
+                                text: "КУДА ОБРАЩАЕТСЯ";
+                                font_size: 10px;
+                                font_weight: 700;
+                                color: #64748b;
+                            }
+                            Text {
+                                text: root.target_address;
+                                font_size: 15px;
+                                font_weight: 600;
+                                color: #38bdf8;
+                            }
+                        }
+
+                        // Reasons
+                        VerticalLayout {
+                            spacing: 3px;
+                            Text {
+                                text: "ОБНАРУЖЕННЫЕ АНОМАЛИИ";
+                                font_size: 10px;
+                                font_weight: 700;
+                                color: #64748b;
+                            }
+                            Text {
+                                text: root.reasons_text;
+                                font_size: 12px;
+                                color: #fbbf24;
+                            }
+                        }
+                    }
                 }
-                Button {
-                    text: "Блок (TCP RST)";
-                    clicked => { root.deny_clicked(); }
-                }
-                Button {
-                    text: "Разрешить разово";
-                    clicked => { root.allow_once_clicked(); }
-                }
-                Button {
-                    text: "На 5 минут";
-                    clicked => { root.allow_duration_clicked(); }
-                }
-                Button {
-                    text: "Для хоста";
-                    clicked => { root.allow_host_clicked(); }
-                }
-                Button {
-                    text: "В Scope";
-                    clicked => { root.allow_scope_clicked(); }
+
+                // 2 Clean buttons + 1 ghost link
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    ActionButton {
+                        width: 170px;
+                        height: 42px;
+                        text: "Заблокировать";
+                        bg_color: #dc2626;
+                        hover_color: #ef4444;
+                        text_color: #ffffff;
+                        clicked => { root.block_clicked(); }
+                    }
+
+                    ActionButton {
+                        width: 150px;
+                        height: 42px;
+                        text: "Разрешить";
+                        bg_color: #1e2533;
+                        hover_color: #2b3548;
+                        text_color: #e2e8f0;
+                        clicked => { root.allow_clicked(); }
+                    }
+
+                    ActionButton {
+                        width: 180px;
+                        height: 42px;
+                        text: "Завершить процесс";
+                        bg_color: transparent;
+                        hover_color: #281216;
+                        text_color: #f87171;
+                        font_size: 12px;
+                        clicked => { root.kill_clicked(); }
+                    }
                 }
             }
         }
     }
 }
 
-/// Detects if the current desktop session is running on X11 instead of Wayland.
-fn detect_x11_session() -> bool {
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        return false;
-    }
-    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
-        if session_type.to_lowercase() == "x11" {
-            return true;
-        }
-    }
-    std::env::var("DISPLAY").is_ok()
+struct ActiveIncident {
+    id: String,
+    auth_pin: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Starting Sentinel-RS Desktop GUI (Slint UI)...");
-
-    let is_x11 = detect_x11_session();
-    if is_x11 {
-        warn!("Running under X11 desktop environment. Synthetic input protection (one-time PIN) will be enforced.");
-    }
+    info!("Starting Sentinel-RS Desktop UI...");
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Sentinel-RS Desktop GUI Alert Dialog");
+        println!("Sentinel-RS Desktop GUI");
         println!("\nUsage: sentinel-gui [OPTIONS]");
         println!("\nOptions:");
-        println!("  --demo       Display mock incident alert for preview and testing");
+        println!("  --demo       Display preview with sample data");
         println!("  -s, --socket Path to sentinel.sock [default: /run/sentinel/sentinel.sock]");
         println!("  -h, --help   Print help");
         return Ok(());
@@ -209,166 +488,302 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let window = IncidentPromptWindow::new()?;
-    window.set_is_x11(is_x11);
+    let window = MainWindow::new()?;
+    let window_handle = window.as_weak();
+
+    let writer_slot: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
+    let active_incident: Arc<Mutex<Option<ActiveIncident>>> = Arc::new(Mutex::new(None));
+
+    // Countdown timer background task
+    let w_timer = window_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let w_h = w_timer.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = w_h.upgrade() {
+                    if w.get_has_incident() {
+                        let s = w.get_countdown_seconds();
+                        if s > 0 {
+                            w.set_countdown_seconds(s - 1);
+                        } else {
+                            w.set_has_incident(false);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Wire actions
+    let active_inc = active_incident.clone();
+    let wr = writer_slot.clone();
+    let w_h = window_handle.clone();
+    window.on_block_clicked(move || {
+        let active_inc = active_inc.clone();
+        let wr = wr.clone();
+        let w_h = w_h.clone();
+        tokio::spawn(async move {
+            if let Some(inc) = active_inc.lock().await.take() {
+                send_verdict(&wr, inc.id, PromptAction::DenyOnce, inc.auth_pin).await;
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = w_h.upgrade() {
+                    w.set_has_incident(false);
+                }
+            });
+        });
+    });
+
+    let active_inc = active_incident.clone();
+    let wr = writer_slot.clone();
+    let w_h = window_handle.clone();
+    window.on_allow_clicked(move || {
+        let active_inc = active_inc.clone();
+        let wr = wr.clone();
+        let w_h = w_h.clone();
+        tokio::spawn(async move {
+            if let Some(inc) = active_inc.lock().await.take() {
+                send_verdict(&wr, inc.id, PromptAction::AllowOnce, inc.auth_pin).await;
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = w_h.upgrade() {
+                    w.set_has_incident(false);
+                }
+            });
+        });
+    });
+
+    let active_inc = active_incident.clone();
+    let wr = writer_slot.clone();
+    let w_h = window_handle.clone();
+    window.on_kill_clicked(move || {
+        let active_inc = active_inc.clone();
+        let wr = wr.clone();
+        let w_h = w_h.clone();
+        tokio::spawn(async move {
+            if let Some(inc) = active_inc.lock().await.take() {
+                send_verdict(&wr, inc.id, PromptAction::Kill, inc.auth_pin).await;
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = w_h.upgrade() {
+                    w.set_has_incident(false);
+                }
+            });
+        });
+    });
+
+    let w_h = window_handle.clone();
+    window.on_test_alert_clicked(move || {
+        if let Some(w) = w_h.upgrade() {
+            w.set_incident_id("demo-8842".into());
+            w.set_process_name("curl".into());
+            w.set_process_pid("3812".into());
+            w.set_process_path("/usr/bin/curl".into());
+            w.set_target_address("185.220.101.5:443".into());
+            w.set_reasons_text("Чтение ключа ~/.ssh/id_ed25519 • Прямое IP-подключение".into());
+            w.set_risk_score(85);
+            w.set_countdown_seconds(30);
+            w.set_has_incident(true);
+        }
+    });
+
+    let w_h = window_handle.clone();
+    let sock_clone = socket_path.clone();
+    let wr_clone = writer_slot.clone();
+    let inc_clone = active_incident.clone();
+    window.on_reconnect_clicked(move || {
+        let w_h = w_h.clone();
+        let sock = sock_clone.clone();
+        let wr = wr_clone.clone();
+        let inc = inc_clone.clone();
+        tokio::spawn(async move {
+            connect_and_listen(sock, wr, inc, w_h).await;
+        });
+    });
 
     if is_demo {
-        info!("Running in GUI demo mode");
-        window.set_incident_id("demo-8842".into());
-        window.set_risk_score(85);
-        window.set_lineage_text("bash (PID 1204) -> npm (PID 1420) -> python3 (/tmp/install.py)".into());
-        window.set_secret_text("~/.ssh/id_ed25519 (0.14s назад)".into());
-        window.set_target_text("185.220.101.5:443 (Без DNS)".into());
-        window.set_reasons_text(
-            "• Доступ к SSH-ключам неуполномоченным процессом (+40)\n• Скрипт запущен из /tmp (+25)\n• Попытка эксфильтрации в течение 5 секунд (+15)\n• Прямое подключение по IP-адресу (+10)".into()
-        );
-        window.set_auth_pin_expected("7491".into());
-
-        window.on_kill_clicked(|| info!("User clicked Kill in demo"));
-        window.on_deny_clicked(|| info!("User clicked Deny in demo"));
-        window.on_allow_once_clicked(|| info!("User clicked Allow Once in demo"));
-        window.on_allow_duration_clicked(|| info!("User clicked Allow Duration in demo"));
-        window.on_allow_host_clicked(|| info!("User clicked Allow Host in demo"));
-        window.on_allow_scope_clicked(|| info!("User clicked Allow Scope in demo"));
-
+        info!("Running in demo preview mode");
+        window.set_is_connected(true);
+        window.set_lsm_status("LSM: Активен".into());
+        window.set_tracked_count_text("142 процесса".into());
+        window.set_threat_count_text("0 угроз".into());
+        window.set_last_event_text("Демонстрационный режим Sentinel-RS".into());
         window.run()?;
         return Ok(());
     }
 
-    // Connect to Unix Domain Socket
-    let stream = match UnixStream::connect(&socket_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                "Could not connect to sentineld at {}: {}. Launching demo window.",
-                socket_path.display(),
-                e
-            );
-            window.run()?;
-            return Ok(());
-        }
-    };
-
-    let (reader, writer) = stream.into_split();
-    let writer = Arc::new(Mutex::new(writer));
-    let mut reader = BufReader::new(reader);
-
-    let window_handle = window.as_weak();
-    let writer_clone = writer.clone();
-
-    // Helper macro/closure for verdict submission
-    let wire_action = |w_weak: slint::Weak<IncidentPromptWindow>, wr: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, act_factory: Box<dyn Fn(&IncidentPromptWindow) -> PromptAction + Send + 'static>| {
-        move || {
-            if let Some(w) = w_weak.upgrade() {
-                let id = w.get_incident_id().to_string();
-                let pin = if w.get_is_x11() {
-                    Some(w.get_auth_pin_input().to_string())
-                } else {
-                    None
-                };
-                let action = act_factory(&w);
-                let wr = wr.clone();
-                tokio::spawn(async move {
-                    send_verdict(wr, id, action, pin).await;
-                });
-            }
-        }
-    };
-
-    window.on_kill_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::Kill)));
-    window.on_deny_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::DenyOnce)));
-    window.on_allow_once_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowOnce)));
-    window.on_allow_duration_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowForDuration { seconds: 300 })));
-    window.on_allow_host_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|w| {
-        let tgt = w.get_target_text().to_string();
-        let host = tgt.split(':').next().unwrap_or("").trim().to_string();
-        PromptAction::AllowHost { host }
-    })));
-    window.on_allow_scope_clicked(wire_action(window_handle.clone(), writer_clone.clone(), Box::new(|_| PromptAction::AllowAppScope)));
-
-    // Background task to read incoming prompt requests from sentineld
-    let w_incoming = window_handle.clone();
+    // Spawn background connection loop
+    let w_h = window_handle.clone();
     tokio::spawn(async move {
-        let mut line = String::new();
-        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-            let trimmed = line.trim();
-            if let Ok(IpcMessage::Prompt(prompt)) = serde_json::from_str::<IpcMessage>(trimmed) {
-                let weak = w_incoming.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(w) = weak.upgrade() {
-                        populate_prompt(&w, prompt);
-                    }
-                });
-            }
-            line.clear();
-        }
+        connect_and_listen(socket_path, writer_slot, active_incident, w_h).await;
     });
 
     window.run()?;
     Ok(())
 }
 
-/// Sanitize untrusted input strings to prevent UI injection, ANSI control spoofing, or script injection.
-fn sanitize_display_string(input: &str) -> String {
-    input
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .take(512)
-        .collect()
-}
+async fn connect_and_listen(
+    socket_path: PathBuf,
+    writer_slot: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    active_incident: Arc<Mutex<Option<ActiveIncident>>>,
+    window_handle: slint::Weak<MainWindow>,
+) {
+    loop {
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                info!("Connected to sentineld at {}", socket_path.display());
+                let (reader, mut writer) = stream.into_split();
 
-fn populate_prompt(w: &IncidentPromptWindow, p: PromptRequest) {
-    let clean_incident_id = sanitize_display_string(&p.incident_id);
-    w.set_incident_id(clean_incident_id.into());
-    w.set_risk_score((p.risk_score as i32).clamp(0, 100));
+                // Send Subscribe and StatusRequest
+                let sub = serde_json::to_string(&IpcMessage::Subscribe).unwrap_or_default() + "\n";
+                let _ = writer.write_all(sub.as_bytes()).await;
+                let stat = serde_json::to_string(&IpcMessage::StatusRequest).unwrap_or_default() + "\n";
+                let _ = writer.write_all(stat.as_bytes()).await;
 
-    let lineage_str = p
-        .lineage
-        .iter()
-        .map(|s| sanitize_display_string(&s.to_string()))
-        .collect::<Vec<_>>()
-        .join(" -> ");
-    w.set_lineage_text(lineage_str.into());
+                {
+                    let mut lock = writer_slot.lock().await;
+                    *lock = Some(writer);
+                }
 
-    if let Some(sec) = p.secret_path {
-        let clean_sec = sanitize_display_string(&sec);
-        let delta = p
-            .time_delta_ms
-            .map(|ms| format!(" ({:.2}s назад)", ms as f64 / 1000.0))
-            .unwrap_or_default();
-        w.set_secret_text(format!("{}{}", clean_sec, delta).into());
-    }
+                let w_h = window_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = w_h.upgrade() {
+                        w.set_is_connected(true);
+                        w.set_last_event_text("Подключено к службе sentineld".into());
+                    }
+                });
 
-    if let Some(ip) = p.dest_ip {
-        let clean_ip = sanitize_display_string(&ip);
-        let port_str = p.dest_port.map(|port| format!(":{}", port)).unwrap_or_default();
-        w.set_target_text(format!("{}{}", clean_ip, port_str).into());
-    }
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let trimmed = line.trim();
+                    if let Ok(msg) = serde_json::from_str::<IpcMessage>(trimmed) {
+                        match msg {
+                            IpcMessage::Prompt(prompt) => {
+                                let inc_data = ActiveIncident {
+                                    id: prompt.incident_id.clone(),
+                                    auth_pin: prompt.auth_pin.clone(),
+                                };
+                                {
+                                    let mut lock = active_incident.lock().await;
+                                    *lock = Some(inc_data);
+                                }
 
-    let reasons = p
-        .reasons
-        .iter()
-        .map(|r| format!("• {}", sanitize_display_string(r)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    w.set_reasons_text(reasons.into());
+                                let (exe, pid, path) = if let Some(last) = prompt.lineage.last() {
+                                    (
+                                        last.exe_name.clone(),
+                                        last.tgid.to_string(),
+                                        last.script_path
+                                            .as_ref()
+                                            .map(|p| p.display().to_string())
+                                            .unwrap_or_else(|| last.exe_name.clone()),
+                                    )
+                                } else {
+                                    ("Неизвестный процесс".into(), "—".into(), "".into())
+                                };
 
-    w.set_is_x11(p.is_x11_session);
-    if let Some(pin) = p.auth_pin {
-        w.set_auth_pin_expected(pin.into());
+                                let target = match (&prompt.dest_ip, prompt.dest_port) {
+                                    (Some(ip), Some(port)) => format!("{}:{}", ip, port),
+                                    (Some(ip), None) => ip.clone(),
+                                    _ => "Внешний узел".into(),
+                                };
+
+                                let reasons = if prompt.reasons.is_empty() {
+                                    "Подозрительная активность".to_string()
+                                } else {
+                                    prompt.reasons.join(" • ")
+                                };
+
+                                let score = prompt.risk_score as i32;
+                                let inc_id = prompt.incident_id;
+                                let w_h = window_handle.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(w) = w_h.upgrade() {
+                                        w.set_incident_id(inc_id.into());
+                                        w.set_process_name(exe.into());
+                                        w.set_process_pid(pid.into());
+                                        w.set_process_path(path.into());
+                                        w.set_target_address(target.into());
+                                        w.set_reasons_text(reasons.into());
+                                        w.set_risk_score(score);
+                                        w.set_countdown_seconds(30);
+                                        w.set_has_incident(true);
+                                    }
+                                });
+                            }
+                            IpcMessage::StatusResponse {
+                                uptime_secs: _,
+                                tracked_processes,
+                                total_incidents,
+                                frozen_count: _,
+                            } => {
+                                let w_h = window_handle.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(w) = w_h.upgrade() {
+                                        w.set_tracked_count_text(format!("{} процессов", tracked_processes).into());
+                                        w.set_threat_count_text(format!("{} угроз", total_incidents).into());
+                                    }
+                                });
+                            }
+                            IpcMessage::Event { timestamp: _, summary, risk_score: _ } => {
+                                let w_h = window_handle.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(w) = w_h.upgrade() {
+                                        w.set_last_event_text(summary.into());
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    line.clear();
+                }
+
+                // Disconnected
+                warn!("Connection to sentineld lost");
+                {
+                    let mut lock = writer_slot.lock().await;
+                    *lock = None;
+                }
+                let w_h = window_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = w_h.upgrade() {
+                        w.set_is_connected(false);
+                        w.set_last_event_text("Связь с демоном потеряна".into());
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("Cannot connect to sentineld: {}. Retrying in 3s...", e);
+                let w_h = window_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = w_h.upgrade() {
+                        w.set_is_connected(false);
+                    }
+                });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
 
 async fn send_verdict(
-    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    writer_slot: &Arc<Mutex<Option<OwnedWriteHalf>>>,
     incident_id: String,
     action: PromptAction,
     auth_pin: Option<String>,
 ) {
-    let msg = IpcMessage::Verdict(PromptVerdict { incident_id, action, auth_pin });
+    let msg = IpcMessage::Verdict(PromptVerdict {
+        incident_id,
+        action,
+        auth_pin,
+    });
     if let Ok(json) = serde_json::to_string(&msg) {
         let payload = json + "\n";
-        let mut w = writer.lock().await;
-        let _ = w.write_all(payload.as_bytes()).await;
+        let mut lock = writer_slot.lock().await;
+        if let Some(ref mut w) = *lock {
+            let _ = w.write_all(payload.as_bytes()).await;
+        }
     }
 }
