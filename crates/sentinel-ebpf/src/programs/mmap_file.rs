@@ -32,6 +32,17 @@ pub fn evaluate_mmap_file(
     manager.handle_mmap_file(id, dev, ino, path, prot, flags)
 }
 
+/// Convenience evaluation for tests and userspace simulation.
+pub fn handle_mmap_file<P: AsRef<Path>>(
+    manager: &TaintMapManager,
+    id: u32,
+    path: P,
+    prot: u32,
+    flags: u32,
+) -> MmapVerdict {
+    manager.handle_mmap_file(id, 0, 0, path.as_ref(), prot, flags)
+}
+
 /// Helper to create a raw event for testing and RingBuffer simulation.
 pub fn create_raw_mmap_event(
     tgid: u32,

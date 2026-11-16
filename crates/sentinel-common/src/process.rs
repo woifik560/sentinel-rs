@@ -24,10 +24,14 @@ pub enum SecretCategory {
     GpgKey,
     /// Browser cookies, login databases, local storage
     BrowserCookies,
+    /// Alias for BrowserCookies / browser credentials
+    BrowserData,
     /// Telegram Desktop session data (tdata/)
     TelegramData,
     /// Cryptocurrency wallet files
     CryptoWallet,
+    /// Cloud provider credentials (~/.aws/*, ~/.kube/*, ~/.config/gcloud/*)
+    CloudCredentials,
     /// Other sensitive files
     Other(String),
 }
@@ -160,6 +164,14 @@ impl ProcessNode {
             category,
             timestamp_ns,
         });
+    }
+
+    /// Returns the executable file basename without path components.
+    pub fn exe_name(&self) -> String {
+        self.exe_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     /// Check if this process has accessed any protected secret.

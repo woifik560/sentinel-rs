@@ -55,7 +55,7 @@ pub struct FlowContext {
     pub uid: u32,
     pub cgroup_id: u64,
     pub sock_cookie: u64,
-    pub taint_flags: u32,
+    pub taint_flags: u64,
     pub exe_inode: u64,
     pub exec_id: u64,
 }

@@ -51,20 +51,34 @@ Sentinel-RS спроектирован для защиты персональн�
      2. `ct state established,related accept` (Линейный Fast-Path в ядре)
      3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass` (New SYN hold)
      Опция `bypass` гарантирует, что в случае остановки или аварии демона сетевой стек десктопа не блокируется полностью (Fail-Safe режим).
-4. **Защита от LoLBin-атак (Living off the Land) и TOFU**:
-   - Абстракция провайдеров целостности (`PkgIntegrityProvider`): проверка принадлежности пакетам с использованием MD5 только как первичного признака и локальным кэшем SHA-256 как криптографического эталона.
-   - Скидка доверия пакету (`-35`) аннулируется при наличии taint (`SECRET_NON_OWNER`) или выполнении скриптов через pipe/inline-аргументы.
-   - Механизм **TOFU (Trust On First Use)** для внешнего софта (`~/.cargo/bin`, Flatpak, AppImage, локальные бинарники).
-5. **Разделение сокетов и строгая верификация GUI-клиента (P0)**:
-   - **Два раздельных Unix-сокета**:
-     - `/run/sentinel/sentinel-ro.sock` (0666): публичный read-only канал для команд мониторинга и статуса (`sntctl monitor`, `sntctl status`, `sntctl export`).
-     - `/run/sentinel/sentinel.sock` (0666, строгая аутентификация post-accept): канал управления, доступный для подключения непривилегированному десктопному GUI без ошибки ядра `EACCES`.
-   - **Строгая верификация peer-процесса и защита от TOCTOU**:
-     - Чтение `SO_PEERCRED` (`uid` и `pid`). Если `uid == 0`, выдаются права администратора.
-     - Валидация канонического пути `/proc/<pid>/exe`, проверка root-владения бинарником (`uid == 0`), прав (`mode & 0o022 == 0`) и SHA-256.
-     - Проверка очистки переменных окружения от `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` через `/proc/<pid>/environ`.
-     - **Анти-TOCTOU инспекция `/proc/<pid>/maps`**: даже если конструктор библиотеки очистил `environ` в памяти процесса перед `connect()`, демон сканирует карту памяти процесса. Наличие исполняемых отображений (`r-xp`) из `/tmp`, `/dev/shm`, `~` или удалённых файлов немедленно отклоняет подключение.
-   - **Защита от X11-кликджекинга**: детекция X11-сессии, запрос динамического 4-значного PIN-кода и автоматическая блокировка после 3 неверных попыток.
+   - **Гибридный ядерный Watchdog (Fail-Safe для чистых + Fail-Close для Tainted)**:
+     - Закрепление (Pinning) eBPF-программ в `/sys/fs/bpf/sentinel/`: программы остаются активными в ядре даже при падении процесса `sentineld`.
+     - Heartbeat-таймер в `BPF_MAP_TYPE_ARRAY`: демон обновляет метку времени каждые 500 мс.
+     - Умная деградация в `lsm/socket_sendmsg` и `cgroup_skb/egress`: если демон не отвечает > 2.0 сек, чистые процессы (`taint == 0`) продолжают работать без зависаний (Fail-Safe), а зараженные (`taint != 0`) мгновенно блокируются ядром с `-EPERM` (Fail-Close), предотвращая эксфильтрацию украденных данных даже при сбое демона.
+4. **Дистрибутиво-независимая целостность пакетов (Distro-Agnostic Pure Rust) & Scoped Taint**:
+   - **Мульти-бэкенд чтения пакетных баз на чистом Rust**:
+     - Arch Linux / Manjaro / EndeavourOS (`pacman`): чтение `mtree` архивов через `flate2` со сверкой эталонных SHA-256.
+     - Fedora / RHEL / CentOS / openSUSE (`rpm`): прямое извлечение хешей из SQLite-базы `/var/lib/rpm/rpmdb.sqlite` и манифестов.
+     - NixOS: верификация неизменяемых путей `/nix/store/<hash>-name`, прав `root:root` и монтирования `MS_RDONLY`.
+     - Immutable OS (Fedora Silverblue, SteamOS, VanillaOS): проверка Read-Only файловой системы (`ostree`, `composefs`, `erofs`) и аттестация `fs-verity`.
+     - Debian / Ubuntu (`dpkg`): прямой парсинг `/var/lib/dpkg/info/*.md5sums` на чистом Rust без вызова внешних CLI.
+   - **Кэширование верификации в ядре (`BPF_MAP_TYPE_INODE_STORAGE`)**:
+     - Статус `TRUSTED_SYSTEM_PKG` и версия иноды кэшируются прямо в ядре; при любой попытке модификации файла (`MAY_WRITE`) eBPF мгновенно сбрасывает доверие.
+     - В спящих хуках `lsm.s/bprm_committed_creds` поддерживается ядерная kfunc `bpf_get_file_hash()` (`fs-verity`).
+   - **Матрица доменов секретов (Scoped Taint Domains: `u64 taint_mask`)**:
+     - Битовая маска: `BIT_SSH_KEYS`, `BIT_CLOUD_CREDS`, `BIT_CHROMIUM_DATA`, `BIT_FIREFOX_DATA`, `BIT_TELEGRAM_DATA`, `BIT_CRYPTO_WALLETS`.
+     - **Owner Policy**: легитимный браузер (Chrome), читающий свои куки (`BIT_CHROMIUM_DATA`), не помечается как `SECRET_NON_OWNER`. Но если Chrome (или плагин) читает `~/.ssh/id_rsa`, флаг немедленно взводится!
+     - **Передача Taint только сверху вниз**: терминалы и сборщики внутри IDE (`cargo build`, `npm install`) изолированы — taint не загрязняет родительский процесс IDE (VSCode / JetBrains).
+5. **Zero-Userspace Trust аутентификация GUI (устранение TOCTOU) и перекрытие скрытых каналов**:
+   - **Аттестация в ядре при старте (`lsm/bprm_committed_creds`)**:
+     - Демон при старте регистрирует `(dev, ino)` бинарника `/usr/bin/sentinel-gui`. Хук BPF LSM выставляет флаг `is_verified_gui = 1` в `TASK_STORAGE` процесса.
+   - **Герметизация памяти процесса в ядре (`lsm/mmap_file`)**:
+     - Любая загрузка разделяемой библиотеки (`.so`) с `PROT_EXEC` из неподконтрольных root путей (`/tmp`, `/dev/shm`, `~/.local`) блокируется (`-EPERM`) или немедленно аннулирует статус `is_verified_gui = 0`.
+   - **Проверка подключения в `lsm/unix_stream_connect`**:
+     - Попытка `connect()` к `/run/sentinel/sentinel.sock` проверяется в ядре: неавторизованным непривилегированным процессам немедленно возвращается `-EACCES` без пробуждения `sentineld`.
+   - **Защита от Staging-атак и Covert DNS Tunneling**:
+     - Промежуточные файлы (`~/.cache/benign.dat`) наследуют битовую маску тайн через `INODE_STORAGE` при записи, заражая последующих читателей.
+     - DNS-запросы на `127.0.0.53:53` и `io.systemd.Resolve` перехватываются: энтропия Шеннона > 3.8 и длина поддомена > 40 символов блокируются правилом `COVERT_DNS_TUNNEL`.
 6. **Предохранитель Never-Freeze Allowlist и защита от DoS**:
    - Жесткий список защиты рабочего стола (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
    - **Anti-Spoofing**: валидация только по связке `(dev, inode)` и каноническому пути бинарника. Подмена `comm` через `prctl(PR_SET_NAME)` игнорируется.
@@ -75,11 +89,26 @@ Sentinel-RS спроектирован для защиты персональн�
 
 ---
 
-## Требования к ядру и настройка GRUB
+## Требования к ядру и настройка BPF LSM
 
-Sentinel-RS использует BPF LSM хуки, которые должны быть активированы при загрузке ядра.
+Sentinel-RS использует BPF LSM хуки Linux 6.x, которые должны быть активированы при загрузке ядра.
 
-### Настройка для Ubuntu / Debian:
+### Автоматическая настройка загрузчика (`sntctl setup-kernel`):
+Sentinel-RS включает встроенный инструмент универсальной конфигурации ядра для любых дистрибутивов:
+```bash
+sudo sntctl setup-kernel
+```
+Команда автоматически:
+1. Опрашивает `/sys/kernel/security/lsm` и считывает текущий список активных LSM модулей.
+2. **Динамически сохраняет все существующие LSM** (`apparmor`, `selinux`, `yama`, `lockdown`, `integrity`, `landlock`), аккуратно добавляя `,bpf` в конец списка без дублирования.
+3. Распознает активный загрузчик дистрибутива:
+   - **RHEL / Fedora / CentOS / AlmaLinux**: `grubby --update-kernel=ALL --args="lsm=..."`
+   - **Pop!_OS / Ubuntu (systemd-boot)**: `kernelstub -a "lsm=..."`
+   - **Arch Linux / systemd-boot**: патчинг `/boot/loader/entries/*.conf`
+   - **Debian / Ubuntu / openSUSE (GRUB)**: автоматическое обновление `GRUB_CMDLINE_LINUX` в `/etc/default/grub` и вызов `update-grub` / `grub2-mkconfig`.
+4. Для вступления изменений в силу достаточно перезагрузить систему: `sudo reboot`.
+
+### Ручная настройка для Ubuntu / Debian (GRUB):
 1. Откройте файл `/etc/default/grub` с правами суперпользователя:
    ```bash
    sudo nano /etc/default/grub
@@ -173,16 +202,17 @@ flowchart TD
 
 | Правило | Вес | Описание причины |
 |---|:---:|---|
+| `COVERT_DNS_TUNNEL` | **+50** | Скрытый канал эксфильтрации через DNS (энтропия Шеннона > 3.8, длина поддомена > 40 симв.) |
 | `FILELESS_MEMFD` | **+50** | Запуск кода напрямую из оперативной памяти (`memfd_create`) |
 | `FILELESS_ANON_EXEC` | **+35** | Выполнение кода через `mmap` с `PROT_EXEC` на анонимную память или deleted-файл |
 | `SECRET_NON_OWNER` | **+40** | Доступ к секрету или наследование taint через pipe/файл/SCM_RIGHTS процессом вне App Scope |
-| `UNTRUSTED_BINARY_ORIGIN` | **+25** | Запуск из `/tmp`, `/dev/shm`, `~/Downloads` или отсутствие верификации в `dpkg` |
+| `UNTRUSTED_BINARY_ORIGIN` | **+25** | Запуск из `/tmp`, `/dev/shm`, `~/Downloads` или отсутствие верификации в пакетах системы |
 | `SUSPICIOUS_SCRIPT_EXECUTION` | **+25** | Выполнение скрипта из анонимного источника, stdin или с подозрительными флагами запуска |
 | `SUSPICIOUS_INTERPRETER` | **+20** | Интерпретатор запущен с inline-кодом (`-c`, `-e`), eval, base64 или получен через pipe |
 | `FIRST_SEEN_DESTINATION` | **+15** | Первое подключение процесса к внешнему публичному IP-адресу (вне RFC1918 и loopback) |
 | `FAST_EXFIL_BURST` | **+15** | Попытка сетевого подключения в течение <= 5 сек после факта чтения секрета |
 | `RAW_IP_CONNECT` | **+10** | Сетевое подключение напрямую по IP без зафиксированного DNS-запроса |
-| `TRUSTED_PACKAGE_CONTEXT` | **-35** | Бинарник верифицирован в пакетах `dpkg` по SHA-256 и запущен штатно (**НЕ действует при Taint или пайпе!**) |
+| `TRUSTED_PACKAGE_CONTEXT` | **-35** | Бинарник верифицирован в системном пакетном менеджере по SHA-256 (**НЕ действует при Taint или пайпе!**) |
 
 ---
 
@@ -191,6 +221,9 @@ flowchart TD
 Утилита управления переименована в `sntctl` во избежание конфликтов пространства имен:
 
 ```bash
+# Автоматическая настройка BPF LSM в загрузчике ядра (любой дистрибутив) [Требует Root]
+sudo sntctl setup-kernel
+
 # Интерактивный триаж в реальном времени (для серверов и SSH) [Требует Root]
 sudo sntctl watch
 

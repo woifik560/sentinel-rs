@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sentinel_common::events::{
@@ -14,49 +14,73 @@ use sentinel_common::events::{
     SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
 };
 
-/// Bitflags representing taint states of a task or inode object.
+/// Bitflags representing scoped taint states and secret domains of a task or inode object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct TaintFlags(pub u32);
+pub struct TaintFlags(pub u64);
 
 impl TaintFlags {
-    pub const NONE: u32 = 0;
-    pub const TAINTED_SSH: u32 = 1 << 0;
-    pub const TAINTED_GPG: u32 = 1 << 1;
-    pub const TAINTED_BROWSER: u32 = 1 << 2;
-    pub const TAINTED_TELEGRAM: u32 = 1 << 3;
-    pub const TAINTED_CRYPTO: u32 = 1 << 4;
-    pub const TAINTED_PIPE: u32 = 1 << 5;
-    pub const TAINTED_TEMPFILE: u32 = 1 << 6;
-    pub const PENDING_INSPECT: u32 = 1 << 7;
-    pub const TAINT_MMAP_SHARED: u32 = 1 << 8;
-    pub const TAINT_SCM_RIGHTS: u32 = 1 << 9;
+    pub const NONE: u64 = 0;
+    pub const BIT_SSH_KEYS: u64 = 1 << 0;       // ~/.ssh/*
+    pub const BIT_CLOUD_CREDS: u64 = 1 << 1;    // ~/.aws/*, ~/.kube/*, ~/.config/gcloud/*, ~/.gnupg/*
+    pub const BIT_CHROMIUM_DATA: u64 = 1 << 2;  // ~/.config/google-chrome/*, ~/.config/chromium/*
+    pub const BIT_FIREFOX_DATA: u64 = 1 << 3;   // ~/.mozilla/firefox/*
+    pub const BIT_TELEGRAM_DATA: u64 = 1 << 4;  // ~/.local/share/TelegramDesktop/tdata/*
+    pub const BIT_CRYPTO_WALLETS: u64 = 1 << 5; // crypto wallet files
+    pub const BIT_PIPE: u64 = 1 << 6;
+    pub const BIT_TEMPFILE: u64 = 1 << 7;
+    pub const BIT_MMAP_SHARED: u64 = 1 << 8;
+    pub const BIT_SCM_RIGHTS: u64 = 1 << 9;
+    pub const PENDING_INSPECT: u64 = 1 << 10;
+    pub const TRUSTED_SYSTEM_PKG: u64 = 1 << 11;
+    pub const SECRET_NON_OWNER: u64 = 1 << 12;
+
+    // Backward-compatible aliases
+    pub const TAINTED_SSH: u64 = Self::BIT_SSH_KEYS;
+    pub const TAINTED_GPG: u64 = Self::BIT_CLOUD_CREDS;
+    pub const TAINTED_BROWSER: u64 = Self::BIT_CHROMIUM_DATA;
+    pub const TAINTED_TELEGRAM: u64 = Self::BIT_TELEGRAM_DATA;
+    pub const TAINTED_CRYPTO: u64 = Self::BIT_CRYPTO_WALLETS;
+    pub const TAINTED_PIPE: u64 = Self::BIT_PIPE;
+    pub const TAINTED_TEMPFILE: u64 = Self::BIT_TEMPFILE;
+    pub const TAINT_MMAP_SHARED: u64 = Self::BIT_MMAP_SHARED;
+    pub const TAINT_SCM_RIGHTS: u64 = Self::BIT_SCM_RIGHTS;
 
     pub fn is_empty(&self) -> bool {
         self.0 == Self::NONE
     }
 
-    pub fn contains(&self, flag: u32) -> bool {
+    pub fn contains(&self, flag: u64) -> bool {
         (self.0 & flag) != 0
     }
 
-    pub fn insert(&mut self, flag: u32) {
+    pub fn insert(&mut self, flag: u64) {
         self.0 |= flag;
     }
 
-    pub fn remove(&mut self, flag: u32) {
+    pub fn remove(&mut self, flag: u64) {
         self.0 &= !flag;
     }
 
+    pub fn bits(&self) -> u64 {
+        self.0
+    }
+
+    pub fn from_bits_truncate(bits: u64) -> Self {
+        Self(bits)
+    }
+
     pub fn is_tainted(&self) -> bool {
-        (self.0 & (Self::TAINTED_SSH
-            | Self::TAINTED_GPG
-            | Self::TAINTED_BROWSER
-            | Self::TAINTED_TELEGRAM
-            | Self::TAINTED_CRYPTO
-            | Self::TAINTED_PIPE
-            | Self::TAINTED_TEMPFILE
-            | Self::TAINT_MMAP_SHARED
-            | Self::TAINT_SCM_RIGHTS)) != 0
+        (self.0 & (Self::BIT_SSH_KEYS
+            | Self::BIT_CLOUD_CREDS
+            | Self::BIT_CHROMIUM_DATA
+            | Self::BIT_FIREFOX_DATA
+            | Self::BIT_TELEGRAM_DATA
+            | Self::BIT_CRYPTO_WALLETS
+            | Self::BIT_PIPE
+            | Self::BIT_TEMPFILE
+            | Self::BIT_MMAP_SHARED
+            | Self::BIT_SCM_RIGHTS
+            | Self::SECRET_NON_OWNER)) != 0
     }
 }
 
@@ -71,6 +95,8 @@ pub struct TaskStorageEntry {
     pub baseline_profile: u32,
     pub is_leaf: bool,
     pub parent_tgid: u32,
+    pub is_verified_gui: bool,
+    pub is_sealed: bool,
 }
 
 /// In-kernel entry stored in `BPF_MAP_TYPE_INODE_STORAGE` per inode struct (pipe, FIFO, file).
@@ -82,6 +108,9 @@ pub struct InodeStorageEntry {
     pub ino: u64,
     pub is_pipe: bool,
     pub is_fifo: bool,
+    pub is_trusted_system_pkg: bool,
+    pub inode_version: u64,
+    pub fs_verity_hash: Option<[u8; 32]>,
 }
 
 /// In-kernel entry stored in `BPF_MAP_TYPE_SK_STORAGE` per socket struct.
@@ -100,8 +129,19 @@ pub enum UnixSendVerdict {
     Allow,
     /// Message allowed, but receiver process inherits taint (Taint Propagation).
     TaintReceiver,
-    /// Block transfer (-EPERM) to prevent covert data exfiltration or laundering.
+    /// Block transfer (-EPERM / -EACCES) to prevent covert data exfiltration or laundering.
     Block,
+    /// Local resolver query (127.0.0.53:53 / systemd-resolved socket) requires DNS inspection.
+    InspectDns,
+}
+
+impl PartialEq<bool> for UnixSendVerdict {
+    fn eq(&self, other: &bool) -> bool {
+        match self {
+            UnixSendVerdict::TaintReceiver => *other,
+            _ => !*other,
+        }
+    }
 }
 
 /// Verdict for `lsm/ptrace_access_check` hook.
@@ -115,6 +155,22 @@ pub enum PtraceVerdict {
     TaintTracer,
 }
 
+impl PtraceVerdict {
+    pub fn as_errno(&self) -> i32 {
+        match self {
+            PtraceVerdict::Allow => 0,
+            PtraceVerdict::Deny => -1,
+            PtraceVerdict::TaintTracer => 0,
+        }
+    }
+}
+
+impl PartialEq<i32> for PtraceVerdict {
+    fn eq(&self, other: &i32) -> bool {
+        self.as_errno() == *other
+    }
+}
+
 /// Verdict for `lsm/mmap_file` hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmapVerdict {
@@ -126,6 +182,10 @@ pub enum MmapVerdict {
     TaintInode,
     /// Executable mapping on unlinked/tmpfs file: flag potential fileless execution (+35).
     FlagAnonExec,
+    /// Tainted execution blocked (-EPERM / Deny).
+    TaintedExecutionBlocked,
+    /// GUI sealing violation: unverified / non-root / writable library blocked (-EPERM).
+    DenyMmap,
 }
 
 /// Verdict for `lsm/file_receive` (SCM_RIGHTS) hook.
@@ -221,7 +281,65 @@ impl TaintHygiene {
             return true;
         }
 
+        // Cloud provider credentials
+        if path.contains("/.aws/")
+            || path.contains("/.kube/")
+            || path.contains("/.config/gcloud/")
+        {
+            return true;
+        }
+
         false
+    }
+
+    /// Return the scoped secret domain bitmask owned by this executable name (Owner Policy).
+    pub fn get_owner_secret_domain(exe_name: &str) -> u64 {
+        if exe_name == "chrome" || exe_name == "google-chrome" || exe_name == "chromium" || exe_name == "brave" {
+            TaintFlags::BIT_CHROMIUM_DATA
+        } else if exe_name == "firefox" || exe_name == "firefox-bin" {
+            TaintFlags::BIT_FIREFOX_DATA
+        } else if exe_name == "Telegram" || exe_name == "telegram-desktop" {
+            TaintFlags::BIT_TELEGRAM_DATA
+        } else if exe_name == "ssh" || exe_name == "ssh-add" || exe_name == "scp" || exe_name == "sftp" || exe_name == "git" {
+            TaintFlags::BIT_SSH_KEYS
+        } else if exe_name == "aws" || exe_name == "kubectl" || exe_name == "gcloud" {
+            TaintFlags::BIT_CLOUD_CREDS
+        } else {
+            TaintFlags::NONE
+        }
+    }
+
+    /// Return the scoped secret domain bitmask for an accessed path.
+    pub fn get_secret_domain_for_path(path_str: &str) -> u64 {
+        if path_str.contains("/.ssh/") {
+            TaintFlags::BIT_SSH_KEYS
+        } else if path_str.contains("/.aws/")
+            || path_str.contains("/.kube/")
+            || path_str.contains("/.config/gcloud/")
+            || path_str.contains("/.gnupg/")
+        {
+            TaintFlags::BIT_CLOUD_CREDS
+        } else if path_str.contains("/google-chrome/") || path_str.contains("/chromium/") {
+            TaintFlags::BIT_CHROMIUM_DATA
+        } else if path_str.contains("/.mozilla/firefox/") || path_str.contains("cookies.sqlite") {
+            TaintFlags::BIT_FIREFOX_DATA
+        } else if path_str.contains("/TelegramDesktop/tdata") {
+            TaintFlags::BIT_TELEGRAM_DATA
+        } else if path_str.contains("/.electrum/wallets") || path_str.contains("/.bitcoin/wallets") {
+            TaintFlags::BIT_CRYPTO_WALLETS
+        } else {
+            TaintFlags::NONE
+        }
+    }
+
+    /// Check if an executable is the legitimate owner of the accessed secret domain.
+    pub fn is_secret_owner(exe_name: &str, path_str: &str) -> bool {
+        let domain = Self::get_secret_domain_for_path(path_str);
+        if domain == TaintFlags::NONE {
+            return false;
+        }
+        let owner_domain = Self::get_owner_secret_domain(exe_name);
+        (owner_domain & domain) != 0
     }
 
     /// Determines whether a process is an OS-level IPC broker or graphical compositor.
@@ -295,11 +413,126 @@ pub struct TaintMapManager {
     ipc_brokers: Arc<RwLock<HashSet<u32>>>,
     /// Sockets tracked in SK_STORAGE keyed by socket cookie.
     sockets: Arc<RwLock<HashMap<u64, SkStorageEntry>>>,
+    /// Inodes (dev, ino) of cryptographically verified GUI binary for BPF LSM attestation.
+    gui_binary_inodes: Arc<RwLock<HashSet<(u64, u64)>>>,
+    /// Last watchdog heartbeat from sentineld daemon in nanoseconds.
+    last_heartbeat_ns: Arc<AtomicU64>,
 }
 
 impl TaintMapManager {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            thread_to_group: Arc::new(RwLock::new(HashMap::new())),
+            inodes: Arc::new(RwLock::new(HashMap::new())),
+            allowed_tgids: Arc::new(RwLock::new(HashSet::new())),
+            flow_mark_ctx: Arc::new(RwLock::new(HashMap::new())),
+            flow_seq: Arc::new(AtomicU32::new(1)),
+            gui_pid: Arc::new(RwLock::new(None)),
+            daemon_pid: Arc::new(RwLock::new(None)),
+            ipc_brokers: Arc::new(RwLock::new(HashSet::new())),
+            sockets: Arc::new(RwLock::new(HashMap::new())),
+            gui_binary_inodes: Arc::new(RwLock::new(HashSet::new())),
+            last_heartbeat_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Register canonical GUI binary (dev, ino) for zero-userspace BPF LSM attestation.
+    pub fn register_gui_binary(&self, dev: u64, ino: u64) {
+        let mut map = self.gui_binary_inodes.write().unwrap();
+        map.insert((dev, ino));
+    }
+
+    /// Check if an inode matches registered GUI binary.
+    pub fn is_registered_gui_binary(&self, dev: u64, ino: u64) -> bool {
+        let map = self.gui_binary_inodes.read().unwrap();
+        map.contains(&(dev, ino))
+    }
+
+    /// Set verified GUI status for a process group leader in TASK_STORAGE.
+    pub fn set_verified_gui(&self, tgid: u32, verified: bool) {
+        let leader_tgid = self.resolve_group_leader(tgid);
+        let mut map = self.tasks.write().unwrap();
+        let entry = map.entry(leader_tgid).or_insert_with(|| TaskStorageEntry {
+            tgid: leader_tgid,
+            group_leader_tgid: leader_tgid,
+            tid: tgid,
+            taint_flags: TaintFlags::default(),
+            baseline_profile: 0,
+            is_leaf: true,
+            parent_tgid: 0,
+            is_verified_gui: verified,
+            is_sealed: verified,
+        });
+        entry.is_verified_gui = verified;
+        if verified {
+            entry.is_sealed = true;
+        }
+    }
+
+    /// Check if a process group leader has verified GUI status in TASK_STORAGE.
+    pub fn is_verified_gui(&self, tgid: u32) -> bool {
+        let leader_tgid = self.resolve_group_leader(tgid);
+        let map = self.tasks.read().unwrap();
+        map.get(&leader_tgid).map(|e| e.is_verified_gui).unwrap_or(false)
+    }
+
+    /// Update the in-kernel watchdog heartbeat timestamp.
+    pub fn update_heartbeat(&self, now_ns: u64) {
+        self.last_heartbeat_ns.store(now_ns, Ordering::SeqCst);
+    }
+
+    /// Read the latest watchdog heartbeat timestamp.
+    pub fn get_heartbeat(&self) -> u64 {
+        self.last_heartbeat_ns.load(Ordering::SeqCst)
+    }
+
+    /// Check if daemon is currently responsive (within 2.0s watchdog limit).
+    pub fn is_daemon_alive(&self, now_ns: u64) -> bool {
+        let last = self.get_heartbeat();
+        if last == 0 {
+            return true; // Grace period during startup
+        }
+        now_ns.saturating_sub(last) <= 2_000_000_000
+    }
+
+    /// Mark an inode as a trusted system package in INODE_STORAGE with version validation.
+    pub fn mark_inode_trusted(&self, dev: u64, ino: u64, version: u64, fs_verity: Option<[u8; 32]>) {
+        let mut inodes = self.inodes.write().unwrap();
+        let entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
+            taint_flags: TaintFlags::default(),
+            source_tgid: 0,
+            dev,
+            ino,
+            is_pipe: false,
+            is_fifo: false,
+            is_trusted_system_pkg: true,
+            inode_version: version,
+            fs_verity_hash: fs_verity,
+        });
+        entry.is_trusted_system_pkg = true;
+        entry.inode_version = version;
+        entry.fs_verity_hash = fs_verity;
+    }
+
+    /// Check if an inode is verified in INODE_STORAGE and version has not drifted.
+    pub fn is_inode_trusted(&self, dev: u64, ino: u64, current_version: u64) -> bool {
+        let inodes = self.inodes.read().unwrap();
+        if let Some(entry) = inodes.get(&(dev, ino)) {
+            if entry.is_trusted_system_pkg {
+                if current_version == 0 || entry.inode_version == current_version {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Retrieve the taint flags for a task ID.
+    pub fn get_flags(&self, id: u32) -> TaintFlags {
+        let leader_tgid = self.resolve_group_leader(id);
+        let map = self.tasks.read().unwrap();
+        map.get(&leader_tgid).map(|e| e.taint_flags).unwrap_or_default()
     }
 
     /// Register verified GUI process PID for in-kernel ptrace and memory protection.
@@ -533,31 +766,46 @@ impl TaintMapManager {
         let is_writing = (mask & MAY_WRITE) != 0;
         let is_reading = (mask & MAY_READ) != 0;
 
-        // 3. Process Write Path: Tainted task writes to an inode
-        if is_writing && self.is_tainted(leader_tgid) {
-            let parent_flags = self
-                .get_task_storage(leader_tgid)
-                .map(|t| t.taint_flags)
-                .unwrap_or(TaintFlags(TaintFlags::TAINTED_PIPE));
-
-            let mut inodes = self.inodes.write().unwrap();
-            let inode_entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
-                taint_flags: TaintFlags::default(),
-                source_tgid: leader_tgid,
-                dev,
-                ino,
-                is_pipe,
-                is_fifo,
-            });
-
-            inode_entry.taint_flags.0 |= parent_flags.0;
-            if is_pipe || is_fifo {
-                inode_entry.taint_flags.insert(TaintFlags::TAINTED_PIPE);
-            } else {
-                inode_entry.taint_flags.insert(TaintFlags::TAINTED_TEMPFILE);
+        // 3. Process Write Path:
+        if is_writing {
+            // Invalidate in-kernel cached package trust upon any file write
+            {
+                let mut inodes = self.inodes.write().unwrap();
+                if let Some(entry) = inodes.get_mut(&(dev, ino)) {
+                    entry.is_trusted_system_pkg = false;
+                }
             }
 
-            return Some(inode_entry.taint_flags);
+            // Staging Attack Defense: Tainted task writes to ANY file (including user cache, temp files, intermediate logs)
+            if self.is_tainted(leader_tgid) {
+                let parent_flags = self
+                    .get_task_storage(leader_tgid)
+                    .map(|t| t.taint_flags)
+                    .unwrap_or(TaintFlags(TaintFlags::BIT_TEMPFILE));
+
+                let mut inodes = self.inodes.write().unwrap();
+                let inode_entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
+                    taint_flags: TaintFlags::default(),
+                    source_tgid: leader_tgid,
+                    dev,
+                    ino,
+                    is_pipe,
+                    is_fifo,
+                    is_trusted_system_pkg: false,
+                    inode_version: 0,
+                    fs_verity_hash: None,
+                });
+
+                inode_entry.taint_flags.0 |= parent_flags.0;
+                if is_pipe || is_fifo {
+                    inode_entry.taint_flags.insert(TaintFlags::BIT_PIPE);
+                } else {
+                    inode_entry.taint_flags.insert(TaintFlags::BIT_TEMPFILE);
+                }
+                inode_entry.is_trusted_system_pkg = false;
+
+                return Some(inode_entry.taint_flags);
+            }
         }
 
         // 4. Process Read Path: Any task reads from a tainted inode
@@ -580,8 +828,10 @@ impl TaintMapManager {
     }
 
     /// Process `lsm/mmap_file` hook:
+    /// - Zero-Userspace GUI Memory Sealing: blocks unprivileged .so execution inside sentinel-gui
     /// - Detects reading secrets via `mmap` (MAP_SHARED or MAP_PRIVATE)
     /// - Detects writing to shared memory / files from tainted processes (`MAP_SHARED | PROT_WRITE`)
+    /// - Blocks tainted processes from loading executable libraries
     /// - Detects executable mappings (`PROT_EXEC`) on anonymous memory or unlinked tmpfs files
     pub fn handle_mmap_file(
         &self,
@@ -602,7 +852,29 @@ impl TaintMapManager {
         let is_write_shared = (prot & MAY_WRITE != 0 || (prot & 0x2) != 0) && (flags & 0x1 != 0 /* MAP_SHARED */);
         let is_exec = (prot & MAY_EXEC != 0) || ((prot & 0x4) != 0);
 
-        // 1. Executable mapping on unlinked file or tmpfs / memfd -> FlagAnonExec
+        // 0. Zero-Userspace GUI Sealing:
+        // If task has verified GUI flag, any executable mapping (.so) from user-writable
+        // or non-system paths immediately revokes GUI status and denies mmap (-EPERM)!
+        if is_exec && self.is_verified_gui(leader_tgid) {
+            let is_untrusted_loc = path_str.starts_with("/tmp")
+                || path_str.starts_with("/dev/shm")
+                || path_str.starts_with("/home")
+                || path_str.contains("/.local/")
+                || path_str.contains("/Downloads/")
+                || path_str.contains("(deleted)");
+            if is_untrusted_loc {
+                self.set_verified_gui(leader_tgid, false);
+                return MmapVerdict::DenyMmap;
+            }
+        }
+
+        // 1. Tainted Execution Blocked:
+        // A tainted process attempting to map an executable payload is blocked in kernel
+        if is_exec && self.is_tainted(leader_tgid) {
+            return MmapVerdict::TaintedExecutionBlocked;
+        }
+
+        // 2. Executable mapping on unlinked file or tmpfs / memfd -> FlagAnonExec
         if is_exec {
             let is_unlinked_or_tmpfs = path_str.contains("(deleted)")
                 || path_str.starts_with("/dev/shm")
@@ -613,21 +885,22 @@ impl TaintMapManager {
             }
         }
 
-        // 2. Secret file mapped -> Taint reader process
+        // 3. Secret file mapped -> Taint reader process
         if TaintHygiene::is_strictly_private_secret(&path_str) {
+            let domain = TaintHygiene::get_secret_domain_for_path(&path_str);
             let mut taint = TaintFlags::default();
-            taint.insert(TaintFlags::TAINTED_SSH);
-            taint.insert(TaintFlags::TAINT_MMAP_SHARED);
+            taint.insert(domain);
+            taint.insert(TaintFlags::BIT_MMAP_SHARED);
             self.set_task_taint(leader_tgid, taint);
             return MmapVerdict::TaintTask;
         }
 
-        // 3. Tainted process maps normal file with PROT_WRITE | MAP_SHARED -> Taint target inode
+        // 4. Tainted process maps normal file with PROT_WRITE | MAP_SHARED -> Taint target inode
         if is_write_shared && self.is_tainted(leader_tgid) {
             let parent_flags = self
                 .get_task_storage(leader_tgid)
                 .map(|t| t.taint_flags)
-                .unwrap_or(TaintFlags(TaintFlags::TAINT_MMAP_SHARED));
+                .unwrap_or(TaintFlags(TaintFlags::BIT_MMAP_SHARED));
 
             let mut inodes = self.inodes.write().unwrap();
             let inode_entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
@@ -637,14 +910,17 @@ impl TaintMapManager {
                 ino,
                 is_pipe: false,
                 is_fifo: false,
+                is_trusted_system_pkg: false,
+                inode_version: 0,
+                fs_verity_hash: None,
             });
 
             inode_entry.taint_flags.0 |= parent_flags.0;
-            inode_entry.taint_flags.insert(TaintFlags::TAINT_MMAP_SHARED);
+            inode_entry.taint_flags.insert(TaintFlags::BIT_MMAP_SHARED);
             return MmapVerdict::TaintInode;
         }
 
-        // 4. Any process maps an already-tainted inode -> inherit taint
+        // 5. Any process maps an already-tainted inode -> inherit taint
         let inode_tainted = {
             let inodes = self.inodes.read().unwrap();
             inodes.get(&(dev, ino)).map(|e| e.taint_flags)
@@ -697,30 +973,51 @@ impl TaintMapManager {
         FileReceiveVerdict::Allow
     }
 
-    /// Process `lsm/unix_may_send` hook: prevents IPC taint laundering via AF_UNIX domain sockets.
-    pub fn handle_unix_may_send(
+    /// Process `lsm/unix_may_send` hook: prevents IPC taint laundering via AF_UNIX domain sockets
+    /// and guards privileged /run/sentinel/sentinel.sock from unverified callers.
+    pub fn handle_unix_may_send<P: AsRef<Path>>(
         &self,
         sender_id: u32,
         receiver_id: u32,
-        sock_path: &Path,
+        sock_path: P,
     ) -> UnixSendVerdict {
+        let path_ref = sock_path.as_ref();
+        let path_str = path_ref.to_string_lossy();
         let sender_leader = self.resolve_group_leader(sender_id);
         let receiver_leader = self.resolve_group_leader(receiver_id);
+
+        // 1. Zero-Userspace Trust Gate for Management Socket:
+        // Intercepts connect() to /run/sentinel/sentinel.sock directly in kernel space:
+        // Only root (UID 0) or cryptographically verified sentinel-gui are allowed!
+        if path_str.ends_with("/sentinel.sock") || path_str == "/run/sentinel/sentinel.sock" {
+            let is_root = sender_leader == 0;
+            let is_gui = self.is_verified_gui(sender_leader);
+            if !is_root && !is_gui {
+                return UnixSendVerdict::Block;
+            }
+            return UnixSendVerdict::Allow;
+        }
+
+        // 2. Covert DNS Tunneling Protection:
+        // Intercepts requests to systemd-resolved socket (/run/systemd/resolve/io.systemd.Resolve)
+        if (path_str.contains("systemd/resolve") || path_str.contains("io.systemd.Resolve"))
+            && self.is_tainted(sender_leader)
+        {
+            return UnixSendVerdict::InspectDns;
+        }
 
         if !self.is_tainted(sender_leader) {
             return UnixSendVerdict::Allow;
         }
 
-        let path_str = sock_path.to_string_lossy();
-
         // Exempt system display and desktop infrastructure sockets
-        if TaintHygiene::is_exempt_path(&path_str) || path_str.contains("/sentinel.sock") {
+        if TaintHygiene::is_exempt_path(&path_str) {
             return UnixSendVerdict::Allow;
         }
 
         // Anti-Taint Explosion: System IPC brokers (dbus-daemon, systemd, pipewire)
         // must not spread taint to all other clean clients across the session!
-        if self.is_ipc_broker(receiver_leader) {
+        if self.is_ipc_broker(receiver_leader) || TaintHygiene::is_ipc_broker_name(&path_str) {
             return UnixSendVerdict::Allow;
         }
 

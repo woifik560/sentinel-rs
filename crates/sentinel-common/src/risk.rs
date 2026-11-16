@@ -32,6 +32,8 @@ pub enum RuleId {
     TofuTamperedBinary,
     /// +30: Taint laundering attempt via AF_UNIX or ptrace memory snooping.
     IpcTaintLaunder,
+    /// +50: Covert DNS tunneling exfiltration via local resolver (127.0.0.53:53) or anomalous domain entropy.
+    CovertDnsTunnel,
     /// -35: Binary verified in dpkg package database in legitimate context.
     /// NOTE: Disallowed if SecretNonOwner or Taint is present!
     TrustedPackageContext,
@@ -52,6 +54,7 @@ impl RuleId {
             RuleId::FirstSeenDestination => 15,
             RuleId::TofuTamperedBinary => 40,
             RuleId::IpcTaintLaunder => 30,
+            RuleId::CovertDnsTunnel => 50,
             RuleId::TrustedPackageContext => -35,
         }
     }
@@ -70,6 +73,7 @@ impl RuleId {
             RuleId::FirstSeenDestination => "FIRST_SEEN_DESTINATION",
             RuleId::TofuTamperedBinary => "TOFU_TAMPERED_BINARY",
             RuleId::IpcTaintLaunder => "IPC_TAINT_LAUNDER",
+            RuleId::CovertDnsTunnel => "COVERT_DNS_TUNNEL",
             RuleId::TrustedPackageContext => "TRUSTED_PACKAGE_CONTEXT",
         }
     }
@@ -175,6 +179,46 @@ pub fn classify(score: u32, thresholds: &RiskThresholds) -> Verdict {
     } else {
         Verdict::High
     }
+}
+
+/// Calculate Shannon entropy (bits per byte) of a string to detect encoded/exfiltrated payloads.
+pub fn calculate_shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for &b in s.as_bytes() {
+        counts[b as usize] += 1;
+    }
+    let len = s.len() as f64;
+    let mut entropy = 0.0;
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / len;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+/// Detects covert DNS tunneling queries (e.g. `<hex_secret>.attacker.com` via local resolver).
+pub fn is_suspicious_dns_query(domain: &str) -> bool {
+    let clean = domain.trim_end_matches('.');
+    if clean.is_empty() {
+        return false;
+    }
+
+    for label in clean.split('.') {
+        // High entropy (hex/base64/base32 encoded chunks) or long subdomain labels > 40 chars
+        if label.len() > 40 {
+            return true;
+        }
+        if label.len() >= 20 && calculate_shannon_entropy(label) > 3.8 {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]

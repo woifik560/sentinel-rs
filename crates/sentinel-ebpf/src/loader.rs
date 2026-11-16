@@ -29,6 +29,9 @@ impl Default for LoaderConfig {
     }
 }
 
+/// Directory path in bpffs where programs and maps are pinned.
+pub const BPF_PIN_PATH: &str = "/sys/fs/bpf/sentinel";
+
 /// The eBPF loader and event dispatcher.
 pub struct EbpfLoader {
     config: LoaderConfig,
@@ -38,6 +41,16 @@ pub struct EbpfLoader {
 }
 
 impl EbpfLoader {
+    /// Ensures that /sys/fs/bpf/sentinel is ready for persistent pinning.
+    /// This keeps BPF LSM and cgroup programs active in the kernel across daemon crashes.
+    pub fn ensure_pin_dir(&self) -> anyhow::Result<std::path::PathBuf> {
+        let pin_dir = std::path::PathBuf::from(BPF_PIN_PATH);
+        if !pin_dir.exists() {
+            let _ = std::fs::create_dir_all(&pin_dir);
+        }
+        Ok(pin_dir)
+    }
+
     /// Create a new EbpfLoader instance.
     pub fn new(config: LoaderConfig) -> Self {
         let (tx, rx) = mpsc::channel(config.ring_buffer_size);

@@ -51,23 +51,34 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
      2. `ct state established,related accept` (Line-speed kernel fast-path)
      3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass` (New SYN hold)
      The `bypass` flag ensures that if the daemon is stopped or crashes, system network traffic is not locked up indefinitely.
-4. **LoLBin Hardening & TOFU**:
-   - Package integrity provider abstraction (`PkgIntegrityProvider`): uses MD5 solely as a membership indicator, with local SHA-256 caching as the authoritative cryptographic standard.
-   - Package trust discount (`-35`) is invalidated whenever a secret is accessed (`SECRET_NON_OWNER`) or when run via piped stdin or inline arguments.
-   - **Trust On First Use (TOFU)** for external tools (`~/.cargo/bin`, Flatpak, AppImage, local user builds).
-5. **Dual-Socket Architecture & Strict GUI Peer Verification (P0)**:
-   - **Dual Unix Domain Sockets**:
-     - `/run/sentinel/sentinel-ro.sock` (0666): Public read-only socket for monitoring, status queries, and forensic exports (`sntctl monitor`, `sntctl status`, `sntctl export`).
-     - `/run/sentinel/sentinel.sock` (0666, authenticated post-accept): Management socket accessible to unprivileged desktop GUI session without kernel `EACCES` errors.
-   - **Strict Peer Verification & TOCTOU Defense**:
-     - Validates `SO_PEERCRED` (`uid` and `pid`). Root granted administrative rights.
-     - Resolves canonical `/proc/<pid>/exe`, checks root ownership (`uid == 0`), non-writable permissions (`mode & 0o022 == 0`), and SHA-256.
-     - Inspects `/proc/<pid>/environ` to verify absence of `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`.
-     - **Anti-TOCTOU `/proc/<pid>/maps` Inspection**: Even if a hostile library's constructor wiped `environ` in memory prior to `connect()`, the daemon inspects process memory maps. Executable mappings (`r-xp`) from `/tmp`, `/dev/shm`, `~`, or deleted files immediately terminate authorization.
-   - **X11 Anti-Clickjacking Defense**: Detects X11 sessions, mandates entering an ephemeral 4-digit PIN, and locks out the prompt after 3 failed attempts.
-     - Inspects `/proc/<pid>/environ` to verify absence of `LD_PRELOAD` / `LD_AUDIT`.
-     - **Anti-TOCTOU `/proc/<pid>/maps` Inspection**: Even if a hostile library's constructor wiped `environ` in memory prior to `connect()`, the daemon inspects process memory maps. Executable mappings (`r-xp`) from `/tmp`, `/dev/shm`, `~`, or deleted files immediately terminate authorization.
-   - **X11 Anti-Clickjacking Defense**: Detects X11 sessions and mandates entering an ephemeral 4-digit PIN for sensitive prompt actions.
+   - **Hybrid Kernel Watchdog (Fail-Safe for Clean + Fail-Close for Tainted)**:
+     - eBPF program pinning in `/sys/fs/bpf/sentinel/`: programs remain active in-kernel even if `sentineld` crashes.
+     - Heartbeat timer in `BPF_MAP_TYPE_ARRAY`: daemon updates timestamp every 500 ms.
+     - Smart kernel degradation in `lsm/socket_sendmsg` and `cgroup_skb/egress`: if the daemon is unresponsive for > 2.0s, clean processes (`taint == 0`) continue normally without disruption (Fail-Safe), while tainted processes (`taint != 0`) are immediately blocked by the kernel with `-EPERM` (Fail-Close), preventing credential exfiltration even during daemon downtime.
+4. **Distro-Agnostic Package Integrity in Pure Rust & Scoped Taint**:
+   - **Pure-Rust Multi-Backend for System Package Databases**:
+     - Arch Linux / Manjaro / EndeavourOS (`pacman`): reads `mtree` archives via `flate2` and extracts recorded SHA-256 digests.
+     - Fedora / RHEL / CentOS / openSUSE (`rpm`): direct query of SQLite DB `/var/lib/rpm/rpmdb.sqlite` and manifests without calling the `rpm` binary.
+     - NixOS: validates immutable `/nix/store/<hash>-name` paths, `root:root` ownership, and `MS_RDONLY` mount flag.
+     - Immutable OSes (Fedora Silverblue, SteamOS, VanillaOS): validates read-only filesystem mounts (`ostree`, `composefs`, `erofs`) and `fs-verity` digests.
+     - Debian / Ubuntu (`dpkg`): parses `/var/lib/dpkg/info/*.md5sums` and status in pure Rust without external CLI invocations.
+   - **In-Kernel Verification Caching (`BPF_MAP_TYPE_INODE_STORAGE`)**:
+     - `TRUSTED_SYSTEM_PKG` status and inode version (`i_version`) cached directly in kernel memory; any write operation (`MAY_WRITE`) instantly invalidates trust.
+     - Sleepable hooks (`lsm.s/bprm_committed_creds`) leverage kernel kfuncs `bpf_get_file_hash()` (`fs-verity`).
+   - **Scoped Taint Domains (`u64 taint_mask`)**:
+     - Bitmask domains: `BIT_SSH_KEYS`, `BIT_CLOUD_CREDS`, `BIT_CHROMIUM_DATA`, `BIT_FIREFOX_DATA`, `BIT_TELEGRAM_DATA`, `BIT_CRYPTO_WALLETS`.
+     - **Owner Policy**: legitimate browser (Chrome) accessing its own cookies (`BIT_CHROMIUM_DATA`) does NOT raise `SECRET_NON_OWNER`. But if Chrome (or a rogue extension) reads `~/.ssh/id_rsa`, `SECRET_NON_OWNER` immediately triggers and blocks egress!
+     - **Downward-Only Taint Propagation**: IDE terminal shells and build runners (`cargo build`, `npm install`) inherit taint downward, never contaminating the parent IDE (VSCode / JetBrains).
+5. **Zero-Userspace Trust GUI Attestation & Covert Channel Defense**:
+   - **In-Kernel Attestation at Launch (`lsm/bprm_committed_creds`)**:
+     - Daemon registers `(dev, ino)` of `/usr/bin/sentinel-gui`. BPF LSM stamps `is_verified_gui = 1` in `TASK_STORAGE`.
+   - **In-Kernel Memory Sealing (`lsm/mmap_file`)**:
+     - Loading any shared library (`.so`) with `PROT_EXEC` from non-root writable paths (`/tmp`, `/dev/shm`, `~/.local`) is blocked (`-EPERM`) or immediately revokes `is_verified_gui = 0`.
+   - **Direct Kernel Gate in `lsm/unix_stream_connect`**:
+     - Any `connect()` to `/run/sentinel/sentinel.sock` is verified in the kernel: unverified callers receive `-EACCES` directly without waking userspace.
+   - **Staging Attack & Covert DNS Tunneling Defense**:
+     - Intermediate files (`~/.cache/benign.dat`) inherit secret taint masks via `INODE_STORAGE` on `MAY_WRITE`, infecting subsequent readers.
+     - DNS queries to `127.0.0.53:53` or `io.systemd.Resolve` are intercepted: Shannon entropy > 3.8 and subdomain > 40 chars trigger `COVERT_DNS_TUNNEL`.
 6. **Never-Freeze Allowlist & DoS Defense**:
    - Hardcoded protection list (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
    - Anti-Spoofing: Validation strictly based on `(dev, inode)` and canonical binary path. Spoofing `comm` via `prctl(PR_SET_NAME)` is ignored.
@@ -78,11 +89,26 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
 
 ---
 
-## Kernel Setup & GRUB Configuration
+## Kernel Setup & BPF LSM Configuration
 
-Sentinel-RS requires BPF LSM hooks to be enabled at kernel boot.
+Sentinel-RS requires Linux 6.x BPF LSM hooks enabled at kernel boot.
 
-### Ubuntu / Debian Setup:
+### Universal Automatic Setup (`sntctl setup-kernel`):
+Sentinel-RS includes a built-in automated kernel bootloader configuration tool:
+```bash
+sudo sntctl setup-kernel
+```
+The command automatically:
+1. Queries `/sys/kernel/security/lsm` for active LSM modules.
+2. **Dynamically preserves all existing LSMs** (`apparmor`, `selinux`, `yama`, `lockdown`, `integrity`, `landlock`), appending `,bpf` without duplication.
+3. Automatically identifies and updates the active bootloader:
+   - **RHEL / Fedora / CentOS / AlmaLinux**: `grubby --update-kernel=ALL --args="lsm=..."`
+   - **Pop!_OS / Ubuntu (systemd-boot)**: `kernelstub -a "lsm=..."`
+   - **Arch Linux / systemd-boot**: Patches `/boot/loader/entries/*.conf`
+   - **Debian / Ubuntu / openSUSE (GRUB)**: Automatically updates `GRUB_CMDLINE_LINUX` in `/etc/default/grub` and invokes `update-grub` / `grub2-mkconfig`.
+4. Reboot the system to activate: `sudo reboot`.
+
+### Manual Setup for Ubuntu / Debian (GRUB):
 1. Open `/etc/default/grub` with root privileges:
    ```bash
    sudo nano /etc/default/grub
@@ -174,16 +200,17 @@ flowchart TD
 
 | Rule | Weight | Description |
 |---|:---:|---|
+| `COVERT_DNS_TUNNEL` | **+50** | Covert DNS tunneling exfiltration (Shannon entropy > 3.8, subdomain > 40 chars) |
 | `FILELESS_MEMFD` | **+50** | Anonymous memory execution (`memfd_create`) |
 | `FILELESS_ANON_EXEC` | **+35** | Memory execution via `mmap` with `PROT_EXEC` on deleted/tmpfs file |
 | `SECRET_NON_OWNER` | **+40** | Unauthorized secret access or taint inherited via pipe/file/SCM_RIGHTS |
-| `UNTRUSTED_BINARY_ORIGIN` | **+25** | Executable launched from `/tmp`, `/dev/shm`, `~/Downloads`, or unverified in `dpkg` |
+| `UNTRUSTED_BINARY_ORIGIN` | **+25** | Executable launched from `/tmp`, `/dev/shm`, `~/Downloads`, or unverified in system packages |
 | `SUSPICIOUS_SCRIPT_EXECUTION` | **+25** | Script execution from anonymous sources, stdin, or suspicious flags |
 | `SUSPICIOUS_INTERPRETER` | **+20** | Interpreter launched with inline code (`-c`, `-e`), eval, base64, or pipe |
 | `FIRST_SEEN_DESTINATION` | **+15** | First connection to external public IP outside RFC1918 / loopback |
 | `FAST_EXFIL_BURST` | **+15** | Network connection initiated within <= 5s of secret access |
 | `RAW_IP_CONNECT` | **+10** | Direct IP connection without preceding DNS query |
-| `TRUSTED_PACKAGE_CONTEXT` | **-35** | Binary verified in `dpkg` by SHA-256 (**Disallowed upon Taint or pipe!**) |
+| `TRUSTED_PACKAGE_CONTEXT` | **-35** | Binary verified in system package manager by SHA-256 (**Disallowed upon Taint or pipe!**) |
 
 ---
 
@@ -192,6 +219,9 @@ flowchart TD
 Renamed from `sentinelctl` to `sntctl` to prevent namespace collision with SentinelOne:
 
 ```bash
+# Universal automatic kernel bootloader setup for BPF LSM (any distro) [Requires Root]
+sudo sntctl setup-kernel
+
 # Real-time interactive triage (for servers and SSH) [Requires Root]
 sudo sntctl watch
 

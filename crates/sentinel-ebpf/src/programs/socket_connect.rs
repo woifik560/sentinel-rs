@@ -20,16 +20,39 @@
 use sentinel_common::events::SENTINEL_SO_MARK;
 
 /// Evaluated action for an intercepted socket connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub enum SocketConnectVerdict {
     /// Fast-Path: Allow connection immediately with zero latency.
     FastPathAllow,
+    /// Fast-Path: Accept connection (alias for FastPathAllow).
+    FastPathAccept,
     /// Slow-Path: Hold initial SYN packet in Netfilter queue via SO_MARK (0x5E170001 or dynamic).
     SlowPathHoldNfqueue { so_mark: u32 },
     /// Established connection requiring re-evaluation in NFQUEUE (0x40000000 | flow_id).
     RevalidateHoldNfqueue { so_mark: u32 },
     /// Strict/Legacy fallback: Deny connection with -EPERM.
     DenyEperm,
+}
+
+impl PartialEq for SocketConnectVerdict {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SocketConnectVerdict::FastPathAllow, SocketConnectVerdict::FastPathAllow)
+            | (SocketConnectVerdict::FastPathAccept, SocketConnectVerdict::FastPathAccept)
+            | (SocketConnectVerdict::FastPathAllow, SocketConnectVerdict::FastPathAccept)
+            | (SocketConnectVerdict::FastPathAccept, SocketConnectVerdict::FastPathAllow) => true,
+            (SocketConnectVerdict::DenyEperm, SocketConnectVerdict::DenyEperm) => true,
+            (
+                SocketConnectVerdict::SlowPathHoldNfqueue { so_mark: a },
+                SocketConnectVerdict::SlowPathHoldNfqueue { so_mark: b },
+            ) => a == b,
+            (
+                SocketConnectVerdict::RevalidateHoldNfqueue { so_mark: a },
+                SocketConnectVerdict::RevalidateHoldNfqueue { so_mark: b },
+            ) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Evaluates network connection request, choosing Fast-Path or Slow-Path.
@@ -52,26 +75,22 @@ pub fn evaluate_socket_connect(
 pub fn evaluate_socket_connect_with_mark(
     is_tainted: bool,
     is_allowed: bool,
-    is_trusted_profile: bool,
+    _is_trusted_profile: bool,
     use_nfqueue: bool,
     so_mark: u32,
 ) -> SocketConnectVerdict {
-    if is_allowed {
-        return SocketConnectVerdict::FastPathAllow;
+    if is_allowed || !is_tainted {
+        return SocketConnectVerdict::FastPathAccept;
     }
 
-    if !is_tainted && is_trusted_profile {
-        // Fast-Path: clean task with trusted package origin
-        SocketConnectVerdict::FastPathAllow
-    } else if is_tainted || !is_trusted_profile {
-        // Slow-Path: mark socket for zero-drop packet holding in NFQUEUE
+    if is_tainted {
         if use_nfqueue {
             SocketConnectVerdict::SlowPathHoldNfqueue { so_mark }
         } else {
             SocketConnectVerdict::DenyEperm
         }
     } else {
-        SocketConnectVerdict::FastPathAllow
+        SocketConnectVerdict::FastPathAccept
     }
 }
 

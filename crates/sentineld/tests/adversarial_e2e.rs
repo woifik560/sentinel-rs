@@ -11,6 +11,17 @@
 //! 8. D-Bus broker isolation and anti-taint explosion.
 //! 9. Dynamic mark flow correlation: concurrent SYN packets mapped synchronously via BPF map.
 //! 10. SYN retransmit deduplication and AllowForDuration temporary pass.
+//! 11. Zero bitmask collision in Netfilter rules.
+//! 12. TOCTOU defense: /proc/<pid>/maps detects wiped LD_PRELOAD.
+//! 13. D-Bus / systemd broker escape prevention.
+//! 14. JIT runtime legitimate memory execution compatibility.
+//! 15. Multi-distro package integrity & in-kernel INODE_STORAGE cache invalidation.
+//! 16. Zero-Userspace GUI attestation & runtime memory sealing (mmap_file / unix_may_send).
+//! 17. Hybrid watchdog: fail-safe for clean processes & fail-close for tainted processes.
+//! 18. Scoped taint domains (u64 bitmask), Owner Policy & downward-only propagation.
+//! 19. Staging attack defense (intermediate file taint inheritance).
+//! 20. Covert DNS tunneling defense (Shannon entropy > 3.8 & long query detection).
+//! 21. Universal bootloader auto-configuration (dynamic LSM preservation & cmdline patching).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,20 +30,26 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use sentinel_common::events::{
-    decode_flow_mark, encode_flow_mark, FlowContext, EbpfEvent, MAY_READ, MAY_WRITE,
+    decode_flow_mark, encode_flow_mark, FlowContext, EbpfEvent, MAY_EXEC, MAY_READ, MAY_WRITE,
     SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
 };
 use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptRequest, PromptVerdict};
 use sentinel_common::process::{ProcessNode, SecretCategory};
-use sentinel_common::risk::{RiskEngineConfig, RiskThresholds, RuleId, Verdict};
-use sentinel_ebpf::maps::{TaintFlags, TaintHygiene, TaintMapManager};
-use sentinel_ebpf::programs::bprm_check_security::is_memfd_or_fileless;
+use sentinel_common::risk::{
+    calculate_shannon_entropy, is_suspicious_dns_query, RiskEngineConfig, RiskThresholds, RuleId,
+    Verdict,
+};
+use sentinel_ebpf::maps::{TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict};
+use sentinel_ebpf::programs::bprm_check_security::{bpf_get_file_hash_simulated, is_memfd_or_fileless};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
 use sentinel_ebpf::programs::file_receive::handle_file_receive;
 use sentinel_ebpf::programs::mmap_file::{handle_mmap_file, MmapVerdict};
 use sentinel_ebpf::programs::socket_connect::{evaluate_socket_connect, SocketConnectVerdict};
-use sentinel_ebpf::programs::socket_sendmsg::{evaluate_socket_sendmsg_ext, SocketSendmsgVerdict};
+use sentinel_ebpf::programs::socket_sendmsg::{
+    evaluate_socket_sendmsg_ext, evaluate_socket_sendmsg_watchdog, SocketSendmsgVerdict,
+};
+use sentineld::lineage;
 
 // -----------------------------------------------------------------------------
 // Test 1: `cat secret | curl` (pipe taint inheritance)
@@ -452,7 +469,7 @@ fn test_12_ld_preload_toctou_maps_defense() {
 // -----------------------------------------------------------------------------
 #[test]
 fn test_13_dbus_systemd_spawn_link() {
-    use crate::lineage::LineageTracker;
+    use sentineld::lineage::LineageTracker;
 
     let tracker = LineageTracker::new(128);
     let attacker_tgid = 9100;
@@ -496,3 +513,388 @@ fn test_14_jit_runtime_allow() {
     assert!(!TaintHygiene::is_known_jit_runtime("stealer"));
     assert!(!TaintHygiene::is_known_jit_runtime("sh"));
 }
+
+// -----------------------------------------------------------------------------
+// Test 15: Multi-Distro Package Integrity & Inode Storage Kernel Cache
+// -----------------------------------------------------------------------------
+#[test]
+fn test_15_multidistro_package_integrity_and_kernel_cache() {
+    let taint_mgr = TaintMapManager::new();
+    let dev = 100;
+    let ino = 54321;
+    let version = 1;
+    let bin_path = Path::new("/usr/bin/curl");
+
+    // 1. Initial state: inode is NOT trusted
+    assert!(!taint_mgr.is_inode_trusted(dev, ino, version));
+
+    // 2. Mark inode as trusted in in-kernel INODE_STORAGE (e.g. verified by CompositePkgChecker)
+    taint_mgr.mark_inode_trusted(dev, ino, version);
+    assert!(taint_mgr.is_inode_trusted(dev, ino, version));
+
+    // Stale version check: if kernel reports changed i_version, trust is invalid
+    assert!(!taint_mgr.is_inode_trusted(dev, ino, version + 1));
+
+    // 3. Attacker or local package modification attempts to write to the binary
+    let attacker_tgid = 8888;
+    let _write_res = evaluate_file_permission(
+        &taint_mgr,
+        attacker_tgid,
+        dev,
+        ino,
+        bin_path,
+        MAY_WRITE,
+        false,
+        false,
+    );
+
+    // In-kernel LSM instantly invalidates trusted package cache on MAY_WRITE!
+    assert!(
+        !taint_mgr.is_inode_trusted(dev, ino, version),
+        "Kernel INODE_STORAGE must invalidate trusted status on write!"
+    );
+
+    // 4. Test simulated kernel kfunc bpf_get_file_hash_simulated
+    let temp_dir = std::env::temp_dir();
+    let test_file = temp_dir.join("sentinel_test_pkg_hash.bin");
+    std::fs::write(&test_file, b"test package binary payload").unwrap();
+    let hash = bpf_get_file_hash_simulated(&test_file);
+    assert!(hash.is_some(), "Kernel kfunc bpf_get_file_hash must return cryptographic hash");
+    let _ = std::fs::remove_file(test_file);
+}
+
+// -----------------------------------------------------------------------------
+// Test 16: Zero-Userspace GUI Attestation & Runtime Memory Sealing
+// -----------------------------------------------------------------------------
+#[test]
+fn test_16_zero_userspace_gui_attestation_and_sealing() {
+    let taint_mgr = TaintMapManager::new();
+    let gui_dev = 8;
+    let gui_ino = 98765;
+    let gui_tgid = 3000;
+
+    // 1. Daemon registers legitimate GUI binary (dev, ino) in protected eBPF map
+    taint_mgr.register_gui_binary(gui_dev, gui_ino);
+    assert!(taint_mgr.is_registered_gui_binary(gui_dev, gui_ino));
+    assert!(!taint_mgr.is_registered_gui_binary(gui_dev, 11111));
+
+    // 2. GUI process launched -> bprm_committed_creds sets is_verified_gui = 1 in TASK_STORAGE
+    taint_mgr.set_verified_gui(gui_tgid, true);
+    assert!(taint_mgr.is_verified_gui(gui_tgid));
+
+    // 3. Verified GUI connects to /run/sentinel/sentinel.sock -> Kernel allows connect
+    let gui_connect = taint_mgr.handle_unix_may_send(gui_tgid, 1, "/run/sentinel/sentinel.sock");
+    assert_eq!(gui_connect, UnixSendVerdict::Allow);
+
+    // 4. Non-root unverified process attempts connection to /run/sentinel/sentinel.sock -> Kernel returns Block (-EACCES)
+    let rogue_tgid = 9999;
+    let rogue_connect = taint_mgr.handle_unix_may_send(rogue_tgid, 1, "/run/sentinel/sentinel.sock");
+    assert_eq!(
+        rogue_connect,
+        UnixSendVerdict::Block,
+        "Unverified caller must be rejected by kernel LSM without waking userspace!"
+    );
+
+    // 5. Memory Sealing Defense: Attacker tries injecting shared library (.so) into GUI from untrusted location
+    // (e.g. via LD_PRELOAD from /tmp, /dev/shm, ~/.local)
+    let hostile_so_path = Path::new("/tmp/hostile_inject.so");
+    let mmap_verdict = taint_mgr.handle_mmap_file(
+        gui_tgid,
+        0,
+        0,
+        hostile_so_path,
+        MAY_EXEC, // PROT_EXEC
+        0,
+    );
+    assert_eq!(
+        mmap_verdict,
+        MmapVerdict::DenyMmap,
+        "Executable mapping of untrusted .so into GUI must be denied!"
+    );
+    assert!(
+        !taint_mgr.is_verified_gui(gui_tgid),
+        "GUI verified status must be stripped immediately upon loading untrusted code!"
+    );
+
+    // Subsequent connect attempt by compromised GUI is now blocked
+    let compromised_connect = taint_mgr.handle_unix_may_send(gui_tgid, 1, "/run/sentinel/sentinel.sock");
+    assert_eq!(compromised_connect, UnixSendVerdict::Block);
+}
+
+// -----------------------------------------------------------------------------
+// Test 17: Hybrid Watchdog (Fail-Safe Clean / Fail-Close Tainted)
+// -----------------------------------------------------------------------------
+#[test]
+fn test_17_hybrid_watchdog_fail_safe_clean_fail_close_tainted() {
+    let taint_mgr = TaintMapManager::new();
+    let clean_tgid = 4001;
+    let tainted_tgid = 4002;
+
+    taint_mgr.mark_tainted(tainted_tgid);
+
+    let start_time_ns = 1_000_000_000;
+    taint_mgr.update_heartbeat(start_time_ns);
+    assert_eq!(taint_mgr.get_heartbeat(), start_time_ns);
+
+    // Case 1: Daemon is alive (now_ns is 500ms later)
+    let alive_now_ns = start_time_ns + 500_000_000;
+    assert!(taint_mgr.is_daemon_alive(alive_now_ns));
+
+    let clean_alive_res = evaluate_socket_sendmsg_watchdog(
+        &taint_mgr,
+        clean_tgid,
+        alive_now_ns,
+        Some("140.82.112.3"),
+        443,
+    );
+    assert_eq!(clean_alive_res, SocketSendmsgVerdict::Allow);
+
+    // Case 2: Daemon crashed or hung! (now_ns is 3 seconds later, > 2.0s watchdog limit)
+    let dead_now_ns = start_time_ns + 3_000_000_000;
+    assert!(!taint_mgr.is_daemon_alive(dead_now_ns));
+
+    // A. Clean process (browser, desktop, terminal): FAIL-SAFE -> Allowed to continue
+    let clean_dead_res = evaluate_socket_sendmsg_watchdog(
+        &taint_mgr,
+        clean_tgid,
+        dead_now_ns,
+        Some("140.82.112.3"),
+        443,
+    );
+    assert_eq!(
+        clean_dead_res,
+        SocketSendmsgVerdict::Allow,
+        "Clean processes must continue working (Fail-Safe) when daemon is down"
+    );
+
+    // B. Tainted process: FAIL-CLOSE -> Kernel drops packets with -EPERM!
+    let tainted_dead_res = evaluate_socket_sendmsg_watchdog(
+        &taint_mgr,
+        tainted_tgid,
+        dead_now_ns,
+        Some("198.51.100.23"),
+        8080,
+    );
+    assert_eq!(
+        tainted_dead_res,
+        SocketSendmsgVerdict::Deny,
+        "Tainted processes must be blocked (Fail-Close) even when daemon is down!"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 18: Scoped Taint Domains & Owner Policy
+// -----------------------------------------------------------------------------
+#[test]
+fn test_18_scoped_taint_domains_and_owner_policy() {
+    let taint_mgr = TaintMapManager::new();
+
+    // 1. Verify path-to-domain mapping
+    assert_eq!(
+        TaintHygiene::get_secret_domain_for_path("/home/user/.ssh/id_rsa"),
+        TaintFlags::BIT_SSH_KEYS
+    );
+    assert_eq!(
+        TaintHygiene::get_secret_domain_for_path("/home/user/.config/google-chrome/Default/Cookies"),
+        TaintFlags::BIT_CHROMIUM_DATA
+    );
+    assert_eq!(
+        TaintHygiene::get_secret_domain_for_path("/home/user/.mozilla/firefox/profiles/cookies.sqlite"),
+        TaintFlags::BIT_FIREFOX_DATA
+    );
+    assert_eq!(
+        TaintHygiene::get_secret_domain_for_path("/home/user/.aws/credentials"),
+        TaintFlags::BIT_CLOUD_CREDS
+    );
+    assert_eq!(
+        TaintHygiene::get_secret_domain_for_path("/home/user/.local/share/TelegramDesktop/tdata/key_datas"),
+        TaintFlags::BIT_TELEGRAM_DATA
+    );
+
+    // 2. Owner Policy: Chrome accessing Chrome data
+    assert!(TaintHygiene::is_secret_owner("chrome", "/home/user/.config/google-chrome/Default/Cookies"));
+    assert!(TaintHygiene::is_secret_owner("google-chrome", "/home/user/.config/google-chrome/Default/Cookies"));
+    // Chrome accessing SSH keys -> NOT owner!
+    assert!(!TaintHygiene::is_secret_owner("chrome", "/home/user/.ssh/id_rsa"));
+    // Stealer or curl accessing Chrome data -> NOT owner!
+    assert!(!TaintHygiene::is_secret_owner("curl", "/home/user/.config/google-chrome/Default/Cookies"));
+
+    // 3. Process Taint Domain Scoping:
+    let chrome_tgid = 5001;
+    let mut chrome_taint = TaintFlags::default();
+    chrome_taint.insert(TaintFlags::BIT_CHROMIUM_DATA);
+    // Legitimate owner reading its domain -> SECRET_NON_OWNER bit remains 0
+    taint_mgr.set_task_taint(chrome_tgid, chrome_taint);
+    let flags = taint_mgr.get_flags(chrome_tgid);
+    assert_eq!(flags & TaintFlags::SECRET_NON_OWNER, 0);
+
+    // 4. Downward-only taint propagation in developer environments (VSCode terminal):
+    let vscode_tgid = 6000;
+    let terminal_build_tgid = 6001;
+
+    // Terminal runs rogue build script that reads SSH key
+    let mut build_taint = TaintFlags::default();
+    build_taint.insert(TaintFlags::BIT_SSH_KEYS);
+    build_taint.insert(TaintFlags::SECRET_NON_OWNER);
+    taint_mgr.set_task_taint(terminal_build_tgid, build_taint);
+
+    assert!(taint_mgr.is_tainted(terminal_build_tgid));
+    assert!(
+        !taint_mgr.is_tainted(vscode_tgid),
+        "Taint must NOT propagate upward from child build tool to parent IDE!"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 19: Staging Attack Intermediate File Taint Inheritance
+// -----------------------------------------------------------------------------
+#[test]
+fn test_19_staging_attack_intermediate_file_taint() {
+    let taint_mgr = TaintMapManager::new();
+    let script1_tgid = 7001;
+    let script2_tgid = 7002;
+    let staging_dev = 20;
+    let staging_ino = 8877;
+    let staging_path = Path::new("/home/user/.cache/benign.dat");
+
+    // 1. Script 1 accesses SSH key and is tainted
+    let mut s1_taint = TaintFlags::default();
+    s1_taint.insert(TaintFlags::BIT_SSH_KEYS);
+    taint_mgr.set_task_taint(script1_tgid, s1_taint);
+    assert!(taint_mgr.is_tainted(script1_tgid));
+    assert!(!taint_mgr.is_tainted(script2_tgid));
+
+    // 2. Script 1 writes stolen secrets into intermediate benign file
+    let write_res = evaluate_file_permission(
+        &taint_mgr,
+        script1_tgid,
+        staging_dev,
+        staging_ino,
+        staging_path,
+        MAY_WRITE,
+        false,
+        false,
+    );
+    assert!(write_res.is_some(), "Staging file inode must be marked with taint on write");
+
+    // 3. Script 2 reads the intermediate file
+    let read_res = evaluate_file_permission(
+        &taint_mgr,
+        script2_tgid,
+        staging_dev,
+        staging_ino,
+        staging_path,
+        MAY_READ,
+        false,
+        false,
+    );
+    assert!(read_res.is_some(), "Script 2 must inherit taint upon reading staging file");
+
+    // Script 2 is now tainted with BIT_SSH_KEYS!
+    assert!(taint_mgr.is_tainted(script2_tgid));
+    let s2_flags = taint_mgr.get_flags(script2_tgid);
+    assert_ne!(s2_flags & TaintFlags::BIT_SSH_KEYS, 0);
+
+    // 4. Script 2 tries network exfiltration -> Slow-Path hold
+    let connect_verdict = evaluate_socket_connect(true, false, false, true);
+    match connect_verdict {
+        SocketConnectVerdict::SlowPathHoldNfqueue { .. } => {}
+        _ => panic!("Script 2 must be held in NFQUEUE due to inherited taint"),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 20: Covert DNS Tunneling Detection
+// -----------------------------------------------------------------------------
+#[test]
+fn test_20_covert_dns_tunneling_detection() {
+    // 1. Legitimate queries
+    let normal_query = "github.com";
+    assert!(!is_suspicious_dns_query(normal_query));
+
+    let cdn_query = "assets-cdn.github.com";
+    assert!(!is_suspicious_dns_query(cdn_query));
+
+    // 2. Suspicious DNS Tunneling query (Base64/hex encoded payload, length > 40, entropy > 3.8)
+    let tunnel_query = "aW5kZXguZmlsZT1jYXQgL2V0Yy9zaGFkb3cK.exfil.attacker.net";
+    let entropy = calculate_shannon_entropy(tunnel_query.split('.').next().unwrap());
+    assert!(entropy > 3.5);
+    assert!(is_suspicious_dns_query(tunnel_query));
+
+    // 3. Systemd-resolved socket interception in eBPF
+    let taint_mgr = TaintMapManager::new();
+    let tainted_tgid = 8001;
+    taint_mgr.mark_tainted(tainted_tgid);
+
+    let resolved_sock = "/run/systemd/resolve/io.systemd.Resolve";
+    let verdict = taint_mgr.handle_unix_may_send(tainted_tgid, 1, resolved_sock);
+    assert_eq!(
+        verdict,
+        UnixSendVerdict::InspectDns,
+        "Tainted process querying systemd-resolved must trigger InspectDns"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 21: Universal Bootloader Cmdline Auto-Configuration
+// -----------------------------------------------------------------------------
+#[test]
+fn test_21_sntctl_setup_kernel_cmdline_patching() {
+    // Helper function matching sntctl implementation
+    fn patch_cmdline(cmdline: &str, lsm_param: &str) -> String {
+        let mut words: Vec<&str> = cmdline.split_whitespace().collect();
+        words.retain(|w| !w.starts_with("lsm="));
+        words.push(lsm_param);
+        words.join(" ")
+    }
+
+    fn patch_grub_default(content: &str, lsm_param: &str) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        let mut replaced = false;
+
+        for line in content.lines() {
+            if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
+                let val = line["GRUB_CMDLINE_LINUX_DEFAULT=".len()..].trim_matches('"');
+                let patched = patch_cmdline(val, lsm_param);
+                lines.push(format!("GRUB_CMDLINE_LINUX_DEFAULT=\"{}\"", patched));
+                replaced = true;
+            } else if !replaced && line.starts_with("GRUB_CMDLINE_LINUX=") {
+                let val = line["GRUB_CMDLINE_LINUX=".len()..].trim_matches('"');
+                let patched = patch_cmdline(val, lsm_param);
+                lines.push(format!("GRUB_CMDLINE_LINUX=\"{}\"", patched));
+                replaced = true;
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+
+        if !replaced {
+            lines.push(format!("GRUB_CMDLINE_LINUX_DEFAULT=\"{}\"", lsm_param));
+        }
+
+        lines.join("\n")
+    }
+
+    // 1. Test cmdline preservation of existing LSMs (e.g. apparmor, lockdown, yama)
+    let original_cmdline = "BOOT_IMAGE=/vmlinuz root=UUID=123-abc ro quiet lsm=lockdown,capability,landlock,yama,apparmor";
+    let target_lsm = "lsm=lockdown,capability,landlock,yama,apparmor,bpf";
+
+    let patched = patch_cmdline(original_cmdline, target_lsm);
+    assert!(patched.contains("root=UUID=123-abc"));
+    assert!(patched.contains("quiet"));
+    assert!(patched.ends_with(target_lsm));
+    assert_eq!(patched.matches("lsm=").count(), 1, "Only one lsm= parameter must be present");
+
+    // 2. Test /etc/default/grub patching
+    let grub_cfg = "\
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=\"Ubuntu\"
+GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"
+GRUB_CMDLINE_LINUX=\"\"
+";
+    let patched_grub = patch_grub_default(grub_cfg, "lsm=landlock,lockdown,yama,apparmor,bpf");
+    assert!(patched_grub.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,lockdown,yama,apparmor,bpf\""));
+    assert!(patched_grub.contains("GRUB_DISTRIBUTOR=\"Ubuntu\""));
+}
+

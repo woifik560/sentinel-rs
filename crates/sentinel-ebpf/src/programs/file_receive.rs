@@ -28,6 +28,16 @@ pub fn evaluate_file_receive(
     manager.handle_file_receive(receiver_id, sender_id, dev, ino, path)
 }
 
+/// Convenience evaluation for tests and userspace simulation.
+pub fn handle_file_receive(
+    manager: &TaintMapManager,
+    sender_id: u32,
+    receiver_id: u32,
+    _flags: u64,
+) -> FileReceiveVerdict {
+    manager.handle_file_receive(receiver_id, sender_id, 0, 0, Path::new(""))
+}
+
 /// Helper to create a raw event for testing and RingBuffer simulation.
 pub fn create_raw_file_receive_event(
     receiver_tgid: u32,

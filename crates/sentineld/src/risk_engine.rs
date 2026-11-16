@@ -64,15 +64,53 @@ impl RiskEngine {
             });
         }
 
-        // 2. [+40] SECRET_NON_OWNER / TAINTED
-        let has_secret = !node.secret_accesses.is_empty();
-        if has_secret {
+        // 2. [+40] SECRET_NON_OWNER / TAINTED (with Scoped Taint Domains & Owner Policy)
+        let mut has_non_owner_secret = false;
+        let mut has_owner_secret = false;
+        let exe_name = node.exe_name();
+
+        for secret in &node.secret_accesses {
+            let secret_path_str = secret.path.to_string_lossy();
+            if sentinel_ebpf::maps::TaintHygiene::is_secret_owner(&exe_name, &secret_path_str) {
+                has_owner_secret = true;
+            } else {
+                has_non_owner_secret = true;
+                break;
+            }
+        }
+
+        // Only fire SecretNonOwner if a non-owner process accessed secrets or inherited taint
+        if has_non_owner_secret || (!node.secret_accesses.is_empty() && !has_owner_secret) {
             let weight = self.get_weight(RuleId::SecretNonOwner.as_str(), 40);
             firings.push(RuleFiring {
                 rule_id: RuleId::SecretNonOwner,
                 weight,
-                reason: "Чтение защищенного секрета или наследование taint через pipe/FIFO/файл вне App Scope".to_string(),
+                reason: "Чтение защищенного секрета вне авторизованного домена владельца (App Scoping / Taint)".to_string(),
             });
+        }
+
+        // 2b. [+50] COVERT_DNS_TUNNEL (Covert DNS tunneling via local 127.0.0.53:53 or high-entropy queries)
+        if let Some(ref domain) = net.dest_domain {
+            if sentinel_common::risk::is_suspicious_dns_query(domain) {
+                let weight = self.get_weight(RuleId::CovertDnsTunnel.as_str(), 50);
+                firings.push(RuleFiring {
+                    rule_id: RuleId::CovertDnsTunnel,
+                    weight,
+                    reason: format!(
+                        "Обнаружен скрытый DNS-туннель (аномальная энтропия или поддомен > 40 символов): {}",
+                        domain
+                    ),
+                });
+            }
+        } else if let Some(ref ip) = net.dest_ip {
+            if (ip == "127.0.0.53" || ip.starts_with("127.")) && net.dest_port == 53 && has_non_owner_secret {
+                let weight = self.get_weight(RuleId::CovertDnsTunnel.as_str(), 50);
+                firings.push(RuleFiring {
+                    rule_id: RuleId::CovertDnsTunnel,
+                    weight,
+                    reason: "Попытка обращения к локальному DNS-резолверу 127.0.0.53:53 зараженным процессом".to_string(),
+                });
+            }
         }
 
         // 3. [+15] FAST_EXFIL_BURST (<= 5 seconds after secret access)

@@ -19,8 +19,45 @@
 use std::path::Path;
 use sentinel_common::events::{RawBprmCheckSecurityEvent, MAX_PATH_LEN};
 use sentinel_common::process::{
-    PROFILE_FILELESS_MEMFD, PROFILE_INTERPRETER, PROFILE_UNTRUSTED_ORIGIN,
+    PROFILE_FILELESS_MEMFD, PROFILE_INTERPRETER, PROFILE_TRUSTED_PKG, PROFILE_UNTRUSTED_ORIGIN,
 };
+use crate::maps::TaintMapManager;
+
+/// Evaluates bprm execution check with zero-userspace GUI branding and kernel INODE_STORAGE cache.
+pub fn evaluate_bprm_security(
+    manager: &TaintMapManager,
+    tgid: u32,
+    dev: u64,
+    ino: u64,
+    exe_path: &Path,
+    inode_version: u64,
+) -> u32 {
+    let mut profile = compute_baseline_profile(exe_path);
+
+    // 1. Zero-Userspace GUI Attestation:
+    // If the executed binary matches registered GUI binary (dev, ino), set is_verified_gui = true!
+    if manager.is_registered_gui_binary(dev, ino) {
+        manager.set_verified_gui(tgid, true);
+    }
+
+    // 2. Kernel INODE_STORAGE Cached Verification:
+    // If sentineld previously verified this binary, reuse TRUSTED_SYSTEM_PKG directly in kernel!
+    if manager.is_inode_trusted(dev, ino, inode_version) {
+        profile |= PROFILE_TRUSTED_PKG;
+    }
+
+    profile
+}
+
+/// Simulation helper for Linux 6.x kfunc bpf_get_file_hash() / bpf_ima_file_hash()
+pub fn bpf_get_file_hash_simulated(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let content = std::fs::read(path).ok()?;
+    let hash = Sha256::digest(&content);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    Some(out)
+}
 
 /// Check if a binary path or dentry represents anonymous memory execution.
 pub fn is_memfd_or_fileless(path_str: &str) -> bool {

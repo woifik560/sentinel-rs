@@ -21,7 +21,8 @@
 //!    - For tainted tasks with packets already in-flight or on pre-opened sockets,
 //!      `cgroup_skb/egress` drops the packet (`return 0`) until user verdict is granted.
 
-use sentinel_common::events::{SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK};
+use sentinel_common::events::{encode_flow_mark, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK};
+use crate::maps::TaintMapManager;
 use super::socket_connect::{evaluate_socket_connect_with_mark, SocketConnectVerdict};
 
 /// Action to be taken by network hook.
@@ -37,7 +38,50 @@ pub enum EgressAction {
     HoldNfqueue { mark: u32 },
 }
 
-/// Evaluates a `socket_sendmsg` invocation in syscall context.
+/// Specialized verdict for `socket_sendmsg` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketSendmsgVerdict {
+    Pass,
+    Drop,
+    DenyEperm,
+    HoldForRevalidation { reval_mark: u32 },
+    SlowPathHoldNfqueue { so_mark: u32 },
+}
+
+/// Evaluates network data transmission on an established socket via TaintMapManager.
+pub fn evaluate_socket_sendmsg_ext(
+    manager: &TaintMapManager,
+    tgid: u32,
+    is_preopened: bool,
+    is_high_risk: bool,
+    flow_id: u32,
+) -> SocketSendmsgVerdict {
+    let leader_tgid = manager.resolve_group_leader(tgid);
+    let is_tainted = manager.is_tainted(leader_tgid);
+    let is_allowed = manager.is_allowed(leader_tgid);
+
+    if is_allowed {
+        return SocketSendmsgVerdict::Pass;
+    }
+
+    if is_tainted {
+        if is_high_risk {
+            return SocketSendmsgVerdict::DenyEperm;
+        }
+
+        if is_preopened {
+            let reval_mark = encode_flow_mark(flow_id, true);
+            return SocketSendmsgVerdict::HoldForRevalidation { reval_mark };
+        }
+
+        let mark = encode_flow_mark(flow_id, false);
+        return SocketSendmsgVerdict::SlowPathHoldNfqueue { so_mark: mark };
+    }
+
+    SocketSendmsgVerdict::Pass
+}
+
+/// Evaluates a `socket_sendmsg` invocation in syscall context using raw parameters.
 pub fn evaluate_socket_sendmsg(
     is_tainted: bool,
     is_allowed: bool,
@@ -45,7 +89,7 @@ pub fn evaluate_socket_sendmsg(
     use_nfqueue: bool,
     is_preopened: bool,
 ) -> SocketConnectVerdict {
-    evaluate_socket_sendmsg_ext(
+    evaluate_socket_sendmsg_raw(
         is_tainted,
         is_allowed,
         is_trusted_profile,
@@ -56,8 +100,8 @@ pub fn evaluate_socket_sendmsg(
     )
 }
 
-/// Evaluates network data transmission with full context and dynamic mark.
-pub fn evaluate_socket_sendmsg_ext(
+/// Raw evaluator matching low-level kernel eBPF parameter layout.
+pub fn evaluate_socket_sendmsg_raw(
     is_tainted: bool,
     is_allowed: bool,
     is_trusted_profile: bool,
@@ -71,14 +115,10 @@ pub fn evaluate_socket_sendmsg_ext(
     }
 
     if is_tainted {
-        // High risk: immediate stop right in lsm/socket_sendmsg with -EPERM!
-        // Prevents packet creation at the syscall level.
         if is_high_risk || !use_nfqueue {
             return SocketConnectVerdict::DenyEperm;
         }
 
-        // Established / pre-opened connection: mark with revalidation flag (0x5E800000 | flow_id)
-        // Set via bpf_setsockopt in sock_ops/cgroup before Netfilter!
         if is_preopened {
             let reval_mark = flow_mark | SENTINEL_MARK_REVAL_BIT;
             return SocketConnectVerdict::RevalidateHoldNfqueue {
@@ -98,6 +138,45 @@ pub fn evaluate_socket_sendmsg_ext(
         use_nfqueue,
         flow_mark,
     )
+}
+
+/// Hybrid in-kernel watchdog evaluator with covert DNS tunnel inspection:
+/// - If destination is local DNS resolver (127.0.0.53:53 or 127.0.0.0/8:53) and process is tainted:
+///   Refuses silent loopback bypass and blocks transmission (-EPERM).
+/// - If sentineld daemon is unresponsive (> 2.0s watchdog limit):
+///   - Clean process: Pass (Fail-Safe keeps desktop/browsers running seamlessly).
+///   - Tainted process: SyscallEperm / Drop (Fail-Close prevents malware escaping via daemon crash!).
+pub fn evaluate_socket_sendmsg_watchdog(
+    manager: &TaintMapManager,
+    tgid: u32,
+    now_ns: u64,
+    dest_ip: Option<&str>,
+    dest_port: u16,
+) -> EgressAction {
+    let leader_tgid = manager.resolve_group_leader(tgid);
+    let is_tainted = manager.is_tainted(leader_tgid);
+
+    // 1. Covert Local DNS Tunnel Protection:
+    if let Some(ip) = dest_ip {
+        if dest_port == 53 && (ip == "127.0.0.53" || ip.starts_with("127.")) && is_tainted {
+            return EgressAction::SyscallEperm;
+        }
+    }
+
+    // 2. Hybrid In-Kernel Watchdog:
+    if !manager.is_daemon_alive(now_ns) {
+        if !is_tainted {
+            return EgressAction::Pass;
+        } else {
+            return EgressAction::SyscallEperm;
+        }
+    }
+
+    if is_tainted {
+        EgressAction::SyscallEperm
+    } else {
+        EgressAction::Pass
+    }
 }
 
 /// Evaluates egress packet filtering at `cgroup_skb/egress` (in ip_finish_output).

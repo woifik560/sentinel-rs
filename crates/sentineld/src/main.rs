@@ -153,6 +153,34 @@ async fn main() -> anyhow::Result<()> {
     taint_mgr.set_daemon_pid(std::process::id());
     taint_mgr.register_ipc_broker(1);
 
+    // Register GUI binary in BPF LSM for Zero-Userspace Trust attestation
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&config.socket.gui_binary_path) {
+            info!(
+                "Registering GUI binary in BPF LSM: {} (dev={}, ino={})",
+                config.socket.gui_binary_path.display(),
+                meta.dev(),
+                meta.ino()
+            );
+            taint_mgr.register_gui_binary(meta.dev(), meta.ino());
+        }
+    }
+
+    // Start in-kernel Watchdog Heartbeat (updates BPF array map every 500ms)
+    let heartbeat_taint = taint_mgr.clone();
+    tokio::spawn(async move {
+        loop {
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            heartbeat_taint.update_heartbeat(now_ns);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
     // 5. Initialize and Start IPC Server (Dual Socket: Privileged Management & Read-Only Monitor)
     let ipc_server = Arc::new(IpcServer::new(
         config.socket.path.clone(),

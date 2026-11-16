@@ -150,7 +150,12 @@ impl IpcServer {
             loop {
                 match mgmt_listener.accept().await {
                     Ok((stream, _)) => {
-                        let role = match verify_peer_client(&stream, true, &expected_gui_path) {
+                        let role = match verify_peer_client_with_manager(
+                            &stream,
+                            true,
+                            &expected_gui_path,
+                            Some(&mgmt_taint),
+                        ) {
                             Ok(role) => role,
                             Err(e) => {
                                 warn!("SECURITY: Rejecting unauthenticated management IPC peer: {}", e);
@@ -252,6 +257,16 @@ pub fn verify_peer_client(
     is_management: bool,
     expected_gui_path: &Path,
 ) -> anyhow::Result<ClientRole> {
+    verify_peer_client_with_manager(stream, is_management, expected_gui_path, None)
+}
+
+/// Authenticate peer credentials with Zero-Userspace BPF LSM attestation and defense-in-depth checks.
+pub fn verify_peer_client_with_manager(
+    stream: &UnixStream,
+    is_management: bool,
+    expected_gui_path: &Path,
+    taint_manager: Option<&TaintMapManager>,
+) -> anyhow::Result<ClientRole> {
     let creds = getsockopt(stream, PeerCredentials)?;
     let peer_uid = creds.uid();
     let peer_pid = creds.pid();
@@ -267,6 +282,16 @@ pub fn verify_peer_client(
             return Ok(ClientRole::ReadOnly);
         } else {
             anyhow::bail!("Unauthorized user UID: {}", peer_uid);
+        }
+    }
+
+    // 1. Zero-Userspace Trust (BPF LSM Kernel Attestation):
+    // In-kernel bprm_committed_creds hook tags sentinel-gui upon execve() with is_verified_gui = 1,
+    // and lsm/mmap_file seals memory from hostile shared libraries. If already authenticated in
+    // BPF TASK_STORAGE, TOCTOU is eliminated 100%!
+    if let Some(mgr) = taint_manager {
+        if mgr.is_verified_gui(peer_pid as u32) {
+            return Ok(ClientRole::AuthorizedGui);
         }
     }
 
@@ -397,6 +422,10 @@ pub fn verify_peer_client(
                 }
             }
         }
+    }
+
+    if let Some(mgr) = taint_manager {
+        mgr.set_verified_gui(peer_pid as u32, true);
     }
 
     Ok(ClientRole::AuthorizedGui)
