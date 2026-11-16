@@ -588,18 +588,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let reconnect_notify = Arc::new(tokio::sync::Notify::new());
+
     let w_h = window_handle.clone();
-    let sock_clone = socket_path.clone();
-    let wr_clone = writer_slot.clone();
-    let inc_clone = active_incident.clone();
+    let notify_clone = reconnect_notify.clone();
     window.on_reconnect_clicked(move || {
-        let w_h = w_h.clone();
-        let sock = sock_clone.clone();
-        let wr = wr_clone.clone();
-        let inc = inc_clone.clone();
-        tokio::spawn(async move {
-            connect_and_listen(sock, wr, inc, w_h).await;
-        });
+        notify_clone.notify_one();
     });
 
     if is_demo {
@@ -613,10 +607,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Spawn background connection loop
+    // Spawn single background connection loop with instant reconnect notification
     let w_h = window_handle.clone();
+    let notify_loop = reconnect_notify.clone();
     tokio::spawn(async move {
-        connect_and_listen(socket_path, writer_slot, active_incident, w_h).await;
+        connect_and_listen(socket_path, writer_slot, active_incident, w_h, notify_loop).await;
     });
 
     window.run()?;
@@ -628,6 +623,7 @@ async fn connect_and_listen(
     writer_slot: Arc<Mutex<Option<OwnedWriteHalf>>>,
     active_incident: Arc<Mutex<Option<ActiveIncident>>>,
     window_handle: slint::Weak<MainWindow>,
+    reconnect_notify: Arc<tokio::sync::Notify>,
 ) {
     loop {
         match UnixStream::connect(&socket_path).await {
@@ -764,7 +760,12 @@ async fn connect_and_listen(
                 });
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+            _ = reconnect_notify.notified() => {
+                info!("Manual reconnection triggered via UI");
+            }
+        }
     }
 }
 
