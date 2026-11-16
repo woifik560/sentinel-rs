@@ -14,8 +14,8 @@ RestartSec=5s
 # -------------------------------------------------------------
 # Privilege Separation & Linux Capabilities Minimization
 # -------------------------------------------------------------
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
 
 # -------------------------------------------------------------
 # OS & Process Hardening Directives

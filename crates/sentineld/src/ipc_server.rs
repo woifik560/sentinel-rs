@@ -300,9 +300,15 @@ pub fn verify_peer_client_with_manager(
     let resolved_exe = match std::fs::read_link(&exe_symlink) {
         Ok(path) => path,
         Err(_) => {
-            // Test or container environment fallback: check if peer matches current executable
-            if let Ok(curr_exe) = std::env::current_exe() {
-                curr_exe
+            // Fallback: check /proc/<pid>/comm if procfs ptrace is restricted by systemd
+            let comm_path = format!("/proc/{}/comm", peer_pid);
+            if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+                let trimmed = comm.trim();
+                if trimmed == "sentinel-gui" {
+                    expected_gui_path.to_path_buf()
+                } else {
+                    anyhow::bail!("Process comm ({}) does not match sentinel-gui", trimmed);
+                }
             } else {
                 anyhow::bail!("Could not resolve executable for PID {}", peer_pid);
             }
