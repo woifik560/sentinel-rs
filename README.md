@@ -7,13 +7,13 @@
 [![GUI: Slint](https://img.shields.io/badge/GUI-Slint_UI-blueviolet.svg)](https://slint.dev/)
 [![Engine: Deterministic Risk](https://img.shields.io/badge/Engine-Causal_Lineage_%26_Risk-brightgreen.svg)](https://github.com/woifik560/sentinel-rs)
 [![Memory: < 30 MB](https://img.shields.io/badge/RAM-%3C_30_MB-success.svg)](#ключевые-возможности)
-[![Platform: Debian 13](https://img.shields.io/badge/Platform-Debian_13_Trixie-red.svg?logo=debian)](https://www.debian.org/)
+[![Platform: Linux 6.x+](https://img.shields.io/badge/Platform-Linux_6.x%2B_(Debian_%7C_Arch_%7C_Fedora_%7C_NixOS)-blue.svg?logo=linux)](#требования-к-ядру-и-настройка-bpf-lsm)
 
 [English](README.en.md) | **Русский**
 
 ---
 
-## О проекте (Версия 2.0)
+## О проекте (Версия 2.1)
 
 **Sentinel-RS** — это ультралегковесный хостовый фаервол и монитор целостности для Linux Desktop, нацеленный на **детерминированное предотвращение несанкционированной эксфильтрации конфиденциальных данных** пользовательскими процессами и инфостилерами (Infostealers) в рамках непривилегированной десктопной сессии.
 
@@ -92,7 +92,7 @@ Sentinel-RS спроектирован для защиты персональн�
    - Защита очереди NFQUEUE от DoS-спама (`pending_queue_size = 512`, агрегация повторных SYN-ретрансмитов, опция временного разрешения `AllowForDuration`).
    - **Корректные требования к ядру и CVE-2026-64192**: проверка наличия `bpf` в `/sys/kernel/security/lsm` на ядрах 6.1.184+ является достаточной защитой от уязвимости, так как официальный патч ядра блокирует небезопасные операции с `map_type_inode_storage`.
 
-> **Архитектурный принцип V2.0:** 100% чистый Rust (Pure-Rust). Без C/Python-рантаймов, без встроенных LLM в ядре безопасности! Демон не подвержен галлюцинациям, принимает решения за **< 1 миллисекунды** и потребляет **менее 25–30 МБ оперативной памяти**.
+> **Архитектурный принцип V2.1:** 100% чистый Rust (Pure-Rust). Без C/Python-рантаймов, без встроенных LLM в ядре безопасности! Демон не подвержен галлюцинациям, принимает решения за **< 1 миллисекунды** и потребляет **менее 25–30 МБ оперативной памяти**.
 
 ---
 
@@ -294,7 +294,7 @@ sentinel-rs/
 │   │   ├── ipc_server.rs           # Двойной сокет: /run/sentinel/sentinel.sock (0750) и sentinel-ro.sock (0666)
 │   │   └── tests/
 │   │       ├── red_team.rs         # Базовый набор атак
-│   │       └── adversarial_e2e.rs  # Полный E2E-сьют из 10 сложных adversarial-сценариев
+│   │       └── adversarial_e2e.rs  # Полный E2E-сьют из 22 сложных adversarial-сценариев
 │   │
 │   ├── sntctl/                     # Консольная утилита управления (CLI Triage)
 │   └── sentinel-gui/               # Легковесный Desktop UI (Slint, RAM < 30 MB, X11 PIN-защита)
@@ -303,5 +303,32 @@ sentinel-rs/
 │   ├── config.toml                 # SO_MARK, NFQUEUE, пути к обоим сокетам, Never-Freeze список
 │   ├── rules.toml                  # Веса правил (включая FILELESS_ANON_EXEC, SUSPICIOUS_SCRIPT_EXECUTION)
 │   └── sentineld.service           # Systemd unit с минимизацией capabilities и OOMScoreAdjust=-900
+├── vmtest.toml                     # Конфигурация запуска тестов в виртуальной машине QEMU/KVM
 └── ТЗ.txt                          # Полное техническое задание проекта
 ```
+
+---
+
+## Тестирование и CI (Двухуровневая верификация)
+
+Для обеспечения максимальной устойчивости к обходам Sentinel-RS использует двухуровневую архитектуру верификации:
+
+1. **Быстрый Adversarial E2E-сьют в Userspace (< 1 сек)**:
+   - Выполняется локально и в CI через `cargo test --workspace --tests`.
+   - Включает 22 сценария в `adversarial_e2e.rs` и стресс-тесты `red_team.rs`:
+     - Эмуляция цепочек пайпов (`cat ~/.ssh/id_rsa | curl ...`) и SCM_RIGHTS FD passing.
+     - Проверка обхода через established-сокеты (revalidation mark).
+     - Блокировка анонимных mmap/memfd инъекций и защита памяти GUI.
+     - Инвалидация in-kernel `INODE_STORAGE` кэша при записи.
+     - Адаптивная защита от фрагментированной DNS-эксфильтрации (Shannon entropy).
+
+2. **Ring-0 тестирование в реальном ядре Linux 6.x (QEMU/KVM через `vmtest`)**:
+   - Автоматический шаг в GitHub Actions (`.github/workflows/ci.yml`), запускаемый на раннере `ubuntu-24.04`.
+   - С помощью утилиты `vmtest` разворачивает виртуальную машину QEMU с реальным ядром Linux 6.8 и загрузочными параметрами `lsm=landlock,lockdown,yama,bpf`.
+   - Проверяет фактическую инициализацию RingBuffer, BPF-карт `TASK_STORAGE`/`INODE_STORAGE`, файловой системы `bpffs` (`/sys/fs/bpf/sentinel`) и прохождение строгой preflight-проверки BPF LSM в живом ядре.
+   - Локальный запуск разработчиком:
+     ```bash
+     cargo install vmtest --locked
+     vmtest
+     ```
+

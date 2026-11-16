@@ -11,7 +11,7 @@ env:
 
 jobs:
   check-and-test:
-    name: Build & Test
+    name: Build & Test (Userspace)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -41,3 +41,57 @@ jobs:
 
       - name: Check code formatting
         run: cargo fmt --all --check
+
+  ring0-kernel-test:
+    name: Ring-0 Kernel Test (QEMU / Linux 6.x BPF LSM)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ring0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ring0-
+
+      - name: Install QEMU and virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+
+      - name: Enable KVM acceleration
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "KVM acceleration enabled."
+          else
+            echo "KVM device not available, will run with software emulation."
+          fi
+
+      - name: Pre-build test binaries on host runner
+        run: cargo test --workspace --tests --no-run
+
+      - name: Prepare host Linux 6.x kernel for QEMU boot
+        run: |
+          KVER=$(uname -r)
+          echo "Host kernel version: $KVER"
+          sudo chmod +r /boot/vmlinuz-$KVER
+          sudo cp -L /boot/vmlinuz-$KVER ./bzImage-6.x
+          ls -lh ./bzImage-6.x
+
+      - name: Run Ring-0 test suite in QEMU VM via vmtest
+        uses: danobi/vmtest-action@master
+        with:
+          name: "linux-6.x-ring0-bpf-lsm"
+          kernel: "./bzImage-6.x"
+          kernel_args: "console=ttyS0 root=/dev/ram0 rw lsm=landlock,lockdown,yama,bpf quiet"
+          command: "cargo test --workspace --tests"

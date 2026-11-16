@@ -22,6 +22,7 @@
 //! 19. Staging attack defense (intermediate file taint inheritance).
 //! 20. Covert DNS tunneling defense (Shannon entropy > 3.8 & long query detection).
 //! 21. Universal bootloader auto-configuration (dynamic LSM preservation & cmdline patching).
+//! 22. Ring-0 kernel preflight & safe version verification (Linux 6.x+ safe threshold).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1024,4 +1025,24 @@ GRUB_CMDLINE_LINUX=\"\"
     assert!(patched_grub.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,lockdown,yama,apparmor,bpf\""));
     assert!(patched_grub.contains("GRUB_DISTRIBUTOR=\"Ubuntu\""));
 }
+
+// -----------------------------------------------------------------------------
+// Test 22: Ring-0 Kernel Preflight & Safe Version Verification
+// -----------------------------------------------------------------------------
+#[test]
+fn test_22_kernel_preflight_and_safe_version_check() {
+    use sentinel_ebpf::loader::verify_kernel_version_safe;
+
+    // Verify safe thresholds (Linux 6.1+ safe against CVE-2026-64192)
+    assert!(verify_kernel_version_safe("6.1.0-28-amd64", "6.1"));
+    assert!(verify_kernel_version_safe("6.8.0-45-generic", "6.1"));
+    assert!(verify_kernel_version_safe("6.12.1+bpf", "6.1"));
+    assert!(verify_kernel_version_safe("6.6.137-flatcar", "6.1"));
+
+    // Legacy kernels must be flagged as unsafe
+    assert!(!verify_kernel_version_safe("5.15.0-100-generic", "6.1"));
+    assert!(!verify_kernel_version_safe("5.10.0-1-amd64", "6.1"));
+    assert!(!verify_kernel_version_safe("4.19.0-6-amd64", "6.1"));
+}
+
 

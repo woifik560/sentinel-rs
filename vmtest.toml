@@ -1,0 +1,16 @@
+# vmtest.toml - QEMU/KVM Ring-0 in-kernel test harness for Sentinel-RS
+#
+# Runs the Sentinel-RS test suite directly inside a real Linux 6.x VM
+# with BPF LSM enabled (lsm=landlock,lockdown,yama,bpf).
+#
+# Local developer execution:
+#   1. Install vmtest: cargo install vmtest --locked
+#   2. Run all targets: vmtest
+#   3. Or run specific target: vmtest -t linux-6.x-ring0-bpf-lsm
+
+[[target]]
+name = "linux-6.x-ring0-bpf-lsm"
+# Path to host kernel or custom bzImage
+kernel = "/boot/vmlinuz"
+kernel_args = "console=ttyS0 root=/dev/ram0 rw lsm=landlock,lockdown,yama,bpf quiet"
+command = "cargo test --workspace --tests"

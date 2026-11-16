@@ -7,13 +7,13 @@
 [![GUI: Slint](https://img.shields.io/badge/GUI-Slint_UI-blueviolet.svg)](https://slint.dev/)
 [![Engine: Deterministic Risk](https://img.shields.io/badge/Engine-Causal_Lineage_%26_Risk-brightgreen.svg)](https://github.com/woifik560/sentinel-rs)
 [![Memory: < 30 MB](https://img.shields.io/badge/RAM-%3C_30_MB-success.svg)](#key-features)
-[![Platform: Debian 13](https://img.shields.io/badge/Platform-Debian_13_Trixie-red.svg?logo=debian)](https://www.debian.org/)
+[![Platform: Linux 6.x+](https://img.shields.io/badge/Platform-Linux_6.x%2B_(Debian_%7C_Arch_%7C_Fedora_%7C_NixOS)-blue.svg?logo=linux)](#kernel-setup--bpf-lsm-configuration)
 
 **English** | [Русский](README.md)
 
 ---
 
-## About the Project (Version 2.0)
+## About the Project (Version 2.1)
 
 **Sentinel-RS** is an ultra-lightweight host firewall and integrity monitor for Linux Desktop specifically engineered for **deterministic prevention of unauthorized credential exfiltration** by unprivileged user-space processes and Infostealers.
 
@@ -92,7 +92,7 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
    - NFQUEUE queue saturation defense (`pending_queue_size = 512`, duplicate SYN retransmit aggregation, `AllowForDuration` temporary approval).
    - **Kernel Requirements & CVE-2026-64192**: Checking for `bpf` presence in `/sys/kernel/security/lsm` on kernels 6.1.184+ provides verified protection against CVE-2026-64192, as the kernel patch secures `map_type_inode_storage` operations.
 
-> **V2.0 Architectural Rule:** 100% Pure Rust. Zero C/Python runtime dependencies, zero LLMs in the security critical loop! Deterministic scoring in **< 1 millisecond**, memory footprint **< 25–30 MB RAM**.
+> **V2.1 Architectural Rule:** 100% Pure Rust. Zero C/Python runtime dependencies, zero LLMs in the security critical loop! Deterministic scoring in **< 1 millisecond**, memory footprint **< 25–30 MB RAM**.
 
 ---
 
@@ -251,3 +251,29 @@ sudo sntctl whitelist add /usr/bin/curl
 # Run full system diagnostics and security preflight
 sntctl doctor
 ```
+
+---
+
+## Testing & CI (Two-Layer Verification)
+
+To guarantee absolute defense resilience against advanced evasion techniques, Sentinel-RS employs a two-tier verification architecture:
+
+1. **Fast Adversarial Userspace E2E Suite (< 1s)**:
+   - Run locally or in CI via `cargo test --workspace --tests`.
+   - Contains 22 real-world attack scenarios in `adversarial_e2e.rs` alongside stress tests in `red_team.rs`:
+     - Pipe taint inheritance (`cat ~/.ssh/id_rsa | curl ...`) and AF_UNIX `SCM_RIGHTS` FD passing.
+     - Established socket bypass evasion (revalidation mark `0x5E800000 | flow_id`).
+     - Anonymous mmap / memfd injection blocking and GUI memory sealing.
+     - In-kernel `INODE_STORAGE` cache invalidation upon file modifications.
+     - Adaptive chunked DNS tunneling detection (Shannon entropy & cumulative byte threshold).
+
+2. **Ring-0 In-Kernel Testing in Real Linux 6.x (QEMU/KVM via `vmtest`)**:
+   - Automated CI job in GitHub Actions (`.github/workflows/ci.yml`) running on `ubuntu-24.04`.
+   - Utilizes `vmtest` to launch a lightweight QEMU virtual machine booted into a real Linux 6.8 kernel with `lsm=landlock,lockdown,yama,bpf`.
+   - Validates live in-kernel RingBuffer initialization, `BPF_MAP_TYPE_TASK_STORAGE` / `INODE_STORAGE` maps, `/sys/fs/bpf/sentinel` bpffs pinning, and strict preflight verification against CVE-2026-64192.
+   - Run locally by developers:
+     ```bash
+     cargo install vmtest --locked
+     vmtest
+     ```
+
