@@ -201,24 +201,49 @@ pub fn calculate_shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
-/// Detects covert DNS tunneling queries (e.g. `<hex_secret>.attacker.com` via local resolver).
-pub fn is_suspicious_dns_query(domain: &str) -> bool {
+/// Detects covert DNS tunneling queries with adaptive thresholds based on process taint status.
+///
+/// # Anti-Chunking DNS Exfiltration Defense:
+/// - Clean processes (`is_tainted == false`): High threshold (`len > 40` or `len >= 20 && entropy > 3.8`)
+///   to prevent false positives on Content Delivery Networks (CDNs), CloudFront, etc.
+/// - Tainted processes (`is_tainted == true`): Short-chunk exfiltration defense with reduced
+///   threshold (`len >= 16 && entropy > 3.4` or `len >= 24`).
+pub fn is_suspicious_dns_query_adaptive(domain: &str, is_tainted: bool) -> bool {
     let clean = domain.trim_end_matches('.');
     if clean.is_empty() {
         return false;
     }
 
     for label in clean.split('.') {
-        // High entropy (hex/base64/base32 encoded chunks) or long subdomain labels > 40 chars
-        if label.len() > 40 {
-            return true;
-        }
-        if label.len() >= 20 && calculate_shannon_entropy(label) > 3.8 {
-            return true;
+        if is_tainted {
+            if label.len() >= 16 && calculate_shannon_entropy(label) > 3.4 {
+                return true;
+            }
+            if label.len() >= 24 {
+                return true;
+            }
+        } else {
+            if label.len() > 40 {
+                return true;
+            }
+            if label.len() >= 20 && calculate_shannon_entropy(label) > 3.8 {
+                return true;
+            }
         }
     }
 
     false
+}
+
+/// Detects covert DNS tunneling queries using baseline clean thresholds.
+pub fn is_suspicious_dns_query(domain: &str) -> bool {
+    is_suspicious_dns_query_adaptive(domain, false)
+}
+
+/// Cumulative DNS tunneling evaluator: triggers if malware slices secrets into
+/// short chunks (e.g. 12-15 bytes each) sending >= 3 queries or >= 48 bytes in subdomain labels.
+pub fn is_cumulative_dns_tunnel(query_count: u32, cumulative_subdomain_bytes: u32) -> bool {
+    query_count >= 3 || cumulative_subdomain_bytes >= 48
 }
 
 #[cfg(test)]

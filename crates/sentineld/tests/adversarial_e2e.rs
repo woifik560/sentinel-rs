@@ -36,15 +36,17 @@ use sentinel_common::events::{
 use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptRequest, PromptVerdict};
 use sentinel_common::process::{ProcessNode, SecretCategory};
 use sentinel_common::risk::{
-    calculate_shannon_entropy, is_suspicious_dns_query, RiskEngineConfig, RiskThresholds, RuleId,
-    Verdict,
+    calculate_shannon_entropy, is_cumulative_dns_tunnel, is_suspicious_dns_query,
+    is_suspicious_dns_query_adaptive, RiskEngineConfig, RiskThresholds, RuleId, Verdict,
 };
 use sentinel_ebpf::maps::{TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict};
 use sentinel_ebpf::programs::bprm_check_security::{bpf_get_file_hash_simulated, is_memfd_or_fileless};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
 use sentinel_ebpf::programs::file_receive::handle_file_receive;
-use sentinel_ebpf::programs::mmap_file::{handle_mmap_file, MmapVerdict};
+use sentinel_ebpf::programs::mmap_file::{
+    handle_file_mprotect, handle_mmap_file, handle_mmap_file_attrs, MmapVerdict,
+};
 use sentinel_ebpf::programs::socket_connect::{evaluate_socket_connect, SocketConnectVerdict};
 use sentinel_ebpf::programs::socket_sendmsg::{
     evaluate_socket_sendmsg_ext, evaluate_socket_sendmsg_watchdog, SocketSendmsgVerdict,
@@ -595,26 +597,66 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         "Unverified caller must be rejected by kernel LSM without waking userspace!"
     );
 
-    // 5. Memory Sealing Defense: Attacker tries injecting shared library (.so) into GUI from untrusted location
-    // (e.g. via LD_PRELOAD from /tmp, /dev/shm, ~/.local)
-    let hostile_so_path = Path::new("/tmp/hostile_inject.so");
-    let mmap_verdict = taint_mgr.handle_mmap_file(
+    // 5. Memory Sealing Defense: Inode Attribute Whitelist & Path Check
+    // Attacker tries injecting shared library (.so) into GUI from untrusted location or non-root inode
+    // (e.g. ~/.cache/evil.so, /var/tmp/evil.so, or /tmp/hostile.so)
+    let hostile_so_cache = Path::new("/home/user/.cache/evil.so");
+    let mmap_verdict_cache = handle_mmap_file_attrs(
+        &taint_mgr,
         gui_tgid,
+        hostile_so_cache,
+        MAY_EXEC,
         0,
-        0,
-        hostile_so_path,
-        MAY_EXEC, // PROT_EXEC
-        0,
+        1000,   // non-root inode_uid
+        0o755,  // inode_mode
     );
     assert_eq!(
-        mmap_verdict,
+        mmap_verdict_cache,
         MmapVerdict::DenyMmap,
-        "Executable mapping of untrusted .so into GUI must be denied!"
+        "Executable mapping of non-root .so from ~/.cache must be denied!"
     );
     assert!(
         !taint_mgr.is_verified_gui(gui_tgid),
-        "GUI verified status must be stripped immediately upon loading untrusted code!"
+        "GUI verified status must be stripped immediately upon loading non-root code!"
     );
+
+    // Re-verify GUI and test writable /var/tmp/.so
+    taint_mgr.set_verified_gui(gui_tgid, true);
+    let hostile_so_vartmp = Path::new("/var/tmp/evil.so");
+    let mmap_verdict_vartmp = handle_mmap_file_attrs(
+        &taint_mgr,
+        gui_tgid,
+        hostile_so_vartmp,
+        MAY_EXEC,
+        0,
+        0,      // root owned...
+        0o777,  // ...BUT world-writable (mode & 0o022 != 0)!
+    );
+    assert_eq!(
+        mmap_verdict_vartmp,
+        MmapVerdict::DenyMmap,
+        "Executable mapping of group/world writable .so must be denied by inode whitelist!"
+    );
+    assert!(!taint_mgr.is_verified_gui(gui_tgid));
+
+    // 6. Two-step Injection Defense (lsm/file_mprotect: mmap RW -> mprotect RX)
+    taint_mgr.set_verified_gui(gui_tgid, true);
+    // Attacker allocates anonymous RW memory and calls mprotect(PROT_EXEC)
+    let mprotect_anon = handle_file_mprotect(
+        &taint_mgr,
+        gui_tgid,
+        None::<&Path>,
+        0,
+        MAY_EXEC,
+        0,
+        0,
+    );
+    assert_eq!(
+        mprotect_anon,
+        MmapVerdict::DenyMmap,
+        "Anonymous PROT_EXEC mprotect in GUI process must be blocked by kernel sealing!"
+    );
+    assert!(!taint_mgr.is_verified_gui(gui_tgid));
 
     // Subsequent connect attempt by compromised GUI is now blocked
     let compromised_connect = taint_mgr.handle_unix_may_send(gui_tgid, 1, "/run/sentinel/sentinel.sock");
@@ -719,6 +761,65 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
     // Stealer or curl accessing Chrome data -> NOT owner!
     assert!(!TaintHygiene::is_secret_owner("curl", "/home/user/.config/google-chrome/Default/Cookies"));
 
+    // 2b. Anti-Spoofing for Owner Policy:
+    // A. Legitimate system Chrome in /usr/bin/google-chrome with root ownership and trusted integrity
+    let sys_chrome = Path::new("/usr/bin/google-chrome");
+    let chrome_cookies = Path::new("/home/user/.config/google-chrome/Default/Cookies");
+    assert!(TaintHygiene::is_verified_secret_owner(
+        sys_chrome,
+        1,
+        1001,
+        chrome_cookies,
+        true,   // is_trusted_pkg
+        0,      // inode_uid (root)
+        0o755,  // inode_mode
+        false,  // has_untrusted_env
+    ));
+
+    // B. Spoofing Attempt 1: Fake binary named "chrome" launched from user home directory
+    let fake_user_chrome = Path::new("/home/user/.local/bin/chrome");
+    assert!(
+        !TaintHygiene::is_verified_secret_owner(
+            fake_user_chrome,
+            1,
+            2002,
+            chrome_cookies,
+            false,  // not a system package
+            1000,   // user-owned
+            0o755,
+            false,
+        ),
+        "Fake Chrome in user directory must be rejected from secret owner privilege!"
+    );
+
+    // C. Spoofing Attempt 2: Fake binary in /tmp/google-chrome
+    let fake_tmp_chrome = Path::new("/tmp/google-chrome");
+    assert!(!TaintHygiene::is_verified_secret_owner(
+        fake_tmp_chrome,
+        1,
+        3003,
+        chrome_cookies,
+        false,
+        1000,
+        0o777,
+        false,
+    ));
+
+    // D. Spoofing Attempt 3: System Chrome with untrusted library injection / compromised environment
+    assert!(
+        !TaintHygiene::is_verified_secret_owner(
+            sys_chrome,
+            1,
+            1001,
+            chrome_cookies,
+            true,
+            0,
+            0o755,
+            true,   // compromised environment!
+        ),
+        "Compromised Chrome environment must revoke secret owner privilege!"
+    );
+
     // 3. Process Taint Domain Scoping:
     let chrome_tgid = 5001;
     let mut chrome_taint = TaintFlags::default();
@@ -804,7 +905,7 @@ fn test_19_staging_attack_intermediate_file_taint() {
 }
 
 // -----------------------------------------------------------------------------
-// Test 20: Covert DNS Tunneling Detection
+// Test 20: Covert DNS Tunneling Detection (Adaptive & Cumulative Anti-Chunking)
 // -----------------------------------------------------------------------------
 #[test]
 fn test_20_covert_dns_tunneling_detection() {
@@ -815,17 +916,43 @@ fn test_20_covert_dns_tunneling_detection() {
     let cdn_query = "assets-cdn.github.com";
     assert!(!is_suspicious_dns_query(cdn_query));
 
-    // 2. Suspicious DNS Tunneling query (Base64/hex encoded payload, length > 40, entropy > 3.8)
+    // 2. High-entropy DNS Tunneling query (> 40 chars or entropy > 3.8)
     let tunnel_query = "aW5kZXguZmlsZT1jYXQgL2V0Yy9zaGFkb3cK.exfil.attacker.net";
     let entropy = calculate_shannon_entropy(tunnel_query.split('.').next().unwrap());
     assert!(entropy > 3.5);
     assert!(is_suspicious_dns_query(tunnel_query));
 
-    // 3. Systemd-resolved socket interception in eBPF
+    // 3. Adaptive Anti-Chunking Thresholds:
+    // A chunk of 18 characters with base64 data
+    let short_chunk = "dGVzdC1zdG9sZW4xOA==.exfil.attacker.net";
+    // For clean process: NOT flagged (avoids CDN false positives)
+    assert!(
+        !is_suspicious_dns_query_adaptive(short_chunk, false),
+        "Clean processes must not be falsely flagged on short high-entropy subdomains"
+    );
+    // For tainted process: FLAGGED under reduced adaptive threshold (len >= 16 && entropy > 3.4)!
+    assert!(
+        is_suspicious_dns_query_adaptive(short_chunk, true),
+        "Tainted process sending 18-char encoded chunk must be detected by adaptive threshold!"
+    );
+
+    // 4. Cumulative DNS Tracker (Malware slicing stolen data into 3+ short chunks of 14 bytes)
     let taint_mgr = TaintMapManager::new();
     let tainted_tgid = 8001;
     taint_mgr.mark_tainted(tainted_tgid);
 
+    assert!(!taint_mgr.record_dns_query(tainted_tgid, "chunk1exfil123.evil.com"));
+    assert!(!taint_mgr.record_dns_query(tainted_tgid, "chunk2exfil123.evil.com"));
+    // 3rd chunk triggers cumulative threshold!
+    assert!(
+        taint_mgr.record_dns_query(tainted_tgid, "chunk3exfil123.evil.com"),
+        "3rd suspicious query from tainted process must trigger cumulative DNS tunnel alert!"
+    );
+    assert!(taint_mgr.is_cumulative_dns_tunnel_triggered(tainted_tgid));
+    assert!(is_cumulative_dns_tunnel(3, 42));
+    assert!(is_cumulative_dns_tunnel(2, 50));
+
+    // 5. Systemd-resolved socket interception in eBPF
     let resolved_sock = "/run/systemd/resolve/io.systemd.Resolve";
     let verdict = taint_mgr.handle_unix_may_send(tainted_tgid, 1, resolved_sock);
     assert_eq!(

@@ -56,29 +56,36 @@ Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data
      - Heartbeat timer in `BPF_MAP_TYPE_ARRAY`: daemon updates timestamp every 500 ms.
      - Smart kernel degradation in `lsm/socket_sendmsg` and `cgroup_skb/egress`: if the daemon is unresponsive for > 2.0s, clean processes (`taint == 0`) continue normally without disruption (Fail-Safe), while tainted processes (`taint != 0`) are immediately blocked by the kernel with `-EPERM` (Fail-Close), preventing credential exfiltration even during daemon downtime.
 4. **Distro-Agnostic Package Integrity in Pure Rust & Scoped Taint**:
-   - **Pure-Rust Multi-Backend for System Package Databases**:
-     - Arch Linux / Manjaro / EndeavourOS (`pacman`): reads `mtree` archives via `flate2` and extracts recorded SHA-256 digests.
-     - Fedora / RHEL / CentOS / openSUSE (`rpm`): direct query of SQLite DB `/var/lib/rpm/rpmdb.sqlite` and manifests without calling the `rpm` binary.
+   - **Pure-Rust Multi-Backend with O(1) In-Memory Indexing**:
+     - Arch Linux / Manjaro / EndeavourOS (`pacman`): reads `mtree` archives via `flate2` and extracts recorded SHA-256 digests. Memoized in an in-memory `HashMap` index for `O(1)` userspace lookups without repeated decompression.
+     - Fedora / RHEL / CentOS / openSUSE (`rpm`): direct query of SQLite DB `/var/lib/rpm/rpmdb.sqlite` and manifests with `O(1)` in-memory caching.
      - NixOS: validates immutable `/nix/store/<hash>-name` paths, `root:root` ownership, and `MS_RDONLY` mount flag.
      - Immutable OSes (Fedora Silverblue, SteamOS, VanillaOS): validates read-only filesystem mounts (`ostree`, `composefs`, `erofs`) and `fs-verity` digests.
-     - Debian / Ubuntu (`dpkg`): parses `/var/lib/dpkg/info/*.md5sums` and status in pure Rust without external CLI invocations.
+     - Debian / Ubuntu (`dpkg`): parses `/var/lib/dpkg/info/*.md5sums` and status in pure Rust without external CLI invocations, cached in `O(1)` memory table.
    - **In-Kernel Verification Caching (`BPF_MAP_TYPE_INODE_STORAGE`)**:
      - `TRUSTED_SYSTEM_PKG` status and inode version (`i_version`) cached directly in kernel memory; any write operation (`MAY_WRITE`) instantly invalidates trust.
-     - Sleepable hooks (`lsm.s/bprm_committed_creds`) leverage kernel kfuncs `bpf_get_file_hash()` (`fs-verity`).
+     - Sleepable hooks (`lsm.s/bprm_committed_creds`) leverage kernel kfunc `bpf_get_file_hash()` (`fs-verity`), explicitly annotated for `BPF_F_SLEEPABLE` context.
    - **Scoped Taint Domains (`u64 taint_mask`)**:
      - Bitmask domains: `BIT_SSH_KEYS`, `BIT_CLOUD_CREDS`, `BIT_CHROMIUM_DATA`, `BIT_FIREFOX_DATA`, `BIT_TELEGRAM_DATA`, `BIT_CRYPTO_WALLETS`.
-     - **Owner Policy**: legitimate browser (Chrome) accessing its own cookies (`BIT_CHROMIUM_DATA`) does NOT raise `SECRET_NON_OWNER`. But if Chrome (or a rogue extension) reads `~/.ssh/id_rsa`, `SECRET_NON_OWNER` immediately triggers and blocks egress!
+     - **Anti-Spoofing Owner Policy**: legitimate owner privilege (`is_secret_owner = true`) is granted **strictly upon satisfying all 3 conditions simultaneously**:
+       1. Domain profile match (`BIT_CHROMIUM_DATA` for Chrome, `BIT_FIREFOX_DATA` for Firefox, etc.).
+       2. Launch from privileged system directories (`/usr/`, `/opt/`, `/bin/`, `/lib/`) with verified package or inode integrity (`is_trusted_system_pkg == true` or `inode_uid == 0 && (inode_mode & 0o022) == 0`).
+       3. Uncompromised process environment (no memfd loaders or anonymous execution). Fake binaries in `~/.local` or `/tmp` immediately trigger `SECRET_NON_OWNER` (+40 risk score)!
      - **Downward-Only Taint Propagation**: IDE terminal shells and build runners (`cargo build`, `npm install`) inherit taint downward, never contaminating the parent IDE (VSCode / JetBrains).
 5. **Zero-Userspace Trust GUI Attestation & Covert Channel Defense**:
    - **In-Kernel Attestation at Launch (`lsm/bprm_committed_creds`)**:
      - Daemon registers `(dev, ino)` of `/usr/bin/sentinel-gui`. BPF LSM stamps `is_verified_gui = 1` in `TASK_STORAGE`.
-   - **In-Kernel Memory Sealing (`lsm/mmap_file`)**:
-     - Loading any shared library (`.so`) with `PROT_EXEC` from non-root writable paths (`/tmp`, `/dev/shm`, `~/.local`) is blocked (`-EPERM`) or immediately revokes `is_verified_gui = 0`.
+   - **Process Memory Sealing via Inode Attribute Whitelist (`lsm/mmap_file` & `lsm/file_mprotect`)**:
+     - Replaces fragile path blacklists (which can be bypassed via `~/.cache`, `/var/tmp`, `/run/user/$UID`) with an **inode attribute whitelist**: mapped `.so` files must be owned by `root` (`inode_uid == 0`) with no group/world write bits (`(mode & 0o022) == 0`).
+     - Intercepting `lsm/file_mprotect` blocks two-step injection (`mmap(RW) -> mprotect(RX)`) and anonymous execution, immediately revoking `is_verified_gui = 0` and returning `-EPERM`.
    - **Direct Kernel Gate in `lsm/unix_stream_connect`**:
      - Any `connect()` to `/run/sentinel/sentinel.sock` is verified in the kernel: unverified callers receive `-EACCES` directly without waking userspace.
-   - **Staging Attack & Covert DNS Tunneling Defense**:
+   - **Staging Attack & Adaptive Anti-Chunking DNS Tunneling Defense**:
      - Intermediate files (`~/.cache/benign.dat`) inherit secret taint masks via `INODE_STORAGE` on `MAY_WRITE`, infecting subsequent readers.
-     - DNS queries to `127.0.0.53:53` or `io.systemd.Resolve` are intercepted: Shannon entropy > 3.8 and subdomain > 40 chars trigger `COVERT_DNS_TUNNEL`.
+     - **Adaptive DNS Thresholds**: clean processes checked with `len > 40 && entropy > 3.8` (no CDN false positives); tainted processes checked with reduced threshold `len >= 16 && entropy > 3.4`.
+     - **Cumulative DNS Tracker in TASK_STORAGE**: tainted processes sending `>= 3` suspicious queries or accumulating `>= 48` bytes in subdomains trigger `RuleId::CovertDnsTunnel` (+50 risk score) and packet drop.
+   - **Linux 6.x Strict eBPF Verifier Compliance**:
+     - Kernel code in `sentinel-ebpf` is `#![no_std]` integer-only without floating-point instructions (`f32`/`f64`), passing strict BPF Verifier constraints.
 6. **Never-Freeze Allowlist & DoS Defense**:
    - Hardcoded protection list (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
    - Anti-Spoofing: Validation strictly based on `(dev, inode)` and canonical binary path. Spoofing `comm` via `prctl(PR_SET_NAME)` is ignored.

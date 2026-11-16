@@ -46,8 +46,18 @@ pub trait PkgIntegrityProvider: Send + Sync {
 // Arch Linux Backend (pacman / mtree)
 // -----------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-pub struct PacmanBackend;
+#[derive(Clone)]
+pub struct PacmanBackend {
+    cache: Arc<RwLock<HashMap<PathBuf, Option<PackageIntegrityInfo>>>>,
+}
+
+impl Default for PacmanBackend {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
 
 impl PacmanBackend {
     pub fn is_available() -> bool {
@@ -136,10 +146,21 @@ impl PacmanBackend {
 impl PkgIntegrityProvider for PacmanBackend {
     fn check_package(&self, path: &Path) -> Option<PackageIntegrityInfo> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.verify_path(&canonical)
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(cached) = cache.get(&canonical) {
+                return cached.clone();
+            }
+        }
+        let res = self.verify_path(&canonical);
+        self.cache.write().unwrap().insert(canonical, res.clone());
+        res
     }
 
-    fn invalidate_path(&self, _path: &Path) {}
+    fn invalidate_path(&self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.cache.write().unwrap().remove(&canonical);
+    }
 
     fn provider_name(&self) -> &'static str {
         "pacman"
@@ -150,8 +171,18 @@ impl PkgIntegrityProvider for PacmanBackend {
 // Fedora / RHEL Backend (rpm)
 // -----------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-pub struct RpmBackend;
+#[derive(Clone)]
+pub struct RpmBackend {
+    cache: Arc<RwLock<HashMap<PathBuf, Option<PackageIntegrityInfo>>>>,
+}
+
+impl Default for RpmBackend {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
 
 impl RpmBackend {
     pub fn is_available() -> bool {
@@ -221,10 +252,21 @@ impl RpmBackend {
 impl PkgIntegrityProvider for RpmBackend {
     fn check_package(&self, path: &Path) -> Option<PackageIntegrityInfo> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.verify_path(&canonical)
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(cached) = cache.get(&canonical) {
+                return cached.clone();
+            }
+        }
+        let res = self.verify_path(&canonical);
+        self.cache.write().unwrap().insert(canonical, res.clone());
+        res
     }
 
-    fn invalidate_path(&self, _path: &Path) {}
+    fn invalidate_path(&self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.cache.write().unwrap().remove(&canonical);
+    }
 
     fn provider_name(&self) -> &'static str {
         "rpm"
@@ -378,8 +420,18 @@ impl PkgIntegrityProvider for ImmutableOsBackend {
 // Debian / Ubuntu Backend (dpkg - pure Rust without CLI)
 // -----------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-pub struct DpkgBackend;
+#[derive(Clone)]
+pub struct DpkgBackend {
+    cache: Arc<RwLock<HashMap<PathBuf, Option<PackageIntegrityInfo>>>>,
+}
+
+impl Default for DpkgBackend {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
 
 impl DpkgBackend {
     pub fn is_available() -> bool {
@@ -457,10 +509,21 @@ impl DpkgBackend {
 impl PkgIntegrityProvider for DpkgBackend {
     fn check_package(&self, path: &Path) -> Option<PackageIntegrityInfo> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.verify_path(&canonical)
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(cached) = cache.get(&canonical) {
+                return cached.clone();
+            }
+        }
+        let res = self.verify_path(&canonical);
+        self.cache.write().unwrap().insert(canonical, res.clone());
+        res
     }
 
-    fn invalidate_path(&self, _path: &Path) {}
+    fn invalidate_path(&self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.cache.write().unwrap().remove(&canonical);
+    }
 
     fn provider_name(&self) -> &'static str {
         "dpkg"
@@ -605,11 +668,17 @@ impl CompositePkgChecker {
         // 4. Update in-kernel INODE_STORAGE cache
         if let Some(ref res) = info {
             if res.is_integrity_verified {
-                #[cfg(unix)]
                 if let Some(mgr) = taint_mgr {
-                    use std::os::unix::fs::MetadataExt;
-                    if let Ok(meta) = std::fs::metadata(&canonical_path) {
-                        mgr.mark_inode_trusted(meta.dev(), meta.ino(), meta.mtime_nsec() as u64, None);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if let Ok(meta) = std::fs::metadata(&canonical_path) {
+                            mgr.mark_inode_trusted(meta.dev(), meta.ino(), meta.mtime_nsec() as u64);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        mgr.mark_inode_trusted(0, 0, 1);
                     }
                 }
             }
@@ -632,8 +701,11 @@ impl PkgIntegrityProvider for CompositePkgChecker {
     }
 
     fn invalidate_path(&self, path: &Path) {
-        let mut cache = self.cache.write().unwrap();
-        cache.remove(path);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.cache.write().unwrap().remove(&canonical);
+        self.pacman.invalidate_path(&canonical);
+        self.rpm.invalidate_path(&canonical);
+        self.dpkg.invalidate_path(&canonical);
     }
 
     fn provider_name(&self) -> &'static str {

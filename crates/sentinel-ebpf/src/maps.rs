@@ -97,6 +97,8 @@ pub struct TaskStorageEntry {
     pub parent_tgid: u32,
     pub is_verified_gui: bool,
     pub is_sealed: bool,
+    pub dns_query_count: u32,
+    pub cumulative_dns_subdomain_bytes: u32,
 }
 
 /// In-kernel entry stored in `BPF_MAP_TYPE_INODE_STORAGE` per inode struct (pipe, FIFO, file).
@@ -342,6 +344,51 @@ impl TaintHygiene {
         (owner_domain & domain) != 0
     }
 
+    /// Check whether a process is verified as a legitimate secret owner against binary spoofing:
+    /// 1. Path matches recognized domain owner profile (e.g. /usr/bin/google-chrome, /opt/google/chrome/chrome)
+    /// 2. Executable passes package/system integrity (is_trusted_system_pkg == true OR (inode_uid == 0 && (inode_mode & 0o022) == 0))
+    /// 3. Process environment is uncompromised (no hostile memory mappings / unverified libs)
+    pub fn is_verified_secret_owner(
+        exe_path: &Path,
+        _dev: u64,
+        _ino: u64,
+        secret_path: &Path,
+        is_trusted_pkg: bool,
+        inode_uid: u32,
+        inode_mode: u32,
+        has_untrusted_env: bool,
+    ) -> bool {
+        if has_untrusted_env {
+            return false;
+        }
+
+        let exe_str = exe_path.to_string_lossy();
+        let exe_name = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let secret_str = secret_path.to_string_lossy();
+
+        // 1. Must match secret domain owner profile
+        if !Self::is_secret_owner(exe_name, &secret_str) {
+            return false;
+        }
+
+        // Must run from system location, NOT /tmp, /home, /dev/shm, etc.
+        let is_system_path = exe_str.starts_with("/usr/")
+            || exe_str.starts_with("/opt/")
+            || exe_str.starts_with("/bin/")
+            || exe_str.starts_with("/lib/");
+        if !is_system_path {
+            return false;
+        }
+
+        // 2. Binary must have integrity verified (trusted package or root-owned non-writable)
+        let has_integrity = is_trusted_pkg || (inode_uid == 0 && (inode_mode & 0o022) == 0);
+        if !has_integrity {
+            return false;
+        }
+
+        true
+    }
+
     /// Determines whether a process is an OS-level IPC broker or graphical compositor.
     /// Used to prevent "Taint Explosion" where messaging a system broker taints the entire OS.
     pub fn is_ipc_broker_name(exe_name: &str) -> bool {
@@ -463,6 +510,7 @@ impl TaintMapManager {
             parent_tgid: 0,
             is_verified_gui: verified,
             is_sealed: verified,
+            ..Default::default()
         });
         entry.is_verified_gui = verified;
         if verified {
@@ -496,8 +544,8 @@ impl TaintMapManager {
         now_ns.saturating_sub(last) <= 2_000_000_000
     }
 
-    /// Mark an inode as a trusted system package in INODE_STORAGE with version validation.
-    pub fn mark_inode_trusted(&self, dev: u64, ino: u64, version: u64, fs_verity: Option<[u8; 32]>) {
+    /// Mark an inode as a trusted system package in INODE_STORAGE with version validation and optional fs-verity digest.
+    pub fn mark_inode_trusted_ext(&self, dev: u64, ino: u64, version: u64, fs_verity: Option<[u8; 32]>) {
         let mut inodes = self.inodes.write().unwrap();
         let entry = inodes.entry((dev, ino)).or_insert_with(|| InodeStorageEntry {
             taint_flags: TaintFlags::default(),
@@ -513,6 +561,11 @@ impl TaintMapManager {
         entry.is_trusted_system_pkg = true;
         entry.inode_version = version;
         entry.fs_verity_hash = fs_verity;
+    }
+
+    /// Mark an inode as a trusted system package in INODE_STORAGE with version validation.
+    pub fn mark_inode_trusted(&self, dev: u64, ino: u64, version: u64) {
+        self.mark_inode_trusted_ext(dev, ino, version, None);
     }
 
     /// Check if an inode is verified in INODE_STORAGE and version has not drifted.
@@ -659,8 +712,52 @@ impl TaintMapManager {
             baseline_profile: 0,
             is_leaf: true,
             parent_tgid: 0,
+            ..Default::default()
         });
         entry.taint_flags.0 |= flags.0;
+    }
+
+    /// Record a DNS query from a process, returning whether it exceeds the cumulative tunneling threshold.
+    ///
+    /// # Anti-Chunking DNS Exfiltration Defense:
+    /// Tracks query counts and cumulative subdomain label lengths for tainted processes.
+    /// If an attacker attempts to slice stolen data into short chunks (< 16 chars),
+    /// sending >= 3 suspicious queries or accumulating >= 48 subdomain bytes triggers detection.
+    pub fn record_dns_query(&self, tgid: u32, query_domain: &str) -> bool {
+        let leader = self.resolve_group_leader(tgid);
+        let is_tainted = self.is_tainted(leader);
+        if !is_tainted {
+            return false;
+        }
+
+        let clean = query_domain.trim_end_matches('.');
+        let labels: Vec<&str> = clean.split('.').collect();
+        let subdomain_bytes: u32 = if labels.len() > 2 {
+            labels[..labels.len() - 2].iter().map(|l| l.len() as u32).sum()
+        } else if let Some(first) = labels.first() {
+            first.len() as u32
+        } else {
+            0
+        };
+
+        let mut tasks = self.tasks.write().unwrap();
+        if let Some(entry) = tasks.get_mut(&leader) {
+            entry.dns_query_count += 1;
+            entry.cumulative_dns_subdomain_bytes += subdomain_bytes;
+            if entry.dns_query_count >= 3 || entry.cumulative_dns_subdomain_bytes >= 48 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns whether the task has exceeded cumulative DNS tunneling thresholds.
+    pub fn is_cumulative_dns_tunnel_triggered(&self, tgid: u32) -> bool {
+        let leader = self.resolve_group_leader(tgid);
+        let tasks = self.tasks.read().unwrap();
+        tasks.get(&leader)
+            .map(|t| t.dns_query_count >= 3 || t.cumulative_dns_subdomain_bytes >= 48)
+            .unwrap_or(false)
     }
 
     /// Retrieve the current task storage entry for the group leader.
@@ -827,13 +924,17 @@ impl TaintMapManager {
         None
     }
 
-    /// Process `lsm/mmap_file` hook:
-    /// - Zero-Userspace GUI Memory Sealing: blocks unprivileged .so execution inside sentinel-gui
-    /// - Detects reading secrets via `mmap` (MAP_SHARED or MAP_PRIVATE)
-    /// - Detects writing to shared memory / files from tainted processes (`MAP_SHARED | PROT_WRITE`)
-    /// - Blocks tainted processes from loading executable libraries
-    /// - Detects executable mappings (`PROT_EXEC`) on anonymous memory or unlinked tmpfs files
-    pub fn handle_mmap_file(
+    /// Process `lsm/mmap_file` hook with explicit inode attributes.
+    ///
+    /// # Zero-Userspace GUI Memory Sealing (Security Hardening):
+    /// Rather than relying on fragile path blacklists (which can be bypassed via ~/.cache,
+    /// ~/.config, /var/tmp, or /run/user/$UID), any executable mapping (`PROT_EXEC`) requested by a process
+    /// with `is_verified_gui == 1` is strictly audited against an inode attribute whitelist:
+    /// - File MUST belong to root (`inode_uid == 0`).
+    /// - File MUST NOT have write permissions for group or others (`(inode_mode & 0o022) == 0`).
+    /// - File system / path must NOT be temporary or user-writable.
+    /// Violations immediately strip `is_verified_gui = 0` and deny execution (`-EPERM`).
+    pub fn handle_mmap_file_attrs(
         &self,
         id: u32,
         dev: u64,
@@ -841,6 +942,8 @@ impl TaintMapManager {
         path: &Path,
         prot: u32,
         flags: u32,
+        inode_uid: u32,
+        inode_mode: u32,
     ) -> MmapVerdict {
         let leader_tgid = self.resolve_group_leader(id);
         let path_str = path.to_string_lossy();
@@ -853,16 +956,22 @@ impl TaintMapManager {
         let is_exec = (prot & MAY_EXEC != 0) || ((prot & 0x4) != 0);
 
         // 0. Zero-Userspace GUI Sealing:
-        // If task has verified GUI flag, any executable mapping (.so) from user-writable
-        // or non-system paths immediately revokes GUI status and denies mmap (-EPERM)!
+        // Audited against Inode Attribute Whitelist:
         if is_exec && self.is_verified_gui(leader_tgid) {
+            let is_root_owned = inode_uid == 0;
+            let is_not_writable = (inode_mode & 0o022) == 0;
             let is_untrusted_loc = path_str.starts_with("/tmp")
                 || path_str.starts_with("/dev/shm")
                 || path_str.starts_with("/home")
+                || path_str.starts_with("/var/tmp")
                 || path_str.contains("/.local/")
+                || path_str.contains("/.cache/")
+                || path_str.contains("/.config/")
+                || path_str.contains("/run/user/")
                 || path_str.contains("/Downloads/")
                 || path_str.contains("(deleted)");
-            if is_untrusted_loc {
+
+            if !is_root_owned || !is_not_writable || is_untrusted_loc {
                 self.set_verified_gui(leader_tgid, false);
                 return MmapVerdict::DenyMmap;
             }
@@ -931,6 +1040,84 @@ impl TaintMapManager {
                 self.set_task_taint(leader_tgid, taint);
                 return MmapVerdict::TaintTask;
             }
+        }
+
+        MmapVerdict::Allow
+    }
+
+    /// Process `lsm/mmap_file` hook with automatic inode attribute inference.
+    pub fn handle_mmap_file(
+        &self,
+        id: u32,
+        dev: u64,
+        ino: u64,
+        path: &Path,
+        prot: u32,
+        flags: u32,
+    ) -> MmapVerdict {
+        let path_str = path.to_string_lossy();
+        let (default_uid, default_mode) = if path_str.starts_with("/usr")
+            || path_str.starts_with("/lib")
+            || path_str.starts_with("/bin")
+            || path_str.starts_with("/opt")
+        {
+            (0, 0o755)
+        } else {
+            (1000, 0o777)
+        };
+        self.handle_mmap_file_attrs(id, dev, ino, path, prot, flags, default_uid, default_mode)
+    }
+
+    /// Process `lsm/file_mprotect` hook:
+    /// Intercepts memory protection promotions (e.g. mprotect(PROT_EXEC), W^X transitions)
+    /// to prevent two-step injection (mmap(RW) -> mprotect(RX)) into verified GUI or tainted processes.
+    pub fn handle_file_mprotect(
+        &self,
+        id: u32,
+        path: Option<&Path>,
+        _reqprot: u32,
+        prot: u32,
+        inode_uid: u32,
+        inode_mode: u32,
+    ) -> MmapVerdict {
+        let leader_tgid = self.resolve_group_leader(id);
+        let is_exec = (prot & MAY_EXEC != 0) || ((prot & 0x4) != 0);
+
+        if !is_exec {
+            return MmapVerdict::Allow;
+        }
+
+        // 1. Zero-Userspace GUI Memory Sealing:
+        if self.is_verified_gui(leader_tgid) {
+            // Anonymous memory promotion (W^X violation) or file without root ownership / with write permissions
+            let is_anonymous = path.is_none();
+            let is_root_owned = inode_uid == 0;
+            let is_not_writable = (inode_mode & 0o022) == 0;
+            let is_untrusted_loc = if let Some(p) = path {
+                let s = p.to_string_lossy();
+                s.starts_with("/tmp")
+                    || s.starts_with("/dev/shm")
+                    || s.starts_with("/home")
+                    || s.starts_with("/var/tmp")
+                    || s.contains("/.local/")
+                    || s.contains("/.cache/")
+                    || s.contains("/.config/")
+                    || s.contains("/run/user/")
+                    || s.contains("/Downloads/")
+                    || s.contains("(deleted)")
+            } else {
+                true
+            };
+
+            if is_anonymous || !is_root_owned || !is_not_writable || is_untrusted_loc {
+                self.set_verified_gui(leader_tgid, false);
+                return MmapVerdict::DenyMmap;
+            }
+        }
+
+        // 2. Tainted Execution Blocked:
+        if self.is_tainted(leader_tgid) {
+            return MmapVerdict::TaintedExecutionBlocked;
         }
 
         MmapVerdict::Allow

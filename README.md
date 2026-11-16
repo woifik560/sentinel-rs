@@ -56,29 +56,36 @@ Sentinel-RS спроектирован для защиты персональн�
      - Heartbeat-таймер в `BPF_MAP_TYPE_ARRAY`: демон обновляет метку времени каждые 500 мс.
      - Умная деградация в `lsm/socket_sendmsg` и `cgroup_skb/egress`: если демон не отвечает > 2.0 сек, чистые процессы (`taint == 0`) продолжают работать без зависаний (Fail-Safe), а зараженные (`taint != 0`) мгновенно блокируются ядром с `-EPERM` (Fail-Close), предотвращая эксфильтрацию украденных данных даже при сбое демона.
 4. **Дистрибутиво-независимая целостность пакетов (Distro-Agnostic Pure Rust) & Scoped Taint**:
-   - **Мульти-бэкенд чтения пакетных баз на чистом Rust**:
-     - Arch Linux / Manjaro / EndeavourOS (`pacman`): чтение `mtree` архивов через `flate2` со сверкой эталонных SHA-256.
-     - Fedora / RHEL / CentOS / openSUSE (`rpm`): прямое извлечение хешей из SQLite-базы `/var/lib/rpm/rpmdb.sqlite` и манифестов.
+   - **Мульти-бэкенд чтения пакетных баз на чистом Rust с O(1) in-memory кэшированием**:
+     - Arch Linux / Manjaro / EndeavourOS (`pacman`): чтение `mtree` архивов через `flate2` со сверкой эталонных SHA-256. Встроен in-memory индекс `HashMap` с мемоизацией для `O(1)` доступа без повторного разжатия gzip.
+     - Fedora / RHEL / CentOS / openSUSE (`rpm`): прямое извлечение хешей из SQLite-базы `/var/lib/rpm/rpmdb.sqlite` и манифестов с `O(1)` in-memory кэшированием.
      - NixOS: верификация неизменяемых путей `/nix/store/<hash>-name`, прав `root:root` и монтирования `MS_RDONLY`.
      - Immutable OS (Fedora Silverblue, SteamOS, VanillaOS): проверка Read-Only файловой системы (`ostree`, `composefs`, `erofs`) и аттестация `fs-verity`.
-     - Debian / Ubuntu (`dpkg`): прямой парсинг `/var/lib/dpkg/info/*.md5sums` на чистом Rust без вызова внешних CLI.
+     - Debian / Ubuntu (`dpkg`): прямой парсинг `/var/lib/dpkg/info/*.md5sums` на чистом Rust без вызова внешних CLI с `O(1)` кэшированием записей.
    - **Кэширование верификации в ядре (`BPF_MAP_TYPE_INODE_STORAGE`)**:
      - Статус `TRUSTED_SYSTEM_PKG` и версия иноды кэшируются прямо в ядре; при любой попытке модификации файла (`MAY_WRITE`) eBPF мгновенно сбрасывает доверие.
-     - В спящих хуках `lsm.s/bprm_committed_creds` поддерживается ядерная kfunc `bpf_get_file_hash()` (`fs-verity`).
+     - В спящих хуках `lsm.s/bprm_committed_creds` поддерживается ядерная kfunc `bpf_get_file_hash()` (`fs-verity`), явно размеченная для `BPF_F_SLEEPABLE` контекста.
    - **Матрица доменов секретов (Scoped Taint Domains: `u64 taint_mask`)**:
      - Битовая маска: `BIT_SSH_KEYS`, `BIT_CLOUD_CREDS`, `BIT_CHROMIUM_DATA`, `BIT_FIREFOX_DATA`, `BIT_TELEGRAM_DATA`, `BIT_CRYPTO_WALLETS`.
-     - **Owner Policy**: легитимный браузер (Chrome), читающий свои куки (`BIT_CHROMIUM_DATA`), не помечается как `SECRET_NON_OWNER`. Но если Chrome (или плагин) читает `~/.ssh/id_rsa`, флаг немедленно взводится!
+     - **Защита Owner Policy от спуфинга (Anti-Spoofing)**: статус легитимного владельца (`is_secret_owner = true`) подтверждается **только при одновременном выполнении 3 условий**:
+       1. Соответствие профилю домена (`BIT_CHROMIUM_DATA` для Chrome, `BIT_FIREFOX_DATA` для Firefox и т.д.).
+       2. Запуск из системного доверенного каталога (`/usr/`, `/opt/`, `/bin/`, `/lib/`) и верификация целостности бинарника (`is_trusted_system_pkg == true` или `inode_uid == 0 && (inode_mode & 0o022) == 0`).
+       3. Отсутствие признаков компрометации процесса (нет memfd-загрузчиков или анонимного исполнения). Фейковый бинарник из `~/.local` или `/tmp` немедленно получает `SECRET_NON_OWNER` (+40 очков риска)!
      - **Передача Taint только сверху вниз**: терминалы и сборщики внутри IDE (`cargo build`, `npm install`) изолированы — taint не загрязняет родительский процесс IDE (VSCode / JetBrains).
 5. **Zero-Userspace Trust аутентификация GUI (устранение TOCTOU) и перекрытие скрытых каналов**:
    - **Аттестация в ядре при старте (`lsm/bprm_committed_creds`)**:
      - Демон при старте регистрирует `(dev, ino)` бинарника `/usr/bin/sentinel-gui`. Хук BPF LSM выставляет флаг `is_verified_gui = 1` в `TASK_STORAGE` процесса.
-   - **Герметизация памяти процесса в ядре (`lsm/mmap_file`)**:
-     - Любая загрузка разделяемой библиотеки (`.so`) с `PROT_EXEC` из неподконтрольных root путей (`/tmp`, `/dev/shm`, `~/.local`) блокируется (`-EPERM`) или немедленно аннулирует статус `is_verified_gui = 0`.
+   - **Герметизация памяти процесса по белому списку атрибутов иноды (`lsm/mmap_file` и `lsm/file_mprotect`)**:
+     - Вместо ненадежного черного списка путей (который можно обойти через `~/.cache`, `/var/tmp` или `/run/user/$UID`) любая загрузка `.so` с `PROT_EXEC` аудируется по **белому списку атрибутов иноды**: файл обязан принадлежать `root` (`inode_uid == 0`) и не иметь битов записи для группы/остальных (`(mode & 0o022) == 0`).
+     - Перехват хука `lsm/file_mprotect` блокирует двухшаговую инъекцию (`mmap(RW) -> mprotect(RX)`) и анонимный `PROT_EXEC`, немедленно сбрасывая `is_verified_gui = 0` и возвращая `-EPERM`.
    - **Проверка подключения в `lsm/unix_stream_connect`**:
      - Попытка `connect()` к `/run/sentinel/sentinel.sock` проверяется в ядре: неавторизованным непривилегированным процессам немедленно возвращается `-EACCES` без пробуждения `sentineld`.
-   - **Защита от Staging-атак и Covert DNS Tunneling**:
+   - **Защита от Staging-атак и адаптивный детектор DNS-туннелей (Anti-Chunking)**:
      - Промежуточные файлы (`~/.cache/benign.dat`) наследуют битовую маску тайн через `INODE_STORAGE` при записи, заражая последующих читателей.
-     - DNS-запросы на `127.0.0.53:53` и `io.systemd.Resolve` перехватываются: энтропия Шеннона > 3.8 и длина поддомена > 40 символов блокируются правилом `COVERT_DNS_TUNNEL`.
+     - **Адаптивные пороги DNS**: для чистых процессов — `len > 40 && entropy > 3.8` (исключение ложных срабатываний на CDN); для зараженных процессов порог снижается до `len >= 16 && entropy > 3.4`.
+     - **Накопительный трекер (Cumulative DNS Tracker)**: отправка зараженным процессом `>= 3` подозрительных запросов или накопление `>= 48` байт в поддоменах классифицируется как фрагментированный туннель (`RuleId::CovertDnsTunnel`, +50 очков риска) и блокируется ядром.
+   - **Строгая верификация eBPF ядра Linux 6.x**:
+     - Ядерный код в `sentinel-ebpf` работает на `#[no_std]` с целочисленной арифметикой без инструкций с плавающей точкой (`f32`/`f64`), удовлетворяя строгим требованиям BPF Verifier.
 6. **Предохранитель Never-Freeze Allowlist и защита от DoS**:
    - Жесткий список защиты рабочего стола (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
    - **Anti-Spoofing**: валидация только по связке `(dev, inode)` и каноническому пути бинарника. Подмена `comm` через `prctl(PR_SET_NAME)` игнорируется.

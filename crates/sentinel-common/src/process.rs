@@ -195,6 +195,25 @@ impl ProcessNode {
             false
         }
     }
+
+    /// Check if the executable originated from an untrusted user/temp location.
+    pub fn is_untrusted_origin(&self) -> bool {
+        let s = self.exe_path.to_string_lossy();
+        s.starts_with("/tmp")
+            || s.starts_with("/dev/shm")
+            || s.starts_with("/var/tmp")
+            || s.contains("/Downloads/")
+            || s.contains("/.local/")
+            || s.contains("/.cache/")
+            || s.contains("/.config/")
+            || s.starts_with("/home")
+    }
+
+    /// Check if the executable is located in a privileged system path (/usr/, /opt/, /bin/, /lib/).
+    pub fn is_system_path(&self) -> bool {
+        let s = self.exe_path.to_string_lossy();
+        s.starts_with("/usr/") || s.starts_with("/opt/") || s.starts_with("/bin/") || s.starts_with("/lib/")
+    }
 }
 
 /// Identify if a binary is a common interactive user shell.

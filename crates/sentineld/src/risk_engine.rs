@@ -64,14 +64,29 @@ impl RiskEngine {
             });
         }
 
-        // 2. [+40] SECRET_NON_OWNER / TAINTED (with Scoped Taint Domains & Owner Policy)
+        // 2. [+40] SECRET_NON_OWNER / TAINTED (with Scoped Taint Domains & Anti-Spoofing Owner Policy)
         let mut has_non_owner_secret = false;
         let mut has_owner_secret = false;
         let exe_name = node.exe_name();
 
         for secret in &node.secret_accesses {
             let secret_path_str = secret.path.to_string_lossy();
-            if sentinel_ebpf::maps::TaintHygiene::is_secret_owner(&exe_name, &secret_path_str) {
+            let is_domain_match = sentinel_ebpf::maps::TaintHygiene::is_secret_owner(&exe_name, &secret_path_str);
+            // Security Hardening: Anti-Spoofing check for Owner Policy
+            // Legitimate owner requires:
+            // 1. Matches owner domain
+            // 2. Binary in system path (is_system_path() && !is_untrusted_origin())
+            // 3. Verified package integrity (pkg_origin.is_some() || baseline_profile & PROFILE_TRUSTED_PKG != 0)
+            // 4. Uncompromised process environment (!is_memfd && !is_anon_exec)
+            let is_legitimate_owner = is_domain_match
+                && node.is_system_path()
+                && !node.is_untrusted_origin()
+                && (node.pkg_origin.is_some()
+                    || (node.baseline_profile & sentinel_common::process::PROFILE_TRUSTED_PKG != 0))
+                && !node.is_memfd
+                && !node.is_anon_exec;
+
+            if is_legitimate_owner {
                 has_owner_secret = true;
             } else {
                 has_non_owner_secret = true;
@@ -89,21 +104,22 @@ impl RiskEngine {
             });
         }
 
-        // 2b. [+50] COVERT_DNS_TUNNEL (Covert DNS tunneling via local 127.0.0.53:53 or high-entropy queries)
+        // 2b. [+50] COVERT_DNS_TUNNEL (Adaptive & Cumulative Anti-Chunking DNS Exfiltration Defense)
+        let is_tainted = has_non_owner_secret || node.has_secret_access();
         if let Some(ref domain) = net.dest_domain {
-            if sentinel_common::risk::is_suspicious_dns_query(domain) {
+            if sentinel_common::risk::is_suspicious_dns_query_adaptive(domain, is_tainted) {
                 let weight = self.get_weight(RuleId::CovertDnsTunnel.as_str(), 50);
                 firings.push(RuleFiring {
                     rule_id: RuleId::CovertDnsTunnel,
                     weight,
                     reason: format!(
-                        "Обнаружен скрытый DNS-туннель (аномальная энтропия или поддомен > 40 символов): {}",
+                        "Обнаружен скрытый DNS-туннель (аномальная энтропия или поддомен): {}",
                         domain
                     ),
                 });
             }
         } else if let Some(ref ip) = net.dest_ip {
-            if (ip == "127.0.0.53" || ip.starts_with("127.")) && net.dest_port == 53 && has_non_owner_secret {
+            if (ip == "127.0.0.53" || ip.starts_with("127.")) && net.dest_port == 53 && is_tainted {
                 let weight = self.get_weight(RuleId::CovertDnsTunnel.as_str(), 50);
                 firings.push(RuleFiring {
                     rule_id: RuleId::CovertDnsTunnel,

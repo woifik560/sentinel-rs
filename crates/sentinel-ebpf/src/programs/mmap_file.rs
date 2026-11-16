@@ -43,6 +43,33 @@ pub fn handle_mmap_file<P: AsRef<Path>>(
     manager.handle_mmap_file(id, 0, 0, path.as_ref(), prot, flags)
 }
 
+/// Convenience evaluation with explicit inode attributes.
+pub fn handle_mmap_file_attrs<P: AsRef<Path>>(
+    manager: &TaintMapManager,
+    id: u32,
+    path: P,
+    prot: u32,
+    flags: u32,
+    inode_uid: u32,
+    inode_mode: u32,
+) -> MmapVerdict {
+    manager.handle_mmap_file_attrs(id, 0, 0, path.as_ref(), prot, flags, inode_uid, inode_mode)
+}
+
+/// Convenience evaluation for `lsm/file_mprotect` hook.
+pub fn handle_file_mprotect<P: AsRef<Path>>(
+    manager: &TaintMapManager,
+    id: u32,
+    path: Option<P>,
+    reqprot: u32,
+    prot: u32,
+    inode_uid: u32,
+    inode_mode: u32,
+) -> MmapVerdict {
+    let path_ref = path.as_ref().map(|p| p.as_ref());
+    manager.handle_file_mprotect(id, path_ref, reqprot, prot, inode_uid, inode_mode)
+}
+
 /// Helper to create a raw event for testing and RingBuffer simulation.
 pub fn create_raw_mmap_event(
     tgid: u32,
