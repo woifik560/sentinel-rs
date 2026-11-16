@@ -140,7 +140,6 @@ slint::slint! {
         callback allow_clicked();
         callback kill_clicked();
         callback reconnect_clicked();
-        callback test_alert_clicked();
 
         VerticalLayout {
             padding: 24px;
@@ -295,15 +294,12 @@ slint::slint! {
                         color: #64748b;
                         vertical_alignment: center;
                     }
-                    ActionButton {
-                        width: 120px;
-                        height: 28px;
+                    Text {
+                        text: "eBPF Ring-0 Active";
                         font_size: 11px;
-                        text: "Тест тревоги";
-                        bg_color: #181d26;
-                        hover_color: #232a38;
-                        text_color: #94a3b8;
-                        clicked => { root.test_alert_clicked(); }
+                        color: #10b981;
+                        font_weight: 600;
+                        vertical_alignment: center;
                     }
                 }
             }
@@ -571,21 +567,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
         });
-    });
-
-    let w_h = window_handle.clone();
-    window.on_test_alert_clicked(move || {
-        if let Some(w) = w_h.upgrade() {
-            w.set_incident_id("demo-8842".into());
-            w.set_process_name("curl".into());
-            w.set_process_pid("3812".into());
-            w.set_process_path("/usr/bin/curl".into());
-            w.set_target_address("185.220.101.5:443".into());
-            w.set_reasons_text("Чтение ключа ~/.ssh/id_ed25519 • Прямое IP-подключение".into());
-            w.set_risk_score(85);
-            w.set_countdown_seconds(30);
-            w.set_has_incident(true);
-        }
     });
 
     let reconnect_notify = Arc::new(tokio::sync::Notify::new());
