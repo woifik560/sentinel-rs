@@ -34,9 +34,65 @@ impl LineageTracker {
         self.graph.insert(node);
     }
 
-    /// Retrieve a clone of a process node by TGID.
+    /// Retrieve a clone of a process node by TGID (with on-demand procfs fallback).
     pub fn get(&self, tgid: u32) -> Option<ProcessNode> {
-        self.graph.get(tgid)
+        if let Some(node) = self.graph.get(tgid) {
+            return Some(node);
+        }
+
+        // On-demand discovery fallback from /proc/<tgid> for pre-existing or external processes
+        Self::discover_from_procfs(tgid).map(|node| {
+            self.graph.insert(node.clone());
+            node
+        })
+    }
+
+    /// On-demand discovery of process attributes from Linux /proc filesystem.
+    pub fn discover_from_procfs(tgid: u32) -> Option<ProcessNode> {
+        let proc_dir = format!("/proc/{}", tgid);
+        if !Path::new(&proc_dir).exists() {
+            return None;
+        }
+
+        let exe_link = format!("{}/exe", proc_dir);
+        let exe_path = std::fs::read_link(&exe_link)
+            .unwrap_or_else(|_| PathBuf::from(format!("/proc/{}/exe", tgid)));
+
+        // Read ppid and uid from /proc/<tgid>/status
+        let mut ppid = 1;
+        let mut uid = 1000;
+        let status_path = format!("{}/status", proc_dir);
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
+            for line in content.lines() {
+                if line.starts_with("PPid:") {
+                    if let Some(val) = line.split_whitespace().nth(1) {
+                        ppid = val.parse().unwrap_or(1);
+                    }
+                } else if line.starts_with("Uid:") {
+                    if let Some(val) = line.split_whitespace().nth(1) {
+                        uid = val.parse().unwrap_or(1000);
+                    }
+                }
+            }
+        }
+
+        let mut node = ProcessNode::new(tgid, ppid, uid, exe_path);
+
+        // Read cmdline
+        let cmdline_path = format!("{}/cmdline", proc_dir);
+        if let Ok(bytes) = std::fs::read(&cmdline_path) {
+            let cmdline: Vec<String> = bytes
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect();
+            if let Some(info) = inspect_interpreter(&node.exe_path, &cmdline) {
+                node.script_path = info.script_path;
+            }
+            node.cmdline = cmdline;
+        }
+
+        Some(node)
     }
 
     /// Obtain canonical process key for a TGID.
@@ -177,7 +233,7 @@ impl LineageTracker {
                 break;
             }
 
-            if let Some(node) = self.graph.get(current_tgid) {
+            if let Some(node) = self.get(current_tgid) {
                 let exe_name = node
                     .exe_path
                     .file_name()

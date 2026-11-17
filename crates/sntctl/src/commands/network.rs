@@ -12,12 +12,18 @@ pub enum NetworkAction {
     Status,
     /// List currently isolated or blocked processes and destinations
     Blocked,
+    /// Engage emergency host network containment
+    Isolate,
+    /// Release emergency host network containment
+    Unisolate,
 }
 
 pub async fn run_network(socket_path: &Path, action: NetworkAction, json_output: bool) -> anyhow::Result<()> {
     let cmd = match action {
         NetworkAction::Status => IpcCommand::NetworkStatus,
         NetworkAction::Blocked => IpcCommand::NetworkBlocked,
+        NetworkAction::Isolate => IpcCommand::NetworkIsolate,
+        NetworkAction::Unisolate => IpcCommand::NetworkUnisolate,
     };
 
     let resp = send_command(socket_path, cmd).await?;
@@ -26,8 +32,14 @@ pub async fn run_network(socket_path: &Path, action: NetworkAction, json_output:
             if json_output {
                 print_json(&data)?;
             } else {
-                print_header("Network Protection Status");
-                print_json(&data)?;
+                match action {
+                    NetworkAction::Isolate => println!("Host network containment successfully activated"),
+                    NetworkAction::Unisolate => println!("Host network containment successfully released"),
+                    _ => {
+                        print_header("Network Protection Status");
+                        print_json(&data)?;
+                    }
+                }
             }
         }
         IpcResponse::Error { code, message } => {

@@ -457,6 +457,84 @@ async fn handle_ipc_command(
             let chain = lineage.get_ancestor_chain(tgid);
             IpcResponse::Ok(serde_json::to_value(chain).unwrap_or_default())
         }
+        IpcCommand::ProcessKill { tgid, reason } => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required to terminate processes".into(),
+                };
+            }
+            if tgid <= 2 || tgid == std::process::id() {
+                return IpcResponse::Error {
+                    code: "EPERM".into(),
+                    message: format!("Cannot terminate protected system/daemon process {}", tgid),
+                };
+            }
+            let key = crate::lineage::ProcessKey::new(tgid, 0);
+            match crate::response::safe_terminate_process(&key, None, std::time::Duration::from_millis(100)) {
+                Ok(_) => {
+                    info!("Process {} terminated by admin (reason: {:?})", tgid, reason);
+                    IpcResponse::Ok(serde_json::json!({ "terminated_tgid": tgid, "status": "Terminated" }))
+                }
+                Err(e) => {
+                    IpcResponse::Error {
+                        code: "ESRCH".into(),
+                        message: format!("Failed to terminate process {}: {}", tgid, e),
+                    }
+                }
+            }
+        }
+        IpcCommand::ProcessSuspend { tgid } => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required to suspend processes".into(),
+                };
+            }
+            if tgid <= 2 || tgid == std::process::id() {
+                return IpcResponse::Error {
+                    code: "EPERM".into(),
+                    message: format!("Cannot suspend protected system/daemon process {}", tgid),
+                };
+            }
+            let key = crate::lineage::ProcessKey::new(tgid, 0);
+            match crate::response::suspend_process(&key, None) {
+                Ok(_) => {
+                    info!("Process {} suspended by admin", tgid);
+                    IpcResponse::Ok(serde_json::json!({ "suspended_tgid": tgid, "status": "Suspended" }))
+                }
+                Err(e) => {
+                    IpcResponse::Error {
+                        code: "ESRCH".into(),
+                        message: format!("Failed to suspend process {}: {}", tgid, e),
+                    }
+                }
+            }
+        }
+        IpcCommand::NetworkIsolate => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required for network containment".into(),
+                };
+            }
+            let net_block = crate::response::NetworkBlockManager::new();
+            let containment = crate::response::HostContainment::new(std::sync::Arc::new(net_block));
+            containment.isolate_host();
+            IpcResponse::Ok(serde_json::json!({ "containment": "active", "status": "Isolated" }))
+        }
+        IpcCommand::NetworkUnisolate => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required for network containment".into(),
+                };
+            }
+            let net_block = crate::response::NetworkBlockManager::new();
+            let containment = crate::response::HostContainment::new(std::sync::Arc::new(net_block));
+            containment.release_host();
+            IpcResponse::Ok(serde_json::json!({ "containment": "released", "status": "Normal" }))
+        }
         IpcCommand::PolicyList | IpcCommand::PolicyReload => {
             if role != ClientRole::RootAdmin {
                 return IpcResponse::Error {

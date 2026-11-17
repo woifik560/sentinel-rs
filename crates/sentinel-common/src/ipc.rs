@@ -155,10 +155,18 @@ pub enum IpcCommand {
     ProcessInspect { tgid: u32 },
     /// sntctl process lineage <PID>
     ProcessLineage { tgid: u32 },
+    /// sntctl process kill <PID>
+    ProcessKill { tgid: u32, reason: Option<String> },
+    /// sntctl process suspend <PID>
+    ProcessSuspend { tgid: u32 },
     /// sntctl network status
     NetworkStatus,
     /// sntctl network blocked
     NetworkBlocked,
+    /// sntctl network isolate
+    NetworkIsolate,
+    /// sntctl network unisolate
+    NetworkUnisolate,
     /// sntctl config validate
     ConfigValidate,
     /// Manual process unfreeze

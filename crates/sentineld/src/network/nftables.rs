@@ -19,9 +19,9 @@ impl NftablesManager {
         let setup_cmd = format!(
             "nft add table inet sentinel 2>/dev/null; \
              nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
-             nft add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {}{} 2>/dev/null; \
-             nft add rule inet sentinel output ct state established,related accept 2>/dev/null; \
-             nft add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{} 2>/dev/null",
+             nft add rule inet sentinel output 'meta mark & 0xff800000 == 0x5e800000 counter queue num {}{}' 2>/dev/null; \
+             nft add rule inet sentinel output 'ct state established,related accept' 2>/dev/null; \
+             nft add rule inet sentinel output 'ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{}' 2>/dev/null",
             SENTINEL_NFQUEUE_NUM, bypass_str, SENTINEL_NFQUEUE_NUM, bypass_str
         );
 

@@ -16,12 +16,24 @@ pub enum ProcessAction {
     Lineage {
         tgid: u32,
     },
+    /// Safely terminate a process with anti-PID-reuse verification
+    Kill {
+        tgid: u32,
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Suspend a process for forensic inspection
+    Suspend {
+        tgid: u32,
+    },
 }
 
 pub async fn run_process(socket_path: &Path, action: ProcessAction, json_output: bool) -> anyhow::Result<()> {
-    let cmd = match action {
-        ProcessAction::Inspect { tgid } => IpcCommand::ProcessInspect { tgid },
-        ProcessAction::Lineage { tgid } => IpcCommand::ProcessLineage { tgid },
+    let cmd = match &action {
+        ProcessAction::Inspect { tgid } => IpcCommand::ProcessInspect { tgid: *tgid },
+        ProcessAction::Lineage { tgid } => IpcCommand::ProcessLineage { tgid: *tgid },
+        ProcessAction::Kill { tgid, reason } => IpcCommand::ProcessKill { tgid: *tgid, reason: reason.clone() },
+        ProcessAction::Suspend { tgid } => IpcCommand::ProcessSuspend { tgid: *tgid },
     };
 
     let resp = send_command(socket_path, cmd).await?;
@@ -30,12 +42,18 @@ pub async fn run_process(socket_path: &Path, action: ProcessAction, json_output:
             if json_output {
                 print_json(&data)?;
             } else {
-                print_header("Process Inspection");
-                print_json(&data)?;
+                match action {
+                    ProcessAction::Kill { tgid, .. } => println!("Process {} successfully terminated", tgid),
+                    ProcessAction::Suspend { tgid } => println!("Process {} successfully suspended", tgid),
+                    _ => {
+                        print_header("Process Inspection");
+                        print_json(&data)?;
+                    }
+                }
             }
         }
         IpcResponse::Error { code, message } => {
-            eprintln!("Error inspecting process [{}]: {}", code, message);
+            eprintln!("Error executing process action [{}]: {}", code, message);
         }
         _ => {
             println!("Unexpected response: {:?}", resp);

@@ -53,9 +53,20 @@ impl NetworkBlockManager {
         let mut contained = self.is_contained.write().unwrap();
         *contained = enabled;
         if enabled {
-            warn!("EMERGENCY: Host network containment ENABLED! All outbound traffic blocked.");
+            warn!("EMERGENCY: Host network containment ENABLED! All outbound traffic blocked except loopback.");
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("nft add rule inet sentinel output oifname != \"lo\" counter drop 2>/dev/null")
+                .status();
         } else {
             info!("Host network containment disabled. Normal network policy restored.");
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("nft flush chain inet sentinel output 2>/dev/null; \
+                      nft add rule inet sentinel output 'meta mark & 0xff800000 == 0x5e800000 counter queue num 100 bypass' 2>/dev/null; \
+                      nft add rule inet sentinel output 'ct state established,related accept' 2>/dev/null; \
+                      nft add rule inet sentinel output 'ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass' 2>/dev/null")
+                .status();
         }
     }
 

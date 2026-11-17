@@ -122,18 +122,44 @@ enum Commands {
     },
 }
 
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
 
+    let is_root = is_root();
+
     match cli.command {
         Commands::Status => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let default_sock = if is_root {
+                DEFAULT_PRIVILEGED_SOCKET
+            } else {
+                DEFAULT_READONLY_SOCKET
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_status(&sock, json).await?
         }
         Commands::Health => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let default_sock = if is_root {
+                DEFAULT_PRIVILEGED_SOCKET
+            } else {
+                DEFAULT_READONLY_SOCKET
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_health(&sock, json).await?
         }
         Commands::Doctor => run_doctor().await?,
@@ -158,11 +184,19 @@ async fn main() -> anyhow::Result<()> {
             run_rules(&sock, action, json).await?
         }
         Commands::Process { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let default_sock = match action {
+                ProcessAction::Kill { .. } | ProcessAction::Suspend { .. } => DEFAULT_PRIVILEGED_SOCKET,
+                _ => DEFAULT_READONLY_SOCKET,
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_process(&sock, action, json).await?
         }
         Commands::Network { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let default_sock = match action {
+                NetworkAction::Isolate | NetworkAction::Unisolate => DEFAULT_PRIVILEGED_SOCKET,
+                _ => DEFAULT_READONLY_SOCKET,
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_network(&sock, action, json).await?
         }
         Commands::Config { action } => run_config(action).await?,
