@@ -97,7 +97,7 @@ impl NeverFreezeChecker {
         }
 
         // Sentinel infrastructure tools
-        if exe_name == "sntctl" || exe_name == "sentinelctl" || exe_name == "sentinel-gui" {
+        if exe_name == "sntctl" || exe_name == "sentinelctl" {
             return true;
         }
 

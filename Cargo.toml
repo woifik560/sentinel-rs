@@ -5,7 +5,6 @@ members = [
     "crates/sentinel-ebpf",
     "crates/sentineld",
     "crates/sntctl",
-    "crates/sentinel-gui",
 ]
 
 [workspace.package]

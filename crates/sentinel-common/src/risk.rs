@@ -131,6 +131,53 @@ impl RiskScore {
     }
 }
 
+/// Severity levels matching Part 9 of the specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SeverityLevel {
+    /// 0–29: Routine system operations
+    Low,
+    /// 30–49: Minor anomalies or single unverified events
+    Guarded,
+    /// 50–69: Moderate behavioral concern
+    Medium,
+    /// 70–84: High confidence suspicious activity
+    High,
+    /// 85–94: Critical threat requiring immediate autonomous containment
+    Critical,
+    /// 95–100: Severe confirmed attack or tampering
+    Severe,
+}
+
+impl SeverityLevel {
+    pub fn from_score(score: u32) -> Self {
+        match score {
+            0..=29 => SeverityLevel::Low,
+            30..=49 => SeverityLevel::Guarded,
+            50..=69 => SeverityLevel::Medium,
+            70..=84 => SeverityLevel::High,
+            85..=94 => SeverityLevel::Critical,
+            _ => SeverityLevel::Severe,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SeverityLevel::Low => "LOW",
+            SeverityLevel::Guarded => "GUARDED",
+            SeverityLevel::Medium => "MEDIUM",
+            SeverityLevel::High => "HIGH",
+            SeverityLevel::Critical => "CRITICAL",
+            SeverityLevel::Severe => "SEVERE",
+        }
+    }
+}
+
+impl fmt::Display for SeverityLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Verdict classification tiers from the Verdict Router (ТЗ 3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {

@@ -6,7 +6,9 @@
 
 pub mod config;
 pub mod events;
+pub mod health;
 pub mod incident;
 pub mod ipc;
+pub mod policy;
 pub mod process;
 pub mod risk;

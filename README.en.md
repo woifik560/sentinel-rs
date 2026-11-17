@@ -1,279 +1,188 @@
 # Sentinel-RS
 
-**eBPF Desktop Anti-Stealer & Deterministic Context-Aware Firewall for Linux**
+**Autonomous Headless Linux HIPS / EDR Agent Powered by eBPF LSM and Rust**
 
 [![Language: Rust](https://img.shields.io/badge/Language-Rust_2021-orange.svg?logo=rust)](https://www.rust-lang.org/)
-[![Kernel: eBPF LSM](https://img.shields.io/badge/Kernel-eBPF_LSM_(Linux_6.x%2B)-blue.svg?logo=linux)](https://ebpf.io/)
-[![GUI: Slint](https://img.shields.io/badge/GUI-Slint_UI-blueviolet.svg)](https://slint.dev/)
-[![Engine: Deterministic Risk](https://img.shields.io/badge/Engine-Causal_Lineage_%26_Risk-brightgreen.svg)](https://github.com/woifik560/sentinel-rs)
-[![Memory: < 30 MB](https://img.shields.io/badge/RAM-%3C_30_MB-success.svg)](#key-features)
-[![Platform: Linux 6.x+](https://img.shields.io/badge/Platform-Linux_6.x%2B_(Debian_%7C_Arch_%7C_Fedora_%7C_NixOS)-blue.svg?logo=linux)](#kernel-setup--bpf-lsm-configuration)
+[![Kernel: eBPF LSM](https://img.shields.io/badge/Kernel-eBPF_LSM_(Linux_5.10%2B)-blue.svg?logo=linux)](https://ebpf.io/)
+[![Architecture: Headless HIPS/EDR](https://img.shields.io/badge/Architecture-Headless_EDR-green.svg)](#architecture)
+[![Engine: Deterministic Risk](https://img.shields.io/badge/Engine-Causal_Lineage_%26_Risk-brightgreen.svg)](docs/ARCHITECTURE.md)
+[![Memory: < 25-30 MB](https://img.shields.io/badge/RAM-%3C_25--30_MB-success.svg)](docs/PERFORMANCE.md)
+[![Tests: 95 Passing](https://img.shields.io/badge/Tests-95_Passed-brightgreen.svg)](docs/TESTING.md)
 
 **English** | [Русский](README.md)
 
 ---
 
-## About the Project (Version 2.1)
+## About the Project (Version 0.2.1)
 
-**Sentinel-RS** is an ultra-lightweight host firewall and integrity monitor for Linux Desktop specifically engineered for **deterministic prevention of unauthorized credential exfiltration** by unprivileged user-space processes and Infostealers.
+**Sentinel-RS** is an ultra-lightweight, high-performance, fully autonomous **Headless Host Intrusion Prevention System (HIPS)** and **Endpoint Detection and Response (EDR)** security agent for Linux systems (supporting both Linux Server and Linux Desktop platforms).
 
-### Threat Model Boundaries
-Sentinel-RS protects sensitive user data (`~/.ssh`, browser profiles/cookies, Telegram `tdata`, cryptocurrency wallets) from malicious code executed under the same user UID (including npm/pip/cargo build scripts, phishing payloads, and browser extensions):
-* **Within Scope**: Isolation of unprivileged user processes, taint-tracking across pipes, AF_UNIX sockets, and `ptrace`, network hold on new and pre-opened connections, cryptographic integrity enforcement.
-* **Out of Scope / Architectural Constraints**:
-  * *Root Compromise*: If malware gains root access (`sudo` or kernel exploitation), host security is fundamentally compromised at the kernel level.
-  * *X11 Session Limitations*: In X11 sessions, process window and input isolation are absent by design (`XGetImage`, key snooping). Sentinel-RS mitigates clickjacking with a one-time PIN and lockout after 3 failed attempts, but **Wayland is required for complete graphical isolation**.
-
-Unlike traditional packet filters (`iptables`, `nftables`, `ufw`) that lack data provenance context, or bloated endpoint agents with opaque heuristics or nondeterministic LLMs, Sentinel-RS combines:
-1. **eBPF In-Kernel Object Storage**:
-   - Replaces legacy PID/TGID maps with `BPF_MAP_TYPE_TASK_STORAGE`, `BPF_MAP_TYPE_INODE_STORAGE`, and `BPF_MAP_TYPE_SK_STORAGE`. This eliminates memory leaks and PID reuse race conditions.
-   - **Cross-Thread Taint Propagation (`task->group_leader`)**: Taint state is anchored to the thread group leader, ensuring that if Thread A reads a secret, network sockets across all sibling threads (Go goroutines, Tokio, Python, Node.js) are immediately blocked.
-2. **End-to-End Data Flow Taint Tracking & Anti-Bypass Hooks**:
-   - `lsm/file_permission`: Tracks secret leakage across pipes (`cat ~/.ssh/id_rsa | curl ...`), FIFOs, and temporary files (`/tmp`).
-   - `lsm/file_receive`: Tracks file descriptor passing between processes via `SCM_RIGHTS` over AF_UNIX domain sockets.
-   - `lsm/mmap_file`: Tracks memory mappings of protected files; blocks execution (`PROT_EXEC`) on anonymous or tainted memory while maintaining full compatibility with legitimate JIT runtimes (V8, SpiderMonkey, JVM, Node.js).
-   - `lsm/unix_may_send` & `LineageTracker`: Prevents taint laundering across AF_UNIX sockets and closes D-Bus broker escapes (`systemd-run`, `org.freedesktop.systemd1`, portals) by causal lineage linking.
-   - `lsm/ptrace_access_check` & Kernel Self-Defense: Blocks `ptrace`, `process_vm_readv/writev`, and `/proc/<pid>/mem` access against both `sentineld` and `sentinel-gui` from any process running under the same user UID.
-3. **Harmonized Network Hook Ordering & Fast-Path / Slow-Path Separation**:
-   - *Kernel Hook Ordering*: Accounts for the fact that `cgroup_skb/egress` executes in `ip_finish_output()` (after Netfilter output/postrouting chains). Sentinel-RS applies a two-phase architecture:
-     1. In `lsm/socket_sendmsg` syscall context: returns `-EPERM` immediately for HIGH-risk processes, preventing packet creation.
-     2. In `cgroup/sendmsg4|6`, `cgroup/connect4|6`, and `sock_ops`: sets `SO_MARK` via `bpf_setsockopt` directly on the socket structure **before** Netfilter traversal.
-     3. In `cgroup_skb/egress`: immediately drops packets (`return 0`) as a hardware-like fail-safe for tainted tasks with queued packets.
-   - *Synchronous Dynamic Mark Correlation with Zero Bit Collisions*:
-     - Bits `[31:24]` = `0x5E` (Sentinel magic byte)
-     - Bit `[23]` = `0x00800000` (`REVAL_PREOPENED` flag)
-     - Bits `[22:0]` = `flow_id` (up to 8.3M active concurrent flows)
-     - New flow mark: `0x5E000000 | flow_id`
-     - Revalidation mark: `0x5E800000 | flow_id`
-     - In-kernel context is synchronously saved in `flow_mark_ctx` map by `flow_id` before packet departure.
-   - *Netfilter Rules with Queue Bypass Resilience*:
-     1. `meta mark & 0xff800000 == 0x5e800000 counter queue num 100 bypass` (Reval Pre-Opened)
-     2. `ct state established,related accept` (Line-speed kernel fast-path)
-     3. `ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass` (New SYN hold)
-     The `bypass` flag ensures that if the daemon is stopped or crashes, system network traffic is not locked up indefinitely.
-   - **Hybrid Kernel Watchdog (Fail-Safe for Clean + Fail-Close for Tainted)**:
-     - eBPF program pinning in `/sys/fs/bpf/sentinel/`: programs remain active in-kernel even if `sentineld` crashes.
-     - Heartbeat timer in `BPF_MAP_TYPE_ARRAY`: daemon updates timestamp every 500 ms.
-     - Smart kernel degradation in `lsm/socket_sendmsg` and `cgroup_skb/egress`: if the daemon is unresponsive for > 2.0s, clean processes (`taint == 0`) continue normally without disruption (Fail-Safe), while tainted processes (`taint != 0`) are immediately blocked by the kernel with `-EPERM` (Fail-Close), preventing credential exfiltration even during daemon downtime.
-4. **Distro-Agnostic Package Integrity in Pure Rust & Scoped Taint**:
-   - **Pure-Rust Multi-Backend with O(1) In-Memory Indexing**:
-     - Arch Linux / Manjaro / EndeavourOS (`pacman`): reads `mtree` archives via `flate2` and extracts recorded SHA-256 digests. Memoized in an in-memory `HashMap` index for `O(1)` userspace lookups without repeated decompression.
-     - Fedora / RHEL / CentOS / openSUSE (`rpm`): direct query of SQLite DB `/var/lib/rpm/rpmdb.sqlite` and manifests with `O(1)` in-memory caching.
-     - NixOS: validates immutable `/nix/store/<hash>-name` paths, `root:root` ownership, and `MS_RDONLY` mount flag.
-     - Immutable OSes (Fedora Silverblue, SteamOS, VanillaOS): validates read-only filesystem mounts (`ostree`, `composefs`, `erofs`) and `fs-verity` digests.
-     - Debian / Ubuntu (`dpkg`): parses `/var/lib/dpkg/info/*.md5sums` and status in pure Rust without external CLI invocations, cached in `O(1)` memory table.
-   - **In-Kernel Verification Caching (`BPF_MAP_TYPE_INODE_STORAGE`)**:
-     - `TRUSTED_SYSTEM_PKG` status and inode version (`i_version`) cached directly in kernel memory; any write operation (`MAY_WRITE`) instantly invalidates trust.
-     - Sleepable hooks (`lsm.s/bprm_committed_creds`) leverage kernel kfunc `bpf_get_file_hash()` (`fs-verity`), explicitly annotated for `BPF_F_SLEEPABLE` context.
-   - **Scoped Taint Domains (`u64 taint_mask`)**:
-     - Bitmask domains: `BIT_SSH_KEYS`, `BIT_CLOUD_CREDS`, `BIT_CHROMIUM_DATA`, `BIT_FIREFOX_DATA`, `BIT_TELEGRAM_DATA`, `BIT_CRYPTO_WALLETS`.
-     - **Anti-Spoofing Owner Policy**: legitimate owner privilege (`is_secret_owner = true`) is granted **strictly upon satisfying all 3 conditions simultaneously**:
-       1. Domain profile match (`BIT_CHROMIUM_DATA` for Chrome, `BIT_FIREFOX_DATA` for Firefox, etc.).
-       2. Launch from privileged system directories (`/usr/`, `/opt/`, `/bin/`, `/lib/`) with verified package or inode integrity (`is_trusted_system_pkg == true` or `inode_uid == 0 && (inode_mode & 0o022) == 0`).
-       3. Uncompromised process environment (no memfd loaders or anonymous execution). Fake binaries in `~/.local` or `/tmp` immediately trigger `SECRET_NON_OWNER` (+40 risk score)!
-     - **Downward-Only Taint Propagation**: IDE terminal shells and build runners (`cargo build`, `npm install`) inherit taint downward, never contaminating the parent IDE (VSCode / JetBrains).
-5. **Zero-Userspace Trust GUI Attestation & Covert Channel Defense**:
-   - **In-Kernel Attestation at Launch (`lsm/bprm_committed_creds`)**:
-     - Daemon registers `(dev, ino)` of `/usr/bin/sentinel-gui`. BPF LSM stamps `is_verified_gui = 1` in `TASK_STORAGE`.
-   - **Process Memory Sealing via Inode Attribute Whitelist (`lsm/mmap_file` & `lsm/file_mprotect`)**:
-     - Replaces fragile path blacklists (which can be bypassed via `~/.cache`, `/var/tmp`, `/run/user/$UID`) with an **inode attribute whitelist**: mapped `.so` files must be owned by `root` (`inode_uid == 0`) with no group/world write bits (`(mode & 0o022) == 0`).
-     - Intercepting `lsm/file_mprotect` blocks two-step injection (`mmap(RW) -> mprotect(RX)`) and anonymous execution, immediately revoking `is_verified_gui = 0` and returning `-EPERM`.
-   - **Direct Kernel Gate in `lsm/unix_stream_connect`**:
-     - Any `connect()` to `/run/sentinel/sentinel.sock` is verified in the kernel: unverified callers receive `-EACCES` directly without waking userspace.
-   - **Staging Attack & Adaptive Anti-Chunking DNS Tunneling Defense**:
-     - Intermediate files (`~/.cache/benign.dat`) inherit secret taint masks via `INODE_STORAGE` on `MAY_WRITE`, infecting subsequent readers.
-     - **Adaptive DNS Thresholds**: clean processes checked with `len > 40 && entropy > 3.8` (no CDN false positives); tainted processes checked with reduced threshold `len >= 16 && entropy > 3.4`.
-     - **Cumulative DNS Tracker in TASK_STORAGE**: tainted processes sending `>= 3` suspicious queries or accumulating `>= 48` bytes in subdomains trigger `RuleId::CovertDnsTunnel` (+50 risk score) and packet drop.
-   - **Linux 6.x Strict eBPF Verifier Compliance**:
-     - Kernel code in `sentinel-ebpf` is `#![no_std]` integer-only without floating-point instructions (`f32`/`f64`), passing strict BPF Verifier constraints.
-6. **Never-Freeze Allowlist & DoS Defense**:
-   - Hardcoded protection list (PID 1, `systemd*`, `dbus*`, `gnome-shell`, `kwin*`, `sway`, `hyprland`, `pipewire`, `NetworkManager`, `sntctl`).
-   - Anti-Spoofing: Validation strictly based on `(dev, inode)` and canonical binary path. Spoofing `comm` via `prctl(PR_SET_NAME)` is ignored.
-   - NFQUEUE queue saturation defense (`pending_queue_size = 512`, duplicate SYN retransmit aggregation, `AllowForDuration` temporary approval).
-   - **Kernel Requirements & CVE-2026-64192**: Checking for `bpf` presence in `/sys/kernel/security/lsm` on kernels 6.1.184+ provides verified protection against CVE-2026-64192, as the kernel patch secures `map_type_inode_storage` operations.
-
-> **V2.1 Architectural Rule:** 100% Pure Rust. Zero C/Python runtime dependencies, zero LLMs in the security critical loop! Deterministic scoring in **< 1 millisecond**, memory footprint **< 25–30 MB RAM**.
+The agent operates as a background `systemd` daemon service (`sentineld`) managed via the `sntctl` command-line utility. The project has **zero graphical dependencies** (no X11, Wayland, Slint, GUI authentications, or interactive popup prompts). All threat prevention, detection, and containment decisions are evaluated **deterministically and autonomously** without requiring human intervention.
 
 ---
 
-## Kernel Setup & BPF LSM Configuration
+## Core Capabilities
 
-Sentinel-RS requires Linux 6.x BPF LSM hooks enabled at kernel boot.
+1. **Kernel-Space Enforcement (eBPF & BPF LSM)**:
+   - Early interception via BPF LSM hooks (`bprm_check_security`, `file_open`, `file_permission`, `mmap_file`, `ptrace_access_check`, `unix_may_send`, `socket_connect`).
+   - Kernel object storages (`task_storage`, `sk_storage`) and high-throughput BPF RingBuffer.
+   - Fileless execution detection (`memfd_create`, anonymous `PROT_EXEC`) and cross-process memory snooping prevention (`ptrace`, `/proc/<pid>/mem`, `process_vm_readv`).
 
-### Universal Automatic Setup (`sntctl setup-kernel`):
-Sentinel-RS includes a built-in automated kernel bootloader configuration tool:
-```bash
-sudo sntctl setup-kernel
+2. **Causal Data-Flow Taint Tracking**:
+   - Automatically marks tasks as Tainted upon touching credentials (`/etc/shadow`, `~/.ssh/id_*`, cloud metadata, password stores).
+   - Propagates taint across `fork`/`clone`, anonymous pipes, FIFOs, `SCM_RIGHTS` descriptors, and AF_UNIX domain sockets.
+   - Prevents taint laundering through intermediate background brokers.
+
+3. **Causal Process Lineage DAG**:
+   - Maintains an in-memory directed acyclic graph of all processes in userspace.
+   - Tracks full ancestor chains (`ancestor_chain`) up to PID 1.
+   - Anti-PID-reuse guarantee using process start timestamps from `/proc/<pid>/stat`.
+
+4. **Deterministic Risk Engine**:
+   - Calculates normalized risk scores ($0 \le S \le 100$).
+   - Rolling window evidence deduplication.
+   - Exponential risk decay with a 5-minute half-life ($T_{1/2} = 300\text{s}$).
+   - Multi-stage attack compounding multipliers (up to $1.6\times$ for full MITRE ATT&CK progression).
+
+5. **Six-Stage Autonomous Policy Engine**:
+   1. *Stage 1 (Safety Invariant)*: Absolute immunity for PID 1, PID 2, and the `sentineld` daemon.
+   2. *Stage 2 (Protected Resources)*: Kernel and core system path integrity protection.
+   3. *Stage 3 (Admin Deny)*: Explicit administrator blacklists.
+   4. *Stage 4 (Admin Allow)*: Explicit administrator whitelists.
+   5. *Stage 5 (Behavior Detection)*: High-confidence behavioral detection matches.
+   6. *Stage 6 (Operating Mode Defaults)*: Default action matrices for `AUDIT`, `BALANCED`, `STRICT`, and `CUSTOM` modes.
+
+6. **Automated Response Engine**:
+   - Two-phase safe process termination (`SIGSTOP` $\rightarrow$ verify `/proc/<pid>/stat` $\rightarrow$ `SIGTERM` $\rightarrow$ `SIGKILL`).
+   - Process suspension for forensic live-memory triage.
+   - Dynamic netfilter IP blocking and emergency host network isolation via `nftables` (preserving local loopback and management IPC).
+
+7. **Secure Management CLI & IPC**:
+   - Headless administration exclusively via `sntctl`.
+   - Kernel-enforced peer credential authentication (`SO_PEERCRED`) over `/run/sentinel/sentinel.sock` (RBAC: `RootAdmin`, `Operator`, `ReadOnly`).
+
+8. **Ultra-Low Resource Footprint**:
+   - 100% pure Rust (Zero C/Python runtimes, Zero LLM in security hotpath).
+   - Resident Memory: **$< 25\text{--}30\text{ MB}$ RSS**.
+   - Evaluation Latency: **$< 1\text{ ms}$**.
+
+---
+
+## Workspace Architecture
+
 ```
-The command automatically:
-1. Queries `/sys/kernel/security/lsm` for active LSM modules.
-2. **Dynamically preserves all existing LSMs** (`apparmor`, `selinux`, `yama`, `lockdown`, `integrity`, `landlock`), appending `,bpf` without duplication.
-3. Automatically identifies and updates the active bootloader:
-   - **RHEL / Fedora / CentOS / AlmaLinux**: `grubby --update-kernel=ALL --args="lsm=..."`
-   - **Pop!_OS / Ubuntu (systemd-boot)**: `kernelstub -a "lsm=..."`
-   - **Arch Linux / systemd-boot**: Patches `/boot/loader/entries/*.conf`
-   - **Debian / Ubuntu / openSUSE (GRUB)**: Automatically updates `GRUB_CMDLINE_LINUX` in `/etc/default/grub` and invokes `update-grub` / `grub2-mkconfig`.
-4. Reboot the system to activate: `sudo reboot`.
-
-### Manual Setup for Ubuntu / Debian (GRUB):
-1. Open `/etc/default/grub` with root privileges:
-   ```bash
-   sudo nano /etc/default/grub
-   ```
-2. Ensure `bpf` is included in the `lsm` boot parameter under `GRUB_CMDLINE_LINUX`:
-   ```bash
-   GRUB_CMDLINE_LINUX="lsm=landlock,lockdown,yama,apparmor,bpf"
-   ```
-3. Update GRUB and reboot:
-   ```bash
-   sudo update-grub
-   sudo reboot
-   ```
-4. Verify BPF LSM activation:
-   ```bash
-   cat /sys/kernel/security/lsm
-   # 'bpf' must be present in the output
-   ```
-
----
-
-## Architecture Diagram
-
-```mermaid
-flowchart TD
-    subgraph Kernel["LINUX KERNEL (eBPF LSM, Tracepoints & Netfilter)"]
-        LSM_BPRM["lsm/bprm_check_security<br/>(Early profiling & memfd/anon exec detection)"]
-        LSM_FILE["lsm/file_open & file_permission<br/>(Sub-microsecond fast-path & pipe taint)"]
-        LSM_MMAP["lsm/mmap_file<br/>(Blocks PROT_EXEC on anon/tainted memory)"]
-        LSM_RECV["lsm/file_receive<br/>(Intercepts SCM_RIGHTS FD transfers in AF_UNIX)"]
-        LSM_UNIX["lsm/unix_may_send<br/>(D-Bus & systemd broker isolation)"]
-        LSM_PTRACE["lsm/ptrace_access_check<br/>(Protects GUI & daemon from same-UID ptrace/mem snooping)"]
-        
-        DYNAMIC_MARK["Synchronous eBPF Map:<br/>flow_mark_ctx (flow_id -> FlowContext)"]
-        NFQUEUE_HOOK["Netfilter / nftables<br/>1. meta mark & 0xff800000 == 0x5e800000 (Reval Pre-Opened)<br/>2. ct state established,related accept<br/>3. meta mark & 0xff800000 == 0x5e000000 (NFQUEUE SYN Hold)"]
-        
-        LSM_BPRM --> DYNAMIC_MARK
-        LSM_FILE --> DYNAMIC_MARK
-        LSM_MMAP --> DYNAMIC_MARK
-        DYNAMIC_MARK --> NFQUEUE_HOOK
-    end
-
-    subgraph Daemon["BACKGROUND DAEMON (sentineld, root, < 30 MB RAM)"]
-        MAP_READER["Synchronous reading of flow_mark_ctx by flow_id<br/>(Zero race condition against RingBuffer)"]
-        
-        subgraph Engine["Deterministic Security Engine"]
-            LINEAGE["Lineage Tracker (LRU graph 8192 nodes)"]
-            DPKG["Dpkg Checker & SHA-256 Cache<br/>(Verified against /var/lib/dpkg/info/*.md5sums & SHA-256)"]
-            RISK["Risk Engine (0..100 in < 1 ms)<br/>(LoLBin Hardening: Disallows trust discount upon Taint)"]
-            ROUTER{"Verdict Router"}
-        end
-
-        NF_MGR["NFQUEUE Aggregator & Orchestrator<br/>(SYN retransmit collapse, AllowForDuration)"]
-        SAFETY["Never-Freeze Allowlist<br/>(Protects PID 1, systemd, dbus, wayland, sntctl)"]
-        
-        subgraph Sockets["Dual Sockets with Privilege Separation"]
-            RO_SOCK["/run/sentinel/sentinel-ro.sock (0666)<br/>Read-Only: Status, monitoring, exports"]
-            MGMT_SOCK["/run/sentinel/sentinel.sock (0666)<br/>Privileged: SO_PEERCRED, exe, /proc/maps, PIN"]
-        end
-
-        MAP_READER --> LINEAGE
-        LINEAGE --> RISK
-        DPKG --> RISK
-        RISK --> ROUTER
-        
-        ROUTER -->|0..39: LOW| ALLOW["Accept & Audit Log"]
-        ROUTER -->|40..74: GREY| NF_MGR
-        ROUTER -->|75..100: HIGH| BLOCK["NF_DROP / TCP RST + Optional SIGKILL"]
-        
-        NF_MGR <--> SAFETY
-        NF_MGR <--> MGMT_SOCK
-    end
-
-    subgraph Clients["USER SPACE CLIENTS"]
-        CLI["Terminal CLI: sntctl<br/>(watch, monitor, status, export)"]
-        GUI["Native Slint GUI: sentinel-gui<br/>(Alerts, Breadcrumbs, X11 PIN protection)"]
-    end
-
-    Kernel -->|NFQUEUE Packets| NF_MGR
-    NF_MGR -->|Verdicts NF_ACCEPT / NF_DROP| Kernel
-    RO_SOCK -->|Event Monitoring| CLI
-    MGMT_SOCK <-->|Interactive Verdicts| GUI
-    MGMT_SOCK <-->|watch / unfreeze| CLI
+crates/
+├── sentinel-common/    # Shared data types, events, IPC messages, policy enums
+├── sentinel-ebpf/      # Kernel eBPF programs, BPF LSM hooks, maps, RingBuffer
+├── sentineld/          # Privileged host security daemon (HIPS/EDR Engine)
+│   ├── src/collector/  # Kernel event ingestion and normalization
+│   ├── src/lineage/    # Process lineage graph (DAG) and anti-PID-reuse
+│   ├── src/behavior/   # Behavioral detection rules
+│   ├── src/risk/       # Deterministic risk engine and half-life decay
+│   ├── src/policy/     # 6-stage autonomous policy engine
+│   ├── src/response/   # Response orchestrator (Kill, Suspend, NetBlock)
+│   ├── src/incidents/  # Incident lifecycle management and correlation
+│   ├── src/storage/    # Async SQLite storage in WAL mode
+│   ├── src/health/     # Subsystem health monitoring and sd_notify watchdog
+│   └── src/ipc/        # SO_PEERCRED RBAC IPC server
+└── sntctl/             # CLI management client
 ```
 
 ---
 
-## Risk Scoring Weights
+## Quick Start
 
-| Rule | Weight | Description |
-|---|:---:|---|
-| `COVERT_DNS_TUNNEL` | **+50** | Covert DNS tunneling exfiltration (Shannon entropy > 3.8, subdomain > 40 chars) |
-| `FILELESS_MEMFD` | **+50** | Anonymous memory execution (`memfd_create`) |
-| `FILELESS_ANON_EXEC` | **+35** | Memory execution via `mmap` with `PROT_EXEC` on deleted/tmpfs file |
-| `SECRET_NON_OWNER` | **+40** | Unauthorized secret access or taint inherited via pipe/file/SCM_RIGHTS |
-| `UNTRUSTED_BINARY_ORIGIN` | **+25** | Executable launched from `/tmp`, `/dev/shm`, `~/Downloads`, or unverified in system packages |
-| `SUSPICIOUS_SCRIPT_EXECUTION` | **+25** | Script execution from anonymous sources, stdin, or suspicious flags |
-| `SUSPICIOUS_INTERPRETER` | **+20** | Interpreter launched with inline code (`-c`, `-e`), eval, base64, or pipe |
-| `FIRST_SEEN_DESTINATION` | **+15** | First connection to external public IP outside RFC1918 / loopback |
-| `FAST_EXFIL_BURST` | **+15** | Network connection initiated within <= 5s of secret access |
-| `RAW_IP_CONNECT` | **+10** | Direct IP connection without preceding DNS query |
-| `TRUSTED_PACKAGE_CONTEXT` | **-35** | Binary verified in system package manager by SHA-256 (**Disallowed upon Taint or pipe!**) |
+### System Requirements
+- Linux kernel $\ge 5.10$ (recommended $\ge 6.1$) with BPF LSM enabled (`lsm=...,bpf`).
+- Required packages: `libelf`, `nftables`, `sqlite3`.
 
----
-
-## CLI Usage (`sntctl`)
-
-Renamed from `sentinelctl` to `sntctl` to prevent namespace collision with SentinelOne:
-
+### Building from Source
 ```bash
-# Universal automatic kernel bootloader setup for BPF LSM (any distro) [Requires Root]
-sudo sntctl setup-kernel
+git clone https://github.com/woifik560/sentinel-rs.git
+cd sentinel-rs
 
-# Real-time interactive triage (for servers and SSH) [Requires Root]
-sudo sntctl watch
+# Build release binaries
+cargo build --release
+```
 
-# Live firewall event monitor [Read-Only, no root needed]
-sntctl monitor
+### System Installation & Service Launch
+```bash
+# Install binaries and default configs
+sudo install -m 0755 target/release/sentineld /usr/local/bin/
+sudo install -m 0755 target/release/sntctl /usr/local/bin/
+sudo mkdir -p /etc/sentinel /var/lib/sentinel /run/sentinel
+sudo cp config/config.toml /etc/sentinel/
+sudo cp config/rules.toml /etc/sentinel/
+sudo cp config/sentineld.service /etc/systemd/system/
 
-# Check daemon health and statistics [Read-Only, no root needed]
+# Enable and start daemon
+sudo systemctl daemon-reload
+sudo systemctl enable --now sentineld.service
+```
+
+### Verification
+```bash
+# Run environment diagnostics
+sudo sntctl doctor
+
+# Check daemon status
 sntctl status
 
-# Unfreeze process [Requires Root]
-sudo sntctl unfreeze <TGID>
-
-# Export forensic incident report as JSON [Read-Only]
-sntctl export <INCIDENT_ID> --format json
-
-# Manage application whitelist
-sntctl whitelist list
-sudo sntctl whitelist add /usr/bin/curl
-
-# Run full system diagnostics and security preflight
-sntctl doctor
+# Check subsystem health metrics
+sntctl health
 ```
 
 ---
 
-## Testing & CI (Two-Layer Verification)
+## CLI Usage Examples (`sntctl`)
 
-To guarantee absolute defense resilience against advanced evasion techniques, Sentinel-RS employs a two-tier verification architecture:
+```bash
+# Query protection status
+sntctl protection status
 
-1. **Fast Adversarial Userspace E2E Suite (< 1s)**:
-   - Run locally or in CI via `cargo test --workspace --tests`.
-   - Contains 22 real-world attack scenarios in `adversarial_e2e.rs` alongside stress tests in `red_team.rs`:
-     - Pipe taint inheritance (`cat ~/.ssh/id_rsa | curl ...`) and AF_UNIX `SCM_RIGHTS` FD passing.
-     - Established socket bypass evasion (revalidation mark `0x5E800000 | flow_id`).
-     - Anonymous mmap / memfd injection blocking and GUI memory sealing.
-     - In-kernel `INODE_STORAGE` cache invalidation upon file modifications.
-     - Adaptive chunked DNS tunneling detection (Shannon entropy & cumulative byte threshold).
+# Stream live audit events
+sntctl events tail
 
-2. **Ring-0 In-Kernel Testing in Real Linux 6.x (QEMU/KVM via `vmtest`)**:
-   - Automated CI job in GitHub Actions (`.github/workflows/ci.yml`) running on `ubuntu-24.04`.
-   - Utilizes `vmtest` to launch a lightweight QEMU virtual machine booted into a real Linux 6.8 kernel with `lsm=landlock,lockdown,yama,bpf`.
-   - Validates live in-kernel RingBuffer initialization, `BPF_MAP_TYPE_TASK_STORAGE` / `INODE_STORAGE` maps, `/sys/fs/bpf/sentinel` bpffs pinning, and strict preflight verification against CVE-2026-64192.
-   - Run locally by developers:
-     ```bash
-     cargo install vmtest --locked
-     vmtest
-     ```
+# List detected incidents
+sntctl incidents list
 
+# View detailed incident forensics
+sntctl incidents show <INCIDENT_ID>
+
+# Inspect process lineage DAG
+sntctl process inspect <PID>
+sntctl process lineage <PID>
+
+# Hot-reload policy rules
+sudo sntctl policy reload
+
+# Emergency host containment
+sudo sntctl network isolate
+
+# Restore network connectivity
+sudo sntctl network unisolate
+```
+
+---
+
+## Technical Documentation
+
+Comprehensive documentation is available in [`docs/`](docs/):
+- [Architecture Specification](docs/ARCHITECTURE.md)
+- [Security Model & RBAC](docs/SECURITY_MODEL.md)
+- [Threat Model & MITRE Mapping](docs/THREAT_MODEL.md)
+- [Installation Guide](docs/INSTALLATION.md)
+- [Configuration Reference](docs/CONFIGURATION.md)
+- [IPC Protocol Specification](docs/IPC_PROTOCOL.md)
+- [eBPF & Kernel Compatibility](docs/EBPF_COMPATIBILITY.md)
+- [Policy Engine Precedence](docs/POLICY_ENGINE.md)
+- [Incident Response & Forensics](docs/INCIDENT_RESPONSE.md)
+- [Troubleshooting & Diagnostics](docs/TROUBLESHOOTING.md)
+- [Testing & Verification Methodology](docs/TESTING.md)
+- [Performance & Resource Budgets](docs/PERFORMANCE.md)
+
+---
+
+## License
+
+Licensed under the MIT License.

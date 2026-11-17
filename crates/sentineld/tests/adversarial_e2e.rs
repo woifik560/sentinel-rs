@@ -197,24 +197,19 @@ fn test_5_prctl_comm_spoofing_defense() {
 }
 
 // -----------------------------------------------------------------------------
-// Test 6: P0 Attack — Unauthorized non-GUI process attempting Verdict::Allow
+// Test 6: P0 Attack — Unauthorized non-root process attempting Verdict::Allow
 // -----------------------------------------------------------------------------
 #[test]
 fn test_6_p0_unauthorized_sock_connect_rejection() {
     // An infostealer process of UID 1000 connects to management socket and tries to submit Verdict
     let attacker_uid = 1000;
     let _attacker_pid = 6666;
-    let attacker_exe = Path::new("/home/user/.local/bin/infostealer");
-    let gui_binary_canonical = Path::new("/usr/bin/sentinel-gui");
 
     // Peer verification logic:
     let is_root = attacker_uid == 0;
-    let is_gui = attacker_exe == gui_binary_canonical;
 
     let role = if is_root {
         ClientRole::RootAdmin
-    } else if is_gui {
-        ClientRole::AuthorizedGui
     } else {
         ClientRole::ReadOnly
     };
@@ -225,7 +220,6 @@ fn test_6_p0_unauthorized_sock_connect_rejection() {
     let incoming_msg = IpcMessage::Verdict(PromptVerdict {
         incident_id: "inc-1".to_string(),
         action: PromptAction::AllowOnce,
-        auth_pin: None,
     });
 
     let rejection: Result<(), String> = match (&incoming_msg, role) {

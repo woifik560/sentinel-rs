@@ -23,6 +23,7 @@ use sentinel_common::risk::Verdict;
 use sentinel_ebpf::loader::{EbpfLoader, LoaderConfig};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 
+pub mod collector;
 mod context_policy;
 mod freeze;
 mod ipc_server;
@@ -153,21 +154,6 @@ async fn main() -> anyhow::Result<()> {
     taint_mgr.set_daemon_pid(std::process::id());
     taint_mgr.register_ipc_broker(1);
 
-    // Register GUI binary in BPF LSM for Zero-Userspace Trust attestation
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = std::fs::metadata(&config.socket.gui_binary_path) {
-            info!(
-                "Registering GUI binary in BPF LSM: {} (dev={}, ino={})",
-                config.socket.gui_binary_path.display(),
-                meta.dev(),
-                meta.ino()
-            );
-            taint_mgr.register_gui_binary(meta.dev(), meta.ino());
-        }
-    }
-
     // Start in-kernel Watchdog Heartbeat (updates BPF array map every 500ms)
     let heartbeat_taint = taint_mgr.clone();
     tokio::spawn(async move {
@@ -181,11 +167,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 5. Initialize and Start IPC Server (Dual Socket: Privileged Management & Read-Only Monitor)
+    // 5. Initialize and Start IPC Server (Management & Read-Only Monitor)
     let ipc_server = Arc::new(IpcServer::new(
         config.socket.path.clone(),
         config.socket.readonly_path.clone(),
-        config.socket.gui_binary_path.clone(),
         freeze_orchestrator.clone(),
         lineage_tracker.clone(),
         taint_mgr.clone(),
@@ -525,22 +510,6 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or_default()
                                     .as_secs();
 
-                                // X11 Clickjacking Defense: Generate ephemeral PIN if running in X11
-                                let is_x11 = std::env::var("WAYLAND_DISPLAY").is_err()
-                                    && (std::env::var("XDG_SESSION_TYPE").map(|v| v == "x11").unwrap_or(false)
-                                        || std::env::var("DISPLAY").is_ok());
-
-                                let auth_pin = if is_x11 {
-                                    let seed = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_micros();
-                                    let pin = 1000 + (seed % 9000);
-                                    Some(pin.to_string())
-                                } else {
-                                    None
-                                };
-
                                 let prompt = PromptRequest {
                                     incident_id: inc_id,
                                     risk_score: score.total,
@@ -552,8 +521,6 @@ async fn main() -> anyhow::Result<()> {
                                     dest_domain: None,
                                     reasons,
                                     expires_at_unix: expires_at,
-                                    is_x11_session: is_x11,
-                                    auth_pin,
                                 };
 
                                 ipc_server.broadcast_prompt(prompt).await;

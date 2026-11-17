@@ -1,18 +1,12 @@
-//! In-memory Causal Lineage Graph (DAG) and Interpreter Context Analyzer.
-//!
-//! Maintains an LRU cache of 4096–8192 process nodes, preserving process ancestry
-//! even after intermediate parent processes have exited, while enforcing interactive
-//! shell isolation (preventing developer terminal shells like bash/zsh from becoming
-//! permanently tainted).
+//! Causal Lineage Tracker maintaining process ancestry, taint propagation, and interpreter analysis.
 
-use lru::LruCache;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use sentinel_common::ipc::LineageStep;
 use sentinel_common::process::{is_interactive_shell_binary, ProcessNode, SecretCategory};
+use crate::lineage::graph::LineageGraph;
+use crate::lineage::process_key::ProcessKey;
 
 /// Information about an interpreted script invocation.
 #[derive(Debug, Clone)]
@@ -25,47 +19,49 @@ pub struct ScriptInfo {
 /// The Causal Lineage Tracker maintaining process ancestry in an LRU graph.
 #[derive(Clone)]
 pub struct LineageTracker {
-    graph: Arc<Mutex<LruCache<u32, ProcessNode>>>,
+    graph: LineageGraph,
 }
 
 impl LineageTracker {
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(8192).unwrap());
         Self {
-            graph: Arc::new(Mutex::new(LruCache::new(cap))),
+            graph: LineageGraph::new(capacity),
         }
     }
 
     /// Insert or update a process node.
     pub fn insert(&self, node: ProcessNode) {
-        let mut g = self.graph.lock().unwrap();
-        g.put(node.tgid, node);
+        self.graph.insert(node);
     }
 
     /// Retrieve a clone of a process node by TGID.
     pub fn get(&self, tgid: u32) -> Option<ProcessNode> {
-        let mut g = self.graph.lock().unwrap();
-        g.get(&tgid).cloned()
+        self.graph.get(tgid)
+    }
+
+    /// Obtain canonical process key for a TGID.
+    pub fn get_process_key(&self, tgid: u32) -> Option<ProcessKey> {
+        self.graph.get(tgid).map(|n| {
+            ProcessKey::new(n.tgid, n.start_time_ns)
+                .with_exe(n.exe_path, n.exe_dev_ino)
+        })
     }
 
     /// Handle process fork: child inherits metadata and parent pointer from parent TGID.
-    ///
-    /// Shell Isolation: If parent is an interactive shell (bash/zsh) and did not directly read secrets,
-    /// child starts in an untainted clean state.
     pub fn handle_fork(&self, parent_tgid: u32, child_tgid: u32) {
-        let mut g = self.graph.lock().unwrap();
-        let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell) = if let Some(parent) = g.get(&parent_tgid) {
-            (
-                parent.uid,
-                parent.exe_path.clone(),
-                parent.exe_dev_ino,
-                parent.pkg_origin.clone(),
-                parent.has_secret_access(),
-                parent.is_interactive_shell,
-            )
-        } else {
-            (1000, PathBuf::from("/proc/unknown"), (0, 0), None, false, false)
-        };
+        let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell) =
+            if let Some(parent) = self.graph.get(parent_tgid) {
+                (
+                    parent.uid,
+                    parent.exe_path.clone(),
+                    parent.exe_dev_ino,
+                    parent.pkg_origin.clone(),
+                    parent.has_secret_access(),
+                    parent.is_interactive_shell,
+                )
+            } else {
+                (1000, PathBuf::from("/proc/unknown"), (0, 0), None, false, false)
+            };
 
         let mut child = ProcessNode::new(child_tgid, parent_tgid, uid, exe_path);
         child.exe_dev_ino = exe_dev_ino;
@@ -73,110 +69,101 @@ impl LineageTracker {
 
         // Thread Group tracking
         if parent_tgid == child_tgid {
-            // New thread in same process group
-            if let Some(parent) = g.get_mut(&parent_tgid) {
-                parent.add_thread(child_tgid);
-            }
+            self.graph.get_mut_with(parent_tgid, |p| {
+                p.add_thread(child_tgid);
+            });
         }
 
         // If parent has secret accesses and is NOT an interactive shell, inherit secret history
         if parent_has_secrets && !parent_is_shell {
-            if let Some(parent) = g.get(&parent_tgid) {
+            if let Some(parent) = self.graph.get(parent_tgid) {
                 child.secret_accesses = parent.secret_accesses.clone();
             }
         }
 
-        g.put(child_tgid, child);
+        self.graph.insert(child);
         debug!("Lineage fork: {} -> {}", parent_tgid, child_tgid);
     }
 
     /// Link an indirect spawn via D-Bus / systemd broker to its initiator.
-    ///
-    /// When a tainted process calls `systemd-run` or invokes `org.freedesktop.systemd1` / portals
-    /// to spawn a helper process (whose apparent PPID is PID 1 or systemd), this method propagates
-    /// the initiator's taint and secret history to the spawned process, preventing broker escape!
     pub fn link_ipc_spawn(&self, initiator_tgid: u32, spawned_tgid: u32) {
-        let mut g = self.graph.lock().unwrap();
-        let (has_secrets, secrets) = if let Some(initiator) = g.get(&initiator_tgid) {
+        let (has_secrets, secrets) = if let Some(initiator) = self.graph.get(initiator_tgid) {
             (initiator.has_secret_access(), initiator.secret_accesses.clone())
         } else {
             (false, Vec::new())
         };
 
         if has_secrets {
-            if let Some(spawned) = g.get_mut(&spawned_tgid) {
+            self.graph.get_mut_with(spawned_tgid, |spawned| {
                 spawned.secret_accesses.extend(secrets);
                 debug!(
                     "Lineage IPC spawn linked: {} -> {} (inherited taint via D-Bus/systemd broker)",
                     initiator_tgid, spawned_tgid
                 );
-            }
+            });
         }
     }
 
     /// Register a thread under its process group leader.
     pub fn register_thread(&self, tid: u32, leader_tgid: u32) {
-        let mut g = self.graph.lock().unwrap();
-        if let Some(node) = g.get_mut(&leader_tgid) {
+        self.graph.get_mut_with(leader_tgid, |node| {
             node.add_thread(tid);
-        }
+        });
     }
 
     /// Handle process exec: updates executable path, cmdline, script analysis, and memfd detection.
     pub fn handle_exec(&self, tgid: u32, exe_path: PathBuf, cmdline: Vec<String>) {
-        let mut g = self.graph.lock().unwrap();
         let is_memfd = detect_memfd(&exe_path);
         let script_info = inspect_interpreter(&exe_path, &cmdline);
         let is_shell = is_interactive_shell_binary(&exe_path);
         let sha256 = crate::sha_cache::compute_sha256(&exe_path);
 
-        if let Some(node) = g.get_mut(&tgid) {
-            node.exe_path = exe_path;
-            node.cmdline = cmdline;
+        let updated = self.graph.get_mut_with(tgid, |node| {
+            node.exe_path = exe_path.clone();
+            node.cmdline = cmdline.clone();
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
-            node.script_path = script_info.and_then(|s| s.script_path);
-            node.exe_sha256 = sha256;
-        } else {
+            node.script_path = script_info.as_ref().and_then(|s| s.script_path.clone());
+            node.exe_sha256 = sha256.clone();
+        });
+
+        if updated.is_none() {
             let mut node = ProcessNode::new(tgid, 1, 1000, exe_path);
             node.cmdline = cmdline;
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
             node.script_path = script_info.and_then(|s| s.script_path);
             node.exe_sha256 = sha256;
-            g.put(tgid, node);
+            self.graph.insert(node);
         }
         debug!("Lineage exec for TGID {}", tgid);
     }
 
     /// Record a secret access event for a specific process TGID.
     pub fn record_secret_access(&self, tgid: u32, path: PathBuf, category: SecretCategory, ts: u64) {
-        let mut g = self.graph.lock().unwrap();
-        if let Some(node) = g.get_mut(&tgid) {
-            node.record_secret_access(path, category, ts);
-        } else {
+        let updated = self.graph.get_mut_with(tgid, |node| {
+            node.record_secret_access(path.clone(), category.clone(), ts);
+        });
+
+        if updated.is_none() {
             let mut node = ProcessNode::new(tgid, 1, 1000, PathBuf::from("/proc/unknown"));
             node.record_secret_access(path, category, ts);
-            g.put(tgid, node);
+            self.graph.insert(node);
         }
     }
 
     /// Record an IP contact for a process node. Returns true if this is the first time contacting this IP.
     pub fn record_ip_contact(&self, tgid: u32, ip: &str) -> bool {
-        let mut g = self.graph.lock().unwrap();
-        if let Some(node) = g.get_mut(&tgid) {
+        self.graph.get_mut_with(tgid, |node| {
             node.record_ip_contact(ip)
-        } else {
-            true
-        }
+        }).unwrap_or(true)
     }
 
-    /// Clear secret accesses and taint history for a specific TGID (e.g. after user approval / whitelist).
+    /// Clear secret accesses and taint history for a specific TGID.
     pub fn clear_secrets(&self, tgid: u32) {
-        let mut g = self.graph.lock().unwrap();
-        if let Some(node) = g.get_mut(&tgid) {
+        self.graph.get_mut_with(tgid, |node| {
             node.secret_accesses.clear();
-        }
+        });
     }
 
     /// Walk the ancestry chain of a process up to root or maximum 16 steps.
@@ -185,14 +172,12 @@ impl LineageTracker {
         let mut current_tgid = tgid;
         let mut visited = std::collections::HashSet::new();
 
-        let mut g = self.graph.lock().unwrap();
-
         for _ in 0..16 {
             if !visited.insert(current_tgid) || current_tgid == 0 {
                 break;
             }
 
-            if let Some(node) = g.get(&current_tgid) {
+            if let Some(node) = self.graph.get(current_tgid) {
                 let exe_name = node
                     .exe_path
                     .file_name()
@@ -221,8 +206,7 @@ impl LineageTracker {
 
     /// Total number of currently tracked processes.
     pub fn len(&self) -> usize {
-        let g = self.graph.lock().unwrap();
-        g.len()
+        self.graph.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -240,12 +224,18 @@ pub fn detect_memfd(exe_path: &Path) -> bool {
         || (p.contains("(deleted)") && p.starts_with("/dev/shm"))
 }
 
-/// Inspect interpreter process arguments (python3, bash, sh, node, perl).
+/// Inspect interpreter command line arguments for scripts or inline execution.
 pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<ScriptInfo> {
-    let exe_name = exe_path.file_name()?.to_string_lossy();
+    let exe_name = exe_path.file_name()?.to_str()?;
+
     let is_interp = matches!(
-        exe_name.as_ref(),
-        "python3" | "python" | "bash" | "sh" | "zsh" | "dash" | "node" | "perl"
+        exe_name,
+        "python" | "python3" | "python2"
+            | "bash" | "sh" | "zsh" | "dash"
+            | "perl"
+            | "ruby"
+            | "node" | "nodejs"
+            | "php"
     );
 
     if !is_interp {
@@ -256,24 +246,37 @@ pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<Script
     let mut is_suspicious_flags = false;
     let mut script_path = None;
 
-    let mut iter = cmdline.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if arg == "-c" || arg == "-e" {
-            is_inline = true;
-            if let Some(code) = iter.next() {
-                if code.contains("base64")
-                    || code.contains("eval(")
-                    || code.contains("exec(")
-                    || code.contains("urllib")
-                    || code.contains("requests")
-                    || code.contains("socket")
-                {
-                    is_suspicious_flags = true;
-                }
-            }
-        } else if !arg.starts_with('-') && script_path.is_none() {
-            script_path = Some(PathBuf::from(arg));
+    let mut skip_next = false;
+    for (_i, arg) in cmdline.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
         }
+
+        if arg == "-c" || arg == "-e" || arg == "--eval" {
+            is_inline = true;
+            is_suspicious_flags = true;
+            skip_next = true;
+            continue;
+        }
+
+        if arg == "-m" || arg == "-o" || arg == "-u" {
+            skip_next = true;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            continue;
+        }
+
+        if script_path.is_none() {
+            script_path = Some(PathBuf::from(arg));
+            break;
+        }
+    }
+
+    if script_path.is_none() && !is_inline && cmdline.len() <= 1 {
+        is_suspicious_flags = true;
     }
 
     Some(ScriptInfo {
@@ -291,15 +294,13 @@ mod tests {
     fn test_lineage_tracker_ancestry() {
         let tracker = LineageTracker::new(100);
 
-        // Process 1: bash (terminal shell)
-        let node1 = ProcessNode::new(1000, 1, 1000, PathBuf::from("/bin/bash"));
-        tracker.insert(node1);
+        // Fork: systemd (1) -> bash (1000) -> npm (1010) -> python3 (1020)
+        tracker.handle_fork(1, 1000);
+        tracker.handle_exec(1000, PathBuf::from("/usr/bin/bash"), vec!["bash".into()]);
 
-        // Process 2: npm spawned from bash
         tracker.handle_fork(1000, 1010);
-        tracker.handle_exec(1010, PathBuf::from("/usr/bin/npm"), vec!["npm".into(), "run".into(), "build".into()]);
+        tracker.handle_exec(1010, PathBuf::from("/usr/bin/npm"), vec!["npm".into(), "install".into()]);
 
-        // Process 3: python3 spawned from npm
         tracker.handle_fork(1010, 1020);
         tracker.handle_exec(
             1020,

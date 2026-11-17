@@ -23,10 +23,10 @@ use sentinel_common::process::{
 };
 use crate::maps::TaintMapManager;
 
-/// Evaluates bprm execution check with zero-userspace GUI branding and kernel INODE_STORAGE cache.
+/// Evaluates bprm execution check with kernel INODE_STORAGE cache and baseline profile.
 pub fn evaluate_bprm_security(
     manager: &TaintMapManager,
-    tgid: u32,
+    _tgid: u32,
     dev: u64,
     ino: u64,
     exe_path: &Path,
@@ -34,13 +34,7 @@ pub fn evaluate_bprm_security(
 ) -> u32 {
     let mut profile = compute_baseline_profile(exe_path);
 
-    // 1. Zero-Userspace GUI Attestation:
-    // If the executed binary matches registered GUI binary (dev, ino), set is_verified_gui = true!
-    if manager.is_registered_gui_binary(dev, ino) {
-        manager.set_verified_gui(tgid, true);
-    }
-
-    // 2. Kernel INODE_STORAGE Cached Verification:
+    // Kernel INODE_STORAGE Cached Verification:
     // If sentineld previously verified this binary, reuse TRUSTED_SYSTEM_PKG directly in kernel!
     if manager.is_inode_trusted(dev, ino, inode_version) {
         profile |= PROFILE_TRUSTED_PKG;
@@ -69,20 +63,25 @@ pub fn is_memfd_or_fileless(path_str: &str) -> bool {
         || path_str.contains("(deleted)") && path_str.starts_with("/dev/shm")
 }
 
-/// Kernel-level check at execve time: prevents launching sentinel-gui with malicious LD_PRELOAD or LD_AUDIT.
-pub fn check_gui_secure_bprm(exe_path: &Path, envp_entries: &[&str]) -> Result<(), &'static str> {
+/// Kernel-level check at execve time: prevents launching sentineld or sntctl with malicious LD_PRELOAD or LD_AUDIT.
+pub fn check_daemon_secure_bprm(exe_path: &Path, envp_entries: &[&str]) -> Result<(), &'static str> {
     let path_str = exe_path.to_string_lossy();
-    if path_str.ends_with("/sentinel-gui") || path_str == "sentinel-gui" {
+    if path_str.ends_with("/sentineld") || path_str == "sentineld" || path_str.ends_with("/sntctl") || path_str == "sntctl" {
         for entry in envp_entries {
             if entry.starts_with("LD_PRELOAD=") && entry.len() > "LD_PRELOAD=".len() {
-                return Err("-EPERM: LD_PRELOAD forbidden on sentinel-gui binary");
+                return Err("-EPERM: LD_PRELOAD forbidden on sentinel binaries");
             }
             if entry.starts_with("LD_AUDIT=") && entry.len() > "LD_AUDIT=".len() {
-                return Err("-EPERM: LD_AUDIT forbidden on sentinel-gui binary");
+                return Err("-EPERM: LD_AUDIT forbidden on sentinel binaries");
             }
         }
     }
     Ok(())
+}
+
+// Deprecated alias for backward compatibility with existing tests
+pub fn check_gui_secure_bprm(exe_path: &Path, envp_entries: &[&str]) -> Result<(), &'static str> {
+    check_daemon_secure_bprm(exe_path, envp_entries)
 }
 
 /// Compute initial baseline trust profile bits for `TASK_STORAGE`.
