@@ -13,176 +13,235 @@
 
 ---
 
-## About the Project (Version 0.2.1)
+## 🚀 Quick Start: Step-by-Step Setup from Scratch
 
-**Sentinel-RS** is an ultra-lightweight, high-performance, fully autonomous **Headless Host Intrusion Prevention System (HIPS)** and **Endpoint Detection and Response (EDR)** security agent for Linux systems (supporting both Linux Server and Linux Desktop platforms).
+Follow these steps in order. All commands can be copied directly into your Linux terminal.
 
-The agent operates as a background `systemd` daemon service (`sentineld`) managed via the `sntctl` command-line utility. The project has **zero graphical dependencies** (no X11, Wayland, Slint, GUI authentications, or interactive popup prompts). All threat prevention, detection, and containment decisions are evaluated **deterministically and autonomously** without requiring human intervention.
+### Step 1. Install System Dependencies and Rust Toolchain
 
----
+Building the project requires C build tools, `libssl`, `nftables`, and a modern version of the **Rust (Cargo)** toolchain.
 
-## Core Capabilities
-
-1. **Kernel-Space Enforcement (eBPF & BPF LSM)**:
-   - Early interception via BPF LSM hooks (`bprm_check_security`, `file_open`, `file_permission`, `mmap_file`, `ptrace_access_check`, `unix_may_send`, `socket_connect`).
-   - Kernel object storages (`task_storage`, `sk_storage`) and high-throughput BPF RingBuffer.
-   - Fileless execution detection (`memfd_create`, anonymous `PROT_EXEC`) and cross-process memory snooping prevention (`ptrace`, `/proc/<pid>/mem`, `process_vm_readv`).
-
-2. **Causal Data-Flow Taint Tracking**:
-   - Automatically marks tasks as Tainted upon touching credentials (`/etc/shadow`, `~/.ssh/id_*`, cloud metadata, password stores).
-   - Propagates taint across `fork`/`clone`, anonymous pipes, FIFOs, `SCM_RIGHTS` descriptors, and AF_UNIX domain sockets.
-   - Prevents taint laundering through intermediate background brokers.
-
-3. **Causal Process Lineage DAG**:
-   - Maintains an in-memory directed acyclic graph of all processes in userspace.
-   - Tracks full ancestor chains (`ancestor_chain`) up to PID 1.
-   - Anti-PID-reuse guarantee using process start timestamps from `/proc/<pid>/stat`.
-
-4. **Deterministic Risk Engine**:
-   - Calculates normalized risk scores ($0 \le S \le 100$).
-   - Rolling window evidence deduplication.
-   - Exponential risk decay with a 5-minute half-life ($T_{1/2} = 300\text{s}$).
-   - Multi-stage attack compounding multipliers (up to $1.6\times$ for full MITRE ATT&CK progression).
-
-5. **Six-Stage Autonomous Policy Engine**:
-   1. *Stage 1 (Safety Invariant)*: Absolute immunity for PID 1, PID 2, and the `sentineld` daemon.
-   2. *Stage 2 (Protected Resources)*: Kernel and core system path integrity protection.
-   3. *Stage 3 (Admin Deny)*: Explicit administrator blacklists.
-   4. *Stage 4 (Admin Allow)*: Explicit administrator whitelists.
-   5. *Stage 5 (Behavior Detection)*: High-confidence behavioral detection matches.
-   6. *Stage 6 (Operating Mode Defaults)*: Default action matrices for `AUDIT`, `BALANCED`, `STRICT`, and `CUSTOM` modes.
-
-6. **Automated Response Engine**:
-   - Two-phase safe process termination (`SIGSTOP` $\rightarrow$ verify `/proc/<pid>/stat` $\rightarrow$ `SIGTERM` $\rightarrow$ `SIGKILL`).
-   - Process suspension for forensic live-memory triage.
-   - Dynamic netfilter IP blocking and emergency host network isolation via `nftables` (preserving local loopback and management IPC).
-
-7. **Secure Management CLI & IPC**:
-   - Headless administration exclusively via `sntctl`.
-   - Kernel-enforced peer credential authentication (`SO_PEERCRED`) over `/run/sentinel/sentinel.sock` (RBAC: `RootAdmin`, `Operator`, `ReadOnly`).
-
-8. **Ultra-Low Resource Footprint**:
-   - 100% pure Rust (Zero C/Python runtimes, Zero LLM in security hotpath).
-   - Resident Memory: **$< 25\text{--}30\text{ MB}$ RSS**.
-   - Evaluation Latency: **$< 1\text{ ms}$**.
-
----
-
-## Workspace Architecture
-
-```
-crates/
-├── sentinel-common/    # Shared data types, events, IPC messages, policy enums
-├── sentinel-ebpf/      # Kernel eBPF programs, BPF LSM hooks, maps, RingBuffer
-├── sentineld/          # Privileged host security daemon (HIPS/EDR Engine)
-│   ├── src/collector/  # Kernel event ingestion and normalization
-│   ├── src/lineage/    # Process lineage graph (DAG) and anti-PID-reuse
-│   ├── src/behavior/   # Behavioral detection rules
-│   ├── src/risk/       # Deterministic risk engine and half-life decay
-│   ├── src/policy/     # 6-stage autonomous policy engine
-│   ├── src/response/   # Response orchestrator (Kill, Suspend, NetBlock)
-│   ├── src/incidents/  # Incident lifecycle management and correlation
-│   ├── src/storage/    # Async SQLite storage in WAL mode
-│   ├── src/health/     # Subsystem health monitoring and sd_notify watchdog
-│   └── src/ipc/        # SO_PEERCRED RBAC IPC server
-└── sntctl/             # CLI management client
-```
-
----
-
-## Quick Start
-
-### System Requirements
-- Linux kernel $\ge 5.10$ (recommended $\ge 6.1$) with BPF LSM enabled (`lsm=...,bpf`).
-- Required packages: `libelf`, `nftables`, `sqlite3`.
-
-### Building from Source
+#### For Debian / Ubuntu / Kali / Astra Linux:
 ```bash
+# 1. Install build tools, SSL libraries, and nftables
+sudo apt update && sudo apt install -y curl build-essential pkg-config libssl-dev nftables git
+
+# 2. Install official Rust toolchain via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# 3. Activate Cargo environment in your current shell
+source "$HOME/.cargo/env"
+```
+
+#### For RHEL / CentOS / Rocky Linux / Fedora:
+```bash
+sudo dnf install -y gcc gcc-c++ make pkgconfig openssl-devel nftables git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+#### For Arch Linux / Manjaro:
+```bash
+sudo pacman -Syu --noconfirm base-devel git rustup nftables
+rustup default stable
+```
+
+> [!TIP]
+> Verify that the Rust toolchain is available:
+> `cargo --version && rustc --version`
+
+---
+
+### Step 2. Clone Repository and Compile Binaries
+
+```bash
+# Clone source repository
 git clone https://github.com/woifik560/sentinel-rs.git
 cd sentinel-rs
 
-# Build release binaries
+# Build optimized release binaries
 cargo build --release
 ```
 
-### System Installation & Service Launch
+After compilation finishes, two core binaries will be located in `target/release/`:
+* `target/release/sentineld` — Root security daemon (HIPS/EDR Engine).
+* `target/release/sntctl` — CLI management and triage utility.
+
+---
+
+### Step 3. Launch the Security Agent
+
+Choose the launch method that fits your environment:
+
+#### Option A: Run as a background systemd service (Recommended for production servers and workstations)
+
 ```bash
-# Install binaries and default configs
+# 1. Install binaries into system path
 sudo install -m 0755 target/release/sentineld /usr/local/bin/
 sudo install -m 0755 target/release/sntctl /usr/local/bin/
+
+# 2. Create runtime, state, and configuration directories
 sudo mkdir -p /etc/sentinel /var/lib/sentinel /run/sentinel
+
+# 3. Copy default configuration files and systemd service unit
 sudo cp config/config.toml /etc/sentinel/
 sudo cp config/rules.toml /etc/sentinel/
 sudo cp config/sentineld.service /etc/systemd/system/
 
-# Enable and start daemon
+# 4. Reload systemd and start service
 sudo systemctl daemon-reload
 sudo systemctl enable --now sentineld.service
 ```
 
-### Verification
-```bash
-# Run environment diagnostics
-sudo sntctl doctor
+#### Option B: Run directly in terminal (For testing, debugging, or WSL/Docker)
 
-# Check daemon status
+In the first terminal window, start the daemon with root privileges:
+```bash
+sudo ./target/release/sentineld --config config/config.toml --rules config/rules.toml
+```
+
+In a second terminal window (or tab), interact with the agent using `sntctl`:
+```bash
+./target/release/sntctl status
+```
+
+---
+
+### Step 4. Operational Verification
+
+Verify that all subsystems are running properly:
+
+```bash
+# 1. Run system and kernel preflight diagnostics
+sntctl doctor
+
+# 2. Query agent status (role, tracked processes, frozen processes)
 sntctl status
 
-# Check subsystem health metrics
+# 3. Inspect health metrics of internal subsystems
 sntctl health
+
+# 4. Check systemd unit status (if launched via Option A)
+systemctl status sentineld.service
 ```
 
 ---
 
-## CLI Usage Examples (`sntctl`)
+### Step 5. Run Live End-to-End Test Suite
+
+An automated live testing suite is bundled to verify all security layers in your Linux environment:
+```bash
+sudo ./tests/run_live_vm_tests.sh
+```
+
+This test exercises 8 live scenarios:
+1. `sntctl doctor` and kernel capability inspection.
+2. Daemon launch and Netfilter (`inet sentinel`) rule insertion.
+3. Access control verification (`SO_PEERCRED` RBAC: root `RootAdmin` vs unprivileged `ReadOnly`).
+4. Causal Lineage DAG ancestry reconstruction up to PID 1.
+5. Process suspension (`SIGSTOP`), resumption (`SIGCONT`), and termination with Anti-PID-Reuse verification.
+6. Stage 1 Safety Invariants (refusal to terminate PID 1 or the daemon itself).
+7. Emergency host network containment (`network isolate`) preserving local loopback (`127.0.0.1`).
+8. Synthetic credential touch modeling and clean teardown.
+
+---
+
+## 📋 Common CLI Operations (`sntctl`)
 
 ```bash
-# Query protection status
-sntctl protection status
+# -------------------------------------------------------------
+# 1. Monitoring & Diagnostics
+# -------------------------------------------------------------
+sntctl status                      # Agent status summary
+sntctl health                      # Internal health diagnostics
+sntctl doctor                      # Kernel and BPF LSM preflight checks
+sntctl monitor                     # Live streaming of security events
 
-# Stream live audit events
-sntctl events tail
+# -------------------------------------------------------------
+# 2. Protection & Policy Controls
+# -------------------------------------------------------------
+sntctl protection status           # Protection subsystem status
+sudo sntctl protection enable      # Enable active enforcement (blocking mode)
+sudo sntctl protection disable     # Set to audit-only mode (logging only)
+sudo sntctl policy reload          # Hot-reload rules.toml without restarting daemon
 
-# List detected incidents
-sntctl incidents list
+# -------------------------------------------------------------
+# 3. Process Triage & Forensics
+# -------------------------------------------------------------
+sntctl process inspect <PID>       # Process metadata, executable SHA-256, and secret history
+sntctl process lineage <PID>       # Reconstruct causal ancestor lineage DAG to PID 1
+sudo sntctl process suspend <PID>  # Freeze suspicious process immediately (SIGSTOP)
+sudo sntctl unfreeze <PID>         # Resume suspended process (SIGCONT)
+sudo sntctl process kill <PID>     # Safely terminate process with anti-PID-reuse verification
 
-# View detailed incident forensics
-sntctl incidents show <INCIDENT_ID>
+# -------------------------------------------------------------
+# 4. Incident Management
+# -------------------------------------------------------------
+sntctl incidents list              # List recorded security incidents
+sntctl incidents show <ID>         # Show detailed forensic report with computed risk score
 
-# Inspect process lineage DAG
-sntctl process inspect <PID>
-sntctl process lineage <PID>
-
-# Hot-reload policy rules
-sudo sntctl policy reload
-
-# Emergency host containment
-sudo sntctl network isolate
-
-# Restore network connectivity
-sudo sntctl network unisolate
+# -------------------------------------------------------------
+# 5. Network Containment
+# -------------------------------------------------------------
+sntctl network status              # Netfilter and NFQUEUE holding status
+sudo sntctl network isolate        # Emergency host network containment (drops outbound except loopback)
+sudo sntctl network unisolate      # Release containment and restore regular traffic
 ```
 
 ---
 
-## Technical Documentation
+## 🧠 Architecture Overview
 
-Comprehensive documentation is available in [`docs/`](docs/):
-- [Architecture Specification](docs/ARCHITECTURE.md)
-- [Security Model & RBAC](docs/SECURITY_MODEL.md)
-- [Threat Model & MITRE Mapping](docs/THREAT_MODEL.md)
-- [Installation Guide](docs/INSTALLATION.md)
-- [Configuration Reference](docs/CONFIGURATION.md)
-- [IPC Protocol Specification](docs/IPC_PROTOCOL.md)
-- [eBPF & Kernel Compatibility](docs/EBPF_COMPATIBILITY.md)
-- [Policy Engine Precedence](docs/POLICY_ENGINE.md)
-- [Incident Response & Forensics](docs/INCIDENT_RESPONSE.md)
-- [Troubleshooting & Diagnostics](docs/TROUBLESHOOTING.md)
-- [Testing & Verification Methodology](docs/TESTING.md)
-- [Performance & Resource Budgets](docs/PERFORMANCE.md)
+Sentinel-RS is implemented as a 100% Rust workspace with zero external runtimes (Zero C/Python/LLM):
+
+```
+crates/
+├── sentinel-common/    # Shared data types, IPC protocol, events, policy structures
+├── sentinel-ebpf/      # Kernel eBPF programs, BPF LSM hooks, maps, and RingBuffer
+├── sentineld/          # Autonomous background root security daemon (HIPS/EDR Engine)
+│   ├── src/collector/  # Kernel event collection and normalization
+│   ├── src/lineage/    # Process Causal Lineage DAG
+│   ├── src/behavior/   # Behavioral detection heuristics
+│   ├── src/risk/       # Deterministic risk engine with exponential decay
+│   ├── src/policy/     # 6-stage autonomous policy evaluation engine
+│   ├── src/response/   # Autonomous response (Kill, Suspend, NetBlock, Containment)
+│   ├── src/incidents/  # Incident lifecycle management and correlation
+│   ├── src/storage/    # Asynchronous SQLite WAL persistence
+│   ├── src/health/     # Subsystem health monitors and systemd watchdog
+│   └── src/ipc/        # SO_PEERCRED RBAC IPC server
+└── sntctl/             # Terminal management CLI client
+```
+
+### Core Security Highlights
+
+1. **Kernel BPF LSM**: Early-stage interception before syscall execution (`bprm_check_security`, `file_open`, `socket_connect`) and memory snooping protection (`ptrace`, `/proc/<pid>/mem`).
+2. **Causal Taint Tracking**: Marks processes that access sensitive credentials and propagates taint across `fork`, pipes, AF_UNIX domain sockets, and `SCM_RIGHTS` file descriptors.
+3. **Causal Lineage DAG**: In-memory process dependency graph with start-time verification to prevent race conditions from PID recycling.
+4. **Deterministic Risk Engine**: Rolling-window deduplication, exponential risk decay ($T_{1/2} = 300\text{s}$), and MITRE ATT&CK multi-stage compounding multipliers.
+5. **6-Stage Policy Precedence**: Strict deterministic hierarchy preventing conflicting verdicts.
+6. **Autonomous Response**: Anti-PID-reuse termination, process freezing, and dynamic Netfilter holding with fail-safe bypass.
+7. **Ultra-Low Footprint**: Consumes $< 25\text{--}30\text{ MB}$ RAM RSS, sub-millisecond evaluation latency.
 
 ---
 
-## License
+## 📚 Technical Documentation
 
-Licensed under the MIT License.
+Full documentation is available in the [`docs/`](docs/) directory:
+* [Architecture Specification](docs/ARCHITECTURE.md)
+* [Security Model & RBAC](docs/SECURITY_MODEL.md)
+* [Threat Model & Attack Analysis](docs/THREAT_MODEL.md)
+* [Deployment & Installation Guide](docs/INSTALLATION.md)
+* [Configuration & Rule Syntax](docs/CONFIGURATION.md)
+* [IPC Protocol Specification](docs/IPC_PROTOCOL.md)
+* [eBPF Kernel Compatibility](docs/EBPF_COMPATIBILITY.md)
+* [Autonomous Policy Engine](docs/POLICY_ENGINE.md)
+* [Incident Response & Investigation](docs/INCIDENT_RESPONSE.md)
+* [Troubleshooting Guide](docs/TROUBLESHOOTING.md)
+* [Testing & Verification Methodology](docs/TESTING.md)
+* [Performance Budgets & Benchmarks](docs/PERFORMANCE.md)
+
+---
+
+## ⚖️ License
+
+Dual-licensed under either **MIT** or **GPL-2.0-only**.
