@@ -5,12 +5,12 @@ After=network.target network-pre.target local-fs.target
 Before=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=/usr/local/bin/sentineld --config /etc/sentinel/config.toml --rules /etc/sentinel/rules.toml
 ExecStopPost=-/usr/sbin/nft delete table inet sentinel
 Restart=always
 RestartSec=5s
-WatchdogSec=10s
+#WatchdogSec=10s
 
 # -------------------------------------------------------------
 # Systemd Managed Paths
