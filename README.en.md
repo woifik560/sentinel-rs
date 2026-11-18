@@ -131,6 +131,7 @@ systemctl status sentineld.service
 
 An automated live testing suite is bundled to verify all security layers in your Linux environment:
 ```bash
+cd ~/sentinel-rs
 sudo ./tests/run_live_vm_tests.sh
 ```
 

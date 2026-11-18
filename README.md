@@ -131,6 +131,7 @@ systemctl status sentineld.service
 
 В репозиторий включен автоматический комплекс проверки всех защитных механизмов:
 ```bash
+cd ~/sentinel-rs
 sudo ./tests/run_live_vm_tests.sh
 ```
 
