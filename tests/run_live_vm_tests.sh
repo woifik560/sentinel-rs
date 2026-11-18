@@ -10,17 +10,56 @@ echo "[INFO] Current User: $(whoami) (UID: $(id -u))"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-SENTINELD="$SCRIPT_DIR/target/debug/sentineld"
-SNTCTL="$SCRIPT_DIR/target/debug/sntctl"
-
-if [ ! -f "$SENTINELD" ] || [ ! -f "$SNTCTL" ]; then
-    echo "[FAIL] Binaries not found. Please run 'cargo build' first."
+if [ -f "$SCRIPT_DIR/target/release/sentineld" ]; then
+    SENTINELD="$SCRIPT_DIR/target/release/sentineld"
+elif [ -f "$SCRIPT_DIR/target/debug/sentineld" ]; then
+    SENTINELD="$SCRIPT_DIR/target/debug/sentineld"
+elif command -v sentineld > /dev/null 2>&1; then
+    SENTINELD="$(command -v sentineld)"
+else
+    echo "[FAIL] sentineld binary not found. Please run 'cargo build --release' first."
     exit 1
 fi
+
+if [ -f "$SCRIPT_DIR/target/release/sntctl" ]; then
+    SNTCTL="$SCRIPT_DIR/target/release/sntctl"
+elif [ -f "$SCRIPT_DIR/target/debug/sntctl" ]; then
+    SNTCTL="$SCRIPT_DIR/target/debug/sntctl"
+elif command -v sntctl > /dev/null 2>&1; then
+    SNTCTL="$(command -v sntctl)"
+else
+    echo "[FAIL] sntctl binary not found. Please run 'cargo build --release' first."
+    exit 1
+fi
+
+echo "[INFO] Using sentineld binary: $SENTINELD"
+echo "[INFO] Using sntctl binary:    $SNTCTL"
 
 # Ensure test runtime directories exist
 mkdir -p /run/sentinel /var/lib/sentinel /tmp/sentinel_test
 chmod 755 /run/sentinel /var/lib/sentinel /tmp/sentinel_test
+
+SYSTEMD_WAS_ACTIVE=false
+if systemctl is-active sentineld >/dev/null 2>&1; then
+    SYSTEMD_WAS_ACTIVE=true
+    echo "[*] Temporarily stopping systemd sentineld.service for isolated test suite run..."
+    systemctl stop sentineld
+fi
+
+cleanup() {
+    echo ""
+    echo "[*] Cleaning up test daemon..."
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    fi
+    if [ "$SYSTEMD_WAS_ACTIVE" = true ]; then
+        echo "[*] Restoring active sentineld.service under systemd..."
+        systemctl start sentineld || true
+    fi
+}
+trap cleanup EXIT
 
 echo ""
 echo "--------------------------------------------------------------------------------"
@@ -80,13 +119,14 @@ echo "    Response: $STATUS_ROOT"
 echo "[*] Querying health report as Root..."
 $SNTCTL health || true
 
-if id bober > /dev/null 2>&1; then
-    echo "[*] Querying status as non-root user 'bober' (expected: ReadOnly role)..."
-    STATUS_USER=$(su - bober -c "$SNTCTL --json status")
+NON_ROOT_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 1000 2>/dev/null || echo "deb")}"
+if [ -n "$NON_ROOT_USER" ] && [ "$NON_ROOT_USER" != "root" ] && id "$NON_ROOT_USER" > /dev/null 2>&1; then
+    echo "[*] Querying status as non-root user '$NON_ROOT_USER' (expected: ReadOnly role)..."
+    STATUS_USER=$(su - "$NON_ROOT_USER" -c "$SNTCTL --json status")
     echo "    Response: $STATUS_USER"
 
-    echo "[*] Attempting unauthorized privileged protection toggle as 'bober' (privileged socket)..."
-    UNAUTH_ERR=$(su - bober -c "$SNTCTL -s /run/sentinel/sentinel.sock protection disable" 2>&1 || true)
+    echo "[*] Attempting unauthorized privileged protection toggle as '$NON_ROOT_USER' (privileged socket)..."
+    UNAUTH_ERR=$(su - "$NON_ROOT_USER" -c "$SNTCTL -s /run/sentinel/sentinel.sock protection disable" 2>&1 || true)
     echo "    Output: $UNAUTH_ERR"
     if echo "$UNAUTH_ERR" | grep -iqE "permission|denied|eacces|unauthorized"; then
         echo "[OK] Security constraint verified: Non-root user denied by socket DAC permissions!"
@@ -94,8 +134,8 @@ if id bober > /dev/null 2>&1; then
         echo "[FAIL] Non-root user was not rejected on privileged socket!"
     fi
 
-    echo "[*] Attempting unauthorized privileged protection toggle as 'bober' (read-only socket)..."
-    RBAC_ERR=$(su - bober -c "$SNTCTL -s /run/sentinel/sentinel-ro.sock protection disable" 2>&1 || true)
+    echo "[*] Attempting unauthorized privileged protection toggle as '$NON_ROOT_USER' (read-only socket)..."
+    RBAC_ERR=$(su - "$NON_ROOT_USER" -c "$SNTCTL -s /run/sentinel/sentinel-ro.sock protection disable" 2>&1 || true)
     echo "    Output: $RBAC_ERR"
     if echo "$RBAC_ERR" | grep -iqE "permission|denied|eacces|unauthorized"; then
         echo "[OK] Security constraint verified: Non-root user denied by Sentinel-RS RBAC!"
@@ -214,15 +254,10 @@ echo ""
 echo "--------------------------------------------------------------------------------"
 echo " TEARDOWN & SUMMARY"
 echo "--------------------------------------------------------------------------------"
-echo "[*] Stopping sentineld daemon (PID: $DAEMON_PID)..."
-kill -TERM $DAEMON_PID 2>/dev/null || true
-sleep 1
-if kill -0 $DAEMON_PID 2>/dev/null; then
-    kill -KILL $DAEMON_PID 2>/dev/null || true
+if [ -f /tmp/sentinel_test/daemon.log ]; then
+    echo "[*] Daemon log tail:"
+    tail -n 15 /tmp/sentinel_test/daemon.log | sed 's/^/    /'
 fi
-
-echo "[*] Daemon log tail:"
-tail -n 15 /tmp/sentinel_test/daemon.log | sed 's/^/    /'
 
 echo ""
 echo "================================================================================"
