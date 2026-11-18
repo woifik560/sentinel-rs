@@ -164,7 +164,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Doctor => run_doctor().await?,
         Commands::Protection { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVILEGED_SOCKET));
+            let default_sock = match action {
+                ProtectionAction::Enable | ProtectionAction::Disable => DEFAULT_PRIVILEGED_SOCKET,
+                ProtectionAction::Status => {
+                    if is_root {
+                        DEFAULT_PRIVILEGED_SOCKET
+                    } else {
+                        DEFAULT_READONLY_SOCKET
+                    }
+                }
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_protection(&sock, action, json).await?
         }
         Commands::Events { action } => {
@@ -176,7 +186,17 @@ async fn main() -> anyhow::Result<()> {
             run_incidents(&sock, action, json).await?
         }
         Commands::Policy { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVILEGED_SOCKET));
+            let default_sock = match action {
+                PolicyActionCmd::Reload => DEFAULT_PRIVILEGED_SOCKET,
+                _ => {
+                    if is_root {
+                        DEFAULT_PRIVILEGED_SOCKET
+                    } else {
+                        DEFAULT_READONLY_SOCKET
+                    }
+                }
+            };
+            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
             run_policy(&sock, action, json).await?
         }
         Commands::Rules { action } => {
