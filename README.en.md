@@ -228,6 +228,7 @@ crates/
 ## 📚 Technical Documentation
 
 Full documentation is available in the [`docs/`](docs/) directory:
+* **[User Guide & Live Demonstration Showcase](docs/USER_GUIDE_AND_DEMO.md)**
 * [Architecture Specification](docs/ARCHITECTURE.md)
 * [Security Model & RBAC](docs/SECURITY_MODEL.md)
 * [Threat Model & Attack Analysis](docs/THREAT_MODEL.md)
