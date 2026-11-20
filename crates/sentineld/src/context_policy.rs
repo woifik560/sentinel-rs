@@ -74,6 +74,9 @@ impl ContextPolicyEngine {
                         SecretCategory::CloudCredentials => {
                             cat_str.eq_ignore_ascii_case("cloud")
                         }
+                        SecretCategory::DeveloperCredentials => {
+                            cat_str.eq_ignore_ascii_case("dev") || cat_str.eq_ignore_ascii_case("git")
+                        }
                         SecretCategory::TelegramData => cat_str.eq_ignore_ascii_case("telegram"),
                         SecretCategory::CryptoWallet => cat_str.eq_ignore_ascii_case("crypto"),
                         SecretCategory::Other(s) => s.contains(cat_str),

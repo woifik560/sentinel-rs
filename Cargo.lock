@@ -777,6 +777,7 @@ dependencies = [
  "anyhow",
  "aya",
  "bytes",
+ "libc",
  "sentinel-common",
  "serde",
  "sha2",

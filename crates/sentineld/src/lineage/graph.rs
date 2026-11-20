@@ -45,4 +45,22 @@ impl LineageGraph {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Find the most recently tainted process node within max_age_ns.
+    pub fn find_recent_tainted(&self, now_ns: u64, max_age_ns: u64) -> Option<ProcessNode> {
+        let g = self.nodes.lock().unwrap();
+        let mut best: Option<ProcessNode> = None;
+        let mut best_ts = 0;
+
+        for (_k, v) in g.iter() {
+            if let Some(last_sec) = v.secret_accesses.last() {
+                let age = now_ns.saturating_sub(last_sec.timestamp_ns);
+                if age <= max_age_ns && last_sec.timestamp_ns >= best_ts {
+                    best_ts = last_sec.timestamp_ns;
+                    best = Some(v.clone());
+                }
+            }
+        }
+        best
+    }
 }

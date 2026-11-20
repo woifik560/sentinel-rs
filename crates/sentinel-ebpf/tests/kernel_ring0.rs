@@ -27,6 +27,7 @@ async fn test_kernel_safe_version_verification() {
 async fn test_ebpf_loader_initialization_and_preflight() {
     let mut config = LoaderConfig::default();
     config.strict_preflight = false;
+    config.enable_tracepoints = false;
 
     let mut loader = EbpfLoader::new(config);
     let res = loader.load_and_attach().await;

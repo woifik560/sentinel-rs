@@ -78,6 +78,7 @@ impl RiskEngine {
             let is_legitimate_owner = is_domain_match
                 && node.is_system_path()
                 && !node.is_untrusted_origin()
+                && node.ancestor_script.is_none()
                 && (node.pkg_origin.is_some()
                     || (node.baseline_profile & sentinel_common::process::PROFILE_TRUSTED_PKG != 0))
                 && !node.is_memfd
@@ -144,7 +145,9 @@ impl RiskEngine {
         }
 
         // 4. [+25] UNTRUSTED_BINARY_ORIGIN
-        let target_path = node.script_path.as_deref().unwrap_or(&node.exe_path);
+        let target_path = node.script_path.as_deref()
+            .or(node.ancestor_script.as_deref())
+            .unwrap_or(&node.exe_path);
         let path_str = target_path.to_string_lossy();
         let is_untrusted_dir = path_str.starts_with("/tmp")
             || path_str.starts_with("/dev/shm")
@@ -229,7 +232,7 @@ impl RiskEngine {
         }
 
         // 10. [-35] TRUSTED_PACKAGE_CONTEXT
-        let is_script_untrusted = node.script_path.is_some() || node.is_memfd || node.is_anon_exec || node.is_interpreter();
+        let is_script_untrusted = node.script_path.is_some() || node.ancestor_script.is_some() || node.is_memfd || node.is_anon_exec || node.is_interpreter();
         if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret && !net.is_tofu_tampered && !net.is_ipc_laundered {
             let weight = self.get_weight(RuleId::TrustedPackageContext.as_str(), -35);
             firings.push(RuleFiring {

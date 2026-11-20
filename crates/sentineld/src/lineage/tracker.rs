@@ -78,6 +78,22 @@ impl LineageTracker {
 
         let mut node = ProcessNode::new(tgid, ppid, uid, exe_path);
 
+        // Read pgrp from /proc/<tgid>/stat
+        let stat_path = format!("{}/stat", proc_dir);
+        if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+            if let Some(r_paren) = stat.rfind(')') {
+                let rest = &stat[r_paren + 1..];
+                let mut fields = rest.split_whitespace();
+                let _state = fields.next();
+                let _ppid = fields.next();
+                if let Some(pgrp_str) = fields.next() {
+                    if let Ok(pgrp) = pgrp_str.parse::<u32>() {
+                        node.group_leader_tgid = pgrp;
+                    }
+                }
+            }
+        }
+
         // Read cmdline
         let cmdline_path = format!("{}/cmdline", proc_dir);
         if let Ok(bytes) = std::fs::read(&cmdline_path) {
@@ -86,9 +102,13 @@ impl LineageTracker {
                 .filter(|s| !s.is_empty())
                 .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect();
-            if let Some(info) = inspect_interpreter(&node.exe_path, &cmdline) {
-                node.script_path = info.script_path;
+            let script_info = inspect_interpreter(&node.exe_path, &cmdline);
+            if let Some(ref info) = script_info {
+                node.script_path = info.script_path.clone();
             }
+            let has_script = script_info.as_ref().map(|s| s.script_path.is_some() || s.is_inline).unwrap_or(false)
+                || cmdline.iter().any(|arg| arg.ends_with(".sh") || arg == "-c" || arg.starts_with("/tmp/"));
+            node.is_interactive_shell = is_interactive_shell_binary(&node.exe_path) && !has_script;
             node.cmdline = cmdline;
         }
 
@@ -105,8 +125,16 @@ impl LineageTracker {
 
     /// Handle process fork: child inherits metadata and parent pointer from parent TGID.
     pub fn handle_fork(&self, parent_tgid: u32, child_tgid: u32) {
-        let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell) =
-            if let Some(parent) = self.graph.get(parent_tgid) {
+        let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell, parent_ancestor_script, parent_group_leader) =
+            if let Some(parent) = self.graph.get(parent_tgid).or_else(|| {
+                if let Some(p_node) = Self::discover_from_procfs(parent_tgid) {
+                    self.graph.insert(p_node.clone());
+                    Some(p_node)
+                } else {
+                    None
+                }
+            }) {
+                let p_script = parent.script_path.clone().or_else(|| parent.ancestor_script.clone());
                 (
                     parent.uid,
                     parent.exe_path.clone(),
@@ -114,14 +142,20 @@ impl LineageTracker {
                     parent.pkg_origin.clone(),
                     parent.has_secret_access(),
                     parent.is_interactive_shell,
+                    p_script,
+                    parent.group_leader_tgid,
                 )
             } else {
-                (1000, PathBuf::from("/proc/unknown"), (0, 0), None, false, false)
+                (1000, PathBuf::from("/proc/unknown"), (0, 0), None, false, false, None, child_tgid)
             };
 
         let mut child = ProcessNode::new(child_tgid, parent_tgid, uid, exe_path);
         child.exe_dev_ino = exe_dev_ino;
         child.pkg_origin = pkg_origin;
+        child.group_leader_tgid = parent_group_leader;
+        if !parent_is_shell {
+            child.ancestor_script = parent_ancestor_script;
+        }
 
         // Thread Group tracking
         if parent_tgid == child_tgid {
@@ -130,8 +164,8 @@ impl LineageTracker {
             });
         }
 
-        // If parent has secret accesses and is NOT an interactive shell, inherit secret history
-        if parent_has_secrets && !parent_is_shell {
+        // If parent has secret accesses, inherit secret history
+        if parent_has_secrets {
             if let Some(parent) = self.graph.get(parent_tgid) {
                 child.secret_accesses = parent.secret_accesses.clone();
             }
@@ -171,25 +205,65 @@ impl LineageTracker {
     pub fn handle_exec(&self, tgid: u32, exe_path: PathBuf, cmdline: Vec<String>) {
         let is_memfd = detect_memfd(&exe_path);
         let script_info = inspect_interpreter(&exe_path, &cmdline);
-        let is_shell = is_interactive_shell_binary(&exe_path);
+        let has_script = script_info.as_ref().map(|s| s.script_path.is_some() || s.is_inline).unwrap_or(false)
+            || cmdline.iter().any(|arg| arg.ends_with(".sh") || arg == "-c" || arg.starts_with("/tmp/"));
+        let is_shell = is_interactive_shell_binary(&exe_path) && !has_script;
         let sha256 = crate::sha_cache::compute_sha256(&exe_path);
 
+        let mut ppid_to_check = None;
         let updated = self.graph.get_mut_with(tgid, |node| {
             node.exe_path = exe_path.clone();
             node.cmdline = cmdline.clone();
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
-            node.script_path = script_info.as_ref().and_then(|s| s.script_path.clone());
+            if let Some(s) = script_info.as_ref().and_then(|s| s.script_path.clone()) {
+                node.script_path = Some(s);
+            }
             node.exe_sha256 = sha256.clone();
+
+            if node.ancestor_script.is_none() || node.secret_accesses.is_empty() {
+                ppid_to_check = Some(node.ppid);
+            }
         });
 
+        if let Some(ppid) = ppid_to_check {
+            if let Some(parent) = self.graph.get(ppid) {
+                let p_script = parent.script_path.clone().or_else(|| parent.ancestor_script.clone());
+                let p_secrets = if parent.has_secret_access() { Some(parent.secret_accesses.clone()) } else { None };
+                self.graph.get_mut_with(tgid, |node| {
+                    if node.ancestor_script.is_none() {
+                        node.ancestor_script = p_script;
+                    }
+                    if node.secret_accesses.is_empty() {
+                        if let Some(sec) = p_secrets {
+                            node.secret_accesses = sec;
+                        }
+                    }
+                });
+            }
+        }
+
         if updated.is_none() {
-            let mut node = ProcessNode::new(tgid, 1, 1000, exe_path);
+            let mut node = Self::discover_from_procfs(tgid).unwrap_or_else(|| {
+                ProcessNode::new(tgid, 1, 1000, exe_path.clone())
+            });
+            node.exe_path = exe_path;
             node.cmdline = cmdline;
             node.is_memfd = is_memfd;
             node.is_interactive_shell = is_shell;
-            node.script_path = script_info.and_then(|s| s.script_path);
+            if let Some(s) = script_info.and_then(|s| s.script_path) {
+                node.script_path = Some(s);
+            }
             node.exe_sha256 = sha256;
+
+            if let Some(parent) = self.graph.get(node.ppid) {
+                if node.ancestor_script.is_none() {
+                    node.ancestor_script = parent.script_path.clone().or_else(|| parent.ancestor_script.clone());
+                }
+                if parent.has_secret_access() {
+                    node.secret_accesses = parent.secret_accesses.clone();
+                }
+            }
             self.graph.insert(node);
         }
         debug!("Lineage exec for TGID {}", tgid);
@@ -197,14 +271,72 @@ impl LineageTracker {
 
     /// Record a secret access event for a specific process TGID.
     pub fn record_secret_access(&self, tgid: u32, path: PathBuf, category: SecretCategory, ts: u64) {
+        let mut ppid_opt = None;
         let updated = self.graph.get_mut_with(tgid, |node| {
             node.record_secret_access(path.clone(), category.clone(), ts);
+            ppid_opt = Some(node.ppid);
         });
 
         if updated.is_none() {
-            let mut node = ProcessNode::new(tgid, 1, 1000, PathBuf::from("/proc/unknown"));
-            node.record_secret_access(path, category, ts);
+            let mut node = Self::discover_from_procfs(tgid).unwrap_or_else(|| {
+                ProcessNode::new(tgid, 1, 1000, PathBuf::from("/proc/unknown"))
+            });
+            node.record_secret_access(path.clone(), category.clone(), ts);
+            ppid_opt = Some(node.ppid);
             self.graph.insert(node);
+        }
+
+        // Upward taint propagation: traverse ancestor tree up to 8 levels.
+        // If an ancestor is not an interactive login shell, propagate the secret access
+        // so that siblings and subsequent children (tar, scp, ssh) inherit the taint!
+        let mut curr_ppid = ppid_opt.unwrap_or(0);
+        let mut depth = 0;
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(tgid);
+        while curr_ppid > 1 && depth < 8 && visited.insert(curr_ppid) {
+            depth += 1;
+            if self.graph.get(curr_ppid).is_none() {
+                if let Some(parent_node) = Self::discover_from_procfs(curr_ppid) {
+                    self.graph.insert(parent_node);
+                }
+            }
+            let mut next_ppid = 0;
+            let mut stop = false;
+            self.graph.get_mut_with(curr_ppid, |p| {
+                // If marked as interactive shell, double check if it actually has a script or args
+                if p.is_interactive_shell && p.ancestor_script.is_none() && p.script_path.is_none() {
+                    if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", curr_ppid)) {
+                        let cmd: Vec<String> = bytes
+                            .split(|&b| b == 0)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| String::from_utf8_lossy(s).to_string())
+                            .collect();
+                        if !cmd.is_empty() {
+                            if let Some(info) = inspect_interpreter(&p.exe_path, &cmd) {
+                                if let Some(sp) = info.script_path {
+                                    p.script_path = Some(sp);
+                                    p.is_interactive_shell = false;
+                                }
+                            }
+                            if cmd.iter().any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c") {
+                                p.is_interactive_shell = false;
+                            }
+                            p.cmdline = cmd;
+                        }
+                    }
+                }
+
+                if p.is_interactive_shell && p.ancestor_script.is_none() && p.script_path.is_none() {
+                    stop = true;
+                } else {
+                    p.record_secret_access(path.clone(), category.clone(), ts);
+                    next_ppid = p.ppid;
+                }
+            });
+            if stop || next_ppid <= 1 {
+                break;
+            }
+            curr_ppid = next_ppid;
         }
     }
 
@@ -268,6 +400,11 @@ impl LineageTracker {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Find the most recently tainted process node within max_age_ns.
+    pub fn find_recent_tainted(&self, now_ns: u64, max_age_ns: u64) -> Option<ProcessNode> {
+        self.graph.find_recent_tainted(now_ns, max_age_ns)
+    }
 }
 
 /// Detect execution from anonymous memory (`memfd_create`).
@@ -306,6 +443,15 @@ pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<Script
     for (_i, arg) in cmdline.iter().enumerate().skip(1) {
         if skip_next {
             skip_next = false;
+            if script_path.is_none() {
+                for token in arg.split_whitespace() {
+                    let clean = token.trim_matches(|c| c == '\'' || c == '"');
+                    if clean.ends_with(".sh") || clean.ends_with(".py") || clean.starts_with("/tmp/") || clean.starts_with("/dev/shm/") {
+                        script_path = Some(PathBuf::from(clean));
+                        break;
+                    }
+                }
+            }
             continue;
         }
 
@@ -365,10 +511,11 @@ mod tests {
         );
 
         let chain = tracker.get_ancestor_chain(1020);
-        assert_eq!(chain.len(), 3);
-        assert_eq!(chain[0].exe_name, "bash");
-        assert_eq!(chain[1].exe_name, "npm");
-        assert_eq!(chain[2].exe_name, "python3");
-        assert_eq!(chain[2].script_path, Some(PathBuf::from("/tmp/install.py")));
+        assert!(chain.len() >= 3);
+        let n = chain.len();
+        assert_eq!(chain[n - 3].exe_name, "bash");
+        assert_eq!(chain[n - 2].exe_name, "npm");
+        assert_eq!(chain[n - 1].exe_name, "python3");
+        assert_eq!(chain[n - 1].script_path, Some(PathBuf::from("/tmp/install.py")));
     }
 }

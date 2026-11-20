@@ -32,6 +32,8 @@ pub enum SecretCategory {
     CryptoWallet,
     /// Cloud provider credentials (~/.aws/*, ~/.kube/*, ~/.config/gcloud/*)
     CloudCredentials,
+    /// Developer credentials (~/.git-credentials, ~/.netrc, ~/.npmrc, ~/.docker/config.json, etc.)
+    DeveloperCredentials,
     /// Other sensitive files
     Other(String),
 }
@@ -83,6 +85,9 @@ pub struct ProcessNode {
     pub cmdline: Vec<String>,
     /// For interpreters: the path to the script being executed.
     pub script_path: Option<PathBuf>,
+    /// Path to an ancestor script that spawned this process or inherited in this process tree.
+    #[serde(default)]
+    pub ancestor_script: Option<PathBuf>,
     /// Whether the binary was loaded from anonymous memory (memfd_create).
     pub is_memfd: bool,
     /// Whether the process has executed anonymous memory or unlinked tmpfs mapping (mmap PROT_EXEC).
@@ -101,7 +106,6 @@ pub struct ProcessNode {
 impl ProcessNode {
     /// Create a new empty process node with the given identifiers.
     pub fn new(tgid: u32, ppid: u32, uid: u32, exe_path: PathBuf) -> Self {
-        let is_shell = is_interactive_shell_binary(&exe_path);
         let mut threads = HashSet::new();
         threads.insert(tgid);
         Self {
@@ -119,10 +123,11 @@ impl ProcessNode {
             pkg_origin: None,
             cmdline: Vec::new(),
             script_path: None,
+            ancestor_script: None,
             is_memfd: false,
             is_anon_exec: false,
             baseline_profile: PROFILE_UNKNOWN,
-            is_interactive_shell: is_shell,
+            is_interactive_shell: false,
             contacted_ips: HashSet::new(),
             secret_accesses: Vec::new(),
         }

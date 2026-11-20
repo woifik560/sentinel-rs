@@ -40,8 +40,18 @@ impl NftablesManager {
 
     /// Block a specific destination IP address via nftables.
     pub fn block_ip(ip: &str) {
-        let cmd = format!("nft add rule inet sentinel output ip daddr {} drop 2>/dev/null", ip);
-        let _ = Command::new("sh").arg("-c").arg(&cmd).status();
+        info!("Blocking malicious destination IP in nftables: {}", ip);
+        let cmd = format!(
+            "nft add table inet sentinel 2>/dev/null; \
+             nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
+             nft insert rule inet sentinel output ip daddr {} drop 2>/dev/null",
+            ip
+        );
+        let status = Command::new("sh").arg("-c").arg(&cmd).status();
+        match status {
+            Ok(s) if s.success() => info!("nftables drop rule inserted for IP {}", ip),
+            _ => warn!("Failed to insert nftables drop rule for IP {}", ip),
+        }
     }
 
     /// Clean up Netfilter rules upon daemon shutdown/restart.

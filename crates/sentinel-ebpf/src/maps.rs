@@ -277,9 +277,45 @@ impl TaintHygiene {
                 || path.contains("/id_ecdsa")
                 || path.contains("/id_dsa")
                 || path.contains("/.ssh/id_")
+                || path.ends_with(".pem")
+                || path.ends_with(".key")
+                || path.ends_with(".ppk")
+                || path.ends_with(".p12")
+                || path.ends_with(".pfx")
+                || path.ends_with(".ovpn")
+                || path.ends_with("/environment")
+                || path.ends_with("/rc")
             {
                 return true;
             }
+        }
+
+        // Host SSH private keys
+        if path.starts_with("/etc/ssh/ssh_host_") && path.ends_with("_key") {
+            return true;
+        }
+
+        // Developer & Cloud credentials
+        if path.ends_with("/.git-credentials")
+            || path.ends_with("/.netrc")
+            || path.ends_with("/.authinfo")
+            || path.ends_with("/.pgpass")
+            || path.ends_with("/.my.cnf")
+            || path.ends_with("/.npmrc")
+            || path.ends_with("/.pypirc")
+            || path.ends_with("/.docker/config.json")
+            || path.contains("/.config/gh/hosts.yml")
+            || path.contains("/.config/glab-cli/config.yml")
+            || path.contains("/.aws/")
+            || path.contains("/.kube/")
+            || path.contains("/.config/gcloud/")
+        {
+            return true;
+        }
+
+        // Shell history files
+        if path.ends_with("/.bash_history") || path.ends_with("/.zsh_history") || path.ends_with("/.histfile") {
+            return true;
         }
 
         // GPG hygiene: private keys only
@@ -341,12 +377,25 @@ impl TaintHygiene {
 
     /// Return the scoped secret domain bitmask for an accessed path.
     pub fn get_secret_domain_for_path(path_str: &str) -> u64 {
-        if path_str.contains("/.ssh/") {
+        if path_str.contains("/.ssh/") || path_str.starts_with("/etc/ssh/ssh_host_") {
             TaintFlags::BIT_SSH_KEYS
         } else if path_str.contains("/.aws/")
             || path_str.contains("/.kube/")
             || path_str.contains("/.config/gcloud/")
             || path_str.contains("/.gnupg/")
+            || path_str.ends_with("/.git-credentials")
+            || path_str.ends_with("/.netrc")
+            || path_str.ends_with("/.authinfo")
+            || path_str.ends_with("/.pgpass")
+            || path_str.ends_with("/.my.cnf")
+            || path_str.ends_with("/.npmrc")
+            || path_str.ends_with("/.pypirc")
+            || path_str.ends_with("/.docker/config.json")
+            || path_str.contains("/.config/gh/hosts.yml")
+            || path_str.contains("/.config/glab-cli/config.yml")
+            || path_str.ends_with("/.bash_history")
+            || path_str.ends_with("/.zsh_history")
+            || path_str.ends_with("/.histfile")
         {
             TaintFlags::BIT_CLOUD_CREDS
         } else if path_str.contains("/google-chrome/") || path_str.contains("/chromium/") {

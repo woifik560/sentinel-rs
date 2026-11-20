@@ -110,6 +110,11 @@ impl ShaCache {
 /// Compute SHA-256 hash string of a file.
 #[allow(dead_code)]
 pub fn compute_sha256(path: &Path) -> Option<String> {
+    let p_str = path.to_string_lossy();
+    if p_str.starts_with("/proc/") || p_str.starts_with("/sys/") || p_str.starts_with("/dev/") {
+        return None;
+    }
+
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {

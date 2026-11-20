@@ -363,8 +363,8 @@ async fn main() -> anyhow::Result<()> {
                 lineage_tracker.handle_exec(tgid, exe_path, cmdline);
             }
 
-            EbpfEvent::SocketConnect { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark }
-            | EbpfEvent::SocketSendmsg { tgid, group_leader_tgid: _, addr_family: _, dst_ipv4, dst_ipv6, dst_port, so_mark, is_preopened: _ } => {
+            EbpfEvent::SocketConnect { tgid, group_leader_tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark }
+            | EbpfEvent::SocketSendmsg { tgid, group_leader_tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, so_mark, is_preopened: _ } => {
                 // Synchronous FlowContext lookup from flow_mark_ctx eBPF map:
                 let _flow_ctx = taint_mgr.lookup_flow_context(so_mark);
                 let is_reval = (so_mark & sentinel_common::events::SENTINEL_MARK_REVAL_BIT) != 0;
@@ -376,9 +376,16 @@ async fn main() -> anyhow::Result<()> {
                     .map(|ip| ip.to_string())
                     .or_else(|| dst_ipv6.map(|ip| ip.to_string()));
 
+                let mut effective_tgid = tgid;
+                if let Some(ref ip) = dest_ip {
+                    if let Some(ns_pid) = find_process_for_destination(ip, dst_port) {
+                        effective_tgid = ns_pid;
+                    }
+                }
+
                 let is_first_seen_ip = dest_ip
                     .as_ref()
-                    .map(|ip| lineage_tracker.record_ip_contact(tgid, ip))
+                    .map(|ip| lineage_tracker.record_ip_contact(effective_tgid, ip))
                     .unwrap_or(false);
 
                 let now_ns = SystemTime::now()
@@ -386,20 +393,145 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .as_nanos() as u64;
 
-                let node = lineage_tracker.get(tgid).unwrap_or_else(|| {
+                let mut node = lineage_tracker.get(effective_tgid).or_else(|| {
+                    if let Some(discovered) = LineageTracker::discover_from_procfs(effective_tgid) {
+                        let mut disc = discovered;
+                        if let Some(parent) = lineage_tracker.get(disc.ppid) {
+                            disc.ancestor_script = parent.script_path.clone().or_else(|| parent.ancestor_script.clone());
+                            if parent.has_secret_access() {
+                                disc.secret_accesses = parent.secret_accesses.clone();
+                            }
+                        }
+                        lineage_tracker.insert(disc.clone());
+                        Some(disc)
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| {
                     sentinel_common::process::ProcessNode::new(
-                        tgid,
+                        effective_tgid,
                         1,
                         1000,
                         PathBuf::from("/proc/unknown"),
                     )
                 });
 
+                // If cmdline has 1 or fewer elements or script_path is none, re-check /proc/<effective_tgid>/cmdline
+                if node.cmdline.len() <= 1 || node.script_path.is_none() {
+                    if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", effective_tgid)) {
+                        let cmd: Vec<String> = bytes
+                            .split(|&b| b == 0)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| String::from_utf8_lossy(s).to_string())
+                            .collect();
+                        if !cmd.is_empty() {
+                            let script_info = crate::lineage::tracker::inspect_interpreter(&node.exe_path, &cmd);
+                            if let Some(info) = script_info {
+                                if let Some(sp) = info.script_path {
+                                    node.script_path = Some(sp);
+                                    node.is_interactive_shell = false;
+                                }
+                            }
+                            if cmd.iter().any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c") {
+                                node.is_interactive_shell = false;
+                            }
+                            node.cmdline = cmd;
+                        }
+                    }
+                }
+
+                // Dual-defense: If this process itself has no recorded secrets, but its ancestors in the lineage
+                // tree or group leader accessed secrets (e.g. bash or scp spawned ssh), inherit ancestor secrets and script!
+                let mut effective_node = node.clone();
+                let effective_group_leader = if group_leader_tgid != 0 && group_leader_tgid != effective_tgid {
+                    group_leader_tgid
+                } else {
+                    effective_node.group_leader_tgid
+                };
+
+                // 1. Check group leader first!
+                if effective_group_leader != 0 && effective_group_leader != effective_tgid {
+                    if let Some(leader) = lineage_tracker.get(effective_group_leader) {
+                        if effective_node.ancestor_script.is_none() {
+                            effective_node.ancestor_script = leader.script_path.clone().or_else(|| leader.ancestor_script.clone());
+                        }
+                        if effective_node.secret_accesses.is_empty() && leader.has_secret_access() {
+                            effective_node.secret_accesses.extend(leader.secret_accesses.clone());
+                        }
+                    }
+                }
+
+                // 2. Upward ancestor traversal
+                if effective_node.secret_accesses.is_empty() || effective_node.ancestor_script.is_none() {
+                    let mut curr_ppid = effective_node.ppid;
+                    let mut visited = std::collections::HashSet::new();
+                    visited.insert(effective_tgid);
+                    while curr_ppid > 1 && visited.insert(curr_ppid) {
+                        let ancestor_opt = lineage_tracker.get(curr_ppid)
+                            .or_else(|| LineageTracker::discover_from_procfs(curr_ppid));
+
+                        if let Some(mut ancestor) = ancestor_opt {
+                            if ancestor.cmdline.len() <= 1 || ancestor.script_path.is_none() {
+                                if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", curr_ppid)) {
+                                    let cmd: Vec<String> = bytes
+                                        .split(|&b| b == 0)
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| String::from_utf8_lossy(s).to_string())
+                                        .collect();
+                                    if !cmd.is_empty() {
+                                        if let Some(info) = crate::lineage::tracker::inspect_interpreter(&ancestor.exe_path, &cmd) {
+                                            if let Some(sp) = info.script_path {
+                                                ancestor.script_path = Some(sp);
+                                                ancestor.is_interactive_shell = false;
+                                            }
+                                        }
+                                        if cmd.iter().any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c") {
+                                            ancestor.is_interactive_shell = false;
+                                        }
+                                        ancestor.cmdline = cmd;
+                                    }
+                                }
+                            }
+
+                            if effective_node.ancestor_script.is_none() {
+                                effective_node.ancestor_script = ancestor.script_path.clone().or_else(|| ancestor.ancestor_script.clone());
+                            }
+                            if !ancestor.secret_accesses.is_empty() {
+                                effective_node.secret_accesses.extend(ancestor.secret_accesses.clone());
+                                break;
+                            }
+                            if ancestor.is_interactive_shell && ancestor.secret_accesses.is_empty() {
+                                break;
+                            }
+                            curr_ppid = ancestor.ppid;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // 3. Dual-domain / cross-namespace fallback: If still no secrets recorded, check for recent taint
+                if effective_node.secret_accesses.is_empty() {
+                    if let Some(tainted) = lineage_tracker.find_recent_tainted(now_ns, 30_000_000_000) {
+                        warn!(
+                            "Cross-namespace taint correlation: associating network connect from TGID {} with recent tainted process TGID {} ({})",
+                            effective_tgid, tainted.tgid, tainted.display_name()
+                        );
+                        if effective_node.ancestor_script.is_none() {
+                            effective_node.ancestor_script = tainted.script_path.clone().or_else(|| tainted.ancestor_script.clone());
+                        }
+                        effective_node.secret_accesses.extend(tainted.secret_accesses.clone());
+                        if effective_node.group_leader_tgid <= 1 {
+                            effective_node.group_leader_tgid = tainted.group_leader_tgid;
+                        }
+                    }
+                }
+
                 // Contextual Policy Pre-Approval Check: ("who + what secret + where to connect")
-                let last_secret = node.secret_accesses.last();
+                let last_secret = effective_node.secret_accesses.last();
                 if let Some(rule) = context_policy.is_allowed(
-                    &node.exe_path,
-                    node.exe_sha256.as_deref(),
+                    &effective_node.exe_path,
+                    effective_node.exe_sha256.as_deref(),
                     last_secret.map(|s| &s.category),
                     dest_ip.as_deref(),
                     dst_port,
@@ -407,26 +539,26 @@ async fn main() -> anyhow::Result<()> {
                 ) {
                     info!(
                         "CONTEXT POLICY PRE-APPROVED: Flow allowed by rule '{}' for TGID {} ({}) -> {}:{}",
-                        rule.id, tgid, node.display_name(), dest_ip.as_deref().unwrap_or("?"), dst_port
+                        rule.id, tgid, effective_node.display_name(), dest_ip.as_deref().unwrap_or("?"), dst_port
                     );
                     ipc_server.broadcast_event(IpcMessage::Event {
                         timestamp: chrono::Utc::now().to_rfc3339(),
-                        summary: format!("Pre-approved contextual flow ({}) for {}", rule.id, node.display_name()),
+                        summary: format!("Pre-approved contextual flow ({}) for {}", rule.id, effective_node.display_name()),
                         risk_score: Some(0),
                     });
                     continue;
                 }
 
                 // TOFU Check for software outside dpkg
-                let is_tofu_target = TofuManager::is_non_dpkg_target(&node.exe_path);
+                let is_tofu_target = TofuManager::is_non_dpkg_target(&effective_node.exe_path);
                 let mut is_tofu_tampered = false;
                 if is_tofu_target {
-                    if let Some(ref sha) = node.exe_sha256 {
-                        match tofu_mgr.check_or_register(&node.exe_path, sha) {
+                    if let Some(ref sha) = effective_node.exe_sha256 {
+                        match tofu_mgr.check_or_register(&effective_node.exe_path, sha) {
                             TofuCheckResult::Tampered { expected, actual } => {
                                 warn!(
                                     "TOFU TAMPER ALERT: Binary {} hash mismatch! Expected {}, got {}",
-                                    node.exe_path.display(), expected, actual
+                                    effective_node.exe_path.display(), expected, actual
                                 );
                                 is_tofu_tampered = true;
                             }
@@ -446,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
                     dest_domain: None,
                 };
 
-                let score = risk_engine.evaluate(&node, &net_ctx);
+                let score = risk_engine.evaluate(&effective_node, &net_ctx);
                 let verdict = verdict_router.route(&score);
                 let chain = lineage_tracker.get_ancestor_chain(tgid);
 
@@ -495,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
                     Verdict::Grey => {
-                        let exe_name = node
+                        let exe_name = effective_node
                             .exe_path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
@@ -547,7 +679,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Verdict::High => {
                         // Immediate freeze and block (respecting Never-Freeze Allowlist)
-                        let _ = freeze_orchestrator.freeze_process(tgid, &node.exe_path, node.uid);
+                        let _ = freeze_orchestrator.freeze_process(effective_tgid, &effective_node.exe_path, effective_node.uid);
+                        if let Some(ref ip) = dest_ip {
+                            crate::network::nftables::NftablesManager::block_ip(ip);
+                        }
+                        let _ = freeze_orchestrator.terminate_process(effective_tgid, &effective_node.exe_name(), effective_node.uid);
+                        if effective_node.ppid > 1 {
+                            let _ = freeze_orchestrator.terminate_process(effective_node.ppid, "stealer_parent", effective_node.uid);
+                        }
+                        if effective_node.group_leader_tgid > 1 && effective_node.group_leader_tgid != effective_tgid && effective_node.group_leader_tgid != effective_node.ppid {
+                            let leader_is_interactive = lineage_tracker.get(effective_node.group_leader_tgid)
+                                .map(|n| n.is_interactive_shell && n.script_path.is_none())
+                                .unwrap_or(false);
+                            if !leader_is_interactive {
+                                let _ = freeze_orchestrator.terminate_process(effective_node.group_leader_tgid, "stealer_group_leader", effective_node.uid);
+                            }
+                        }
+                        if effective_tgid != tgid {
+                            let _ = freeze_orchestrator.terminate_process(tgid, "stealer_host_pid", effective_node.uid);
+                        }
                         ipc_server.broadcast_event(IpcMessage::Event {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             summary: report.human_summary,
@@ -560,6 +710,59 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn find_process_for_destination(dest_ip: &str, dest_port: u16) -> Option<u32> {
+    // 1. Scan /proc for cmdline matching dest_ip
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let s = file_name.to_string_lossy();
+            if let Ok(pid) = s.parse::<u32>() {
+                if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", pid)) {
+                    let cmd = String::from_utf8_lossy(&bytes);
+                    if cmd.contains(dest_ip) {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check /proc/net/tcp for matching IP:port -> inode -> /proc/<pid>/fd/*
+    if let Ok(ip) = dest_ip.parse::<std::net::Ipv4Addr>() {
+        let octets = ip.octets();
+        let target_hex = format!("{:02X}{:02X}{:02X}{:02X}:{:04X}", octets[3], octets[2], octets[1], octets[0], dest_port);
+        if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
+            for line in tcp_content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 9 && parts[2].eq_ignore_ascii_case(&target_hex) {
+                    let inode = parts[9];
+                    let sock_target = format!("socket:[{}]", inode);
+                    if let Ok(entries) = std::fs::read_dir("/proc") {
+                        for entry in entries.flatten() {
+                            let file_name = entry.file_name();
+                            let s = file_name.to_string_lossy();
+                            if let Ok(pid) = s.parse::<u32>() {
+                                let fd_dir = format!("/proc/{}/fd", pid);
+                                if let Ok(fds) = std::fs::read_dir(&fd_dir) {
+                                    for fd in fds.flatten() {
+                                        if let Ok(link) = std::fs::read_link(fd.path()) {
+                                            if link.to_string_lossy() == sock_target {
+                                                return Some(pid);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn resolve_config_path(primary: &Path, fallback: &str) -> PathBuf {
