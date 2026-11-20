@@ -70,6 +70,10 @@ impl NeverFreezeChecker {
             || exe_name.starts_with("xfce4-")
             || exe_name.starts_with("mate-")
             || exe_name.starts_with("plasma")
+            || exe_name.starts_with("lightdm")
+            || exe_name.starts_with("gdm")
+            || exe_name.starts_with("sddm")
+            || exe_name.starts_with("steam")
         {
             return true;
         }

@@ -50,6 +50,7 @@ pub fn simulate_file_open_check(
     // 2. SSH Keys App Scope validation
     if path_str.contains("/.ssh/") || (path_str.starts_with("/etc/ssh/ssh_host_") && path_str.ends_with("_key")) {
         if !current_exe.ends_with("/ssh")
+            && !current_exe.ends_with("/scp")
             && !current_exe.ends_with("/ssh-add")
             && !current_exe.ends_with("/sftp")
             && !current_exe.ends_with("/sshd")
@@ -110,6 +111,11 @@ pub fn simulate_file_open_check(
 
     // 5. Browser Credentials App Scope validation
     if path_str.contains("cookies.sqlite") || path_str.contains("/Cookies") || path_str.contains("/Login Data") {
+        // Exclude Steam internal CEF caches and game runtime data
+        if path_str.contains("/Steam/") || path_str.contains("/.steam/") || path_str.contains("/steamapps/") {
+            return None;
+        }
+
         if !current_exe.ends_with("/firefox")
             && !current_exe.ends_with("/firefox-esr")
             && !current_exe.ends_with("/firefox-bin")
@@ -121,6 +127,8 @@ pub fn simulate_file_open_check(
             && !current_exe.ends_with("/brave-browser")
             && !current_exe.ends_with("/opera")
             && !current_exe.ends_with("/vivaldi-bin")
+            && !current_exe.contains("steam")
+            && !current_exe.contains("steamapps")
         {
             return Some(SecretCategory::BrowserCookies);
         }

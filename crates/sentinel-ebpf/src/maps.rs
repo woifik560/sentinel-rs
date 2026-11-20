@@ -509,6 +509,8 @@ impl TaintHygiene {
                 | "chromium-browser"
                 | "brave"
                 | "brave-browser"
+                | "steam"
+                | "steamwebhelper"
                 | "node"
                 | "nodejs"
                 | "java"

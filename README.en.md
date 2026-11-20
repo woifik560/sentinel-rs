@@ -180,6 +180,7 @@ sudo sntctl process kill <PID>     # Safely terminate process with anti-PID-reus
 # -------------------------------------------------------------
 sntctl incidents list              # List recorded security incidents
 sntctl incidents show <ID>         # Show detailed forensic report with computed risk score
+sudo sntctl incidents clear        # Clear all recorded security incidents
 
 # -------------------------------------------------------------
 # 5. Network Containment
@@ -187,6 +188,15 @@ sntctl incidents show <ID>         # Show detailed forensic report with computed
 sntctl network status              # Netfilter and NFQUEUE holding status
 sudo sntctl network isolate        # Emergency host network containment (drops outbound except loopback)
 sudo sntctl network unisolate      # Release containment and restore regular traffic
+
+# -------------------------------------------------------------
+# 6. Disabling, Enabling & Firewall Control
+# -------------------------------------------------------------
+sudo sntctl protection disable     # Disable threat blocking (audit mode: logging only)
+sudo sntctl protection enable      # Enable active threat blocking
+sudo systemctl stop sentineld      # Completely stop the Sentinel daemon
+sudo systemctl start sentineld     # Start Sentinel daemon
+sudo nft flush table inet sentinel # Flush all Sentinel kernel netfilter rules (unblock)
 ```
 
 ---
