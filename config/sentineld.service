@@ -30,18 +30,18 @@ CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PT
 # -------------------------------------------------------------
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/run/sentinel /var/lib/sentinel /tmp
+ReadWritePaths=/run/sentinel /var/lib/sentinel /tmp /sys/kernel/tracing
 PrivateTmp=yes
 LockPersonality=yes
 RestrictNamespaces=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 NoNewPrivileges=yes
-ProtectKernelTunables=yes
+ProtectKernelTunables=no
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectClock=yes
-SystemCallFilter=@system-service @network-io @bpf @signal
+SystemCallFilter=@system-service @network-io @bpf @signal fanotify_init fanotify_mark
 SystemCallErrorNumber=EPERM
 
 # -------------------------------------------------------------
