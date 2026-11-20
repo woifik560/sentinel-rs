@@ -21,6 +21,8 @@ pub enum IncidentsAction {
     Export {
         incident_id: String,
     },
+    /// Clear all security incidents
+    Clear,
 }
 
 pub async fn run_incidents(socket_path: &Path, action: IncidentsAction, json_output: bool) -> anyhow::Result<()> {
@@ -28,6 +30,7 @@ pub async fn run_incidents(socket_path: &Path, action: IncidentsAction, json_out
         IncidentsAction::List { limit } => IpcCommand::IncidentsList { limit: Some(limit), offset: Some(0) },
         IncidentsAction::Show { incident_id } => IpcCommand::IncidentsShow { incident_id },
         IncidentsAction::Export { incident_id } => IpcCommand::IncidentsShow { incident_id },
+        IncidentsAction::Clear => IpcCommand::IncidentsClear,
     };
 
     let resp = send_command(socket_path, cmd).await?;

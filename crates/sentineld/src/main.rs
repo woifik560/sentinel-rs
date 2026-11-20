@@ -604,8 +604,10 @@ async fn main() -> anyhow::Result<()> {
                     score.firings.clone(),
                 );
 
-                if let Ok(json) = serde_json::to_string_pretty(&report) {
-                    ipc_server.store_incident_json(incident_id.clone(), json).await;
+                if verdict != Verdict::Low {
+                    if let Ok(json) = serde_json::to_string_pretty(&report) {
+                        ipc_server.store_incident_json(incident_id.clone(), json).await;
+                    }
                 }
 
                 if config.general.audit_only {

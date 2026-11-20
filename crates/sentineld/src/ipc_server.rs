@@ -431,6 +431,12 @@ async fn handle_ipc_command(
             let keys: Vec<String> = map.keys().cloned().collect();
             IpcResponse::Ok(serde_json::json!({ "incidents": keys }))
         }
+        IpcCommand::IncidentsClear => {
+            let mut map = incidents.write().await;
+            let count = map.len();
+            map.clear();
+            IpcResponse::Ok(serde_json::json!({ "status": "cleared", "cleared_count": count }))
+        }
         IpcCommand::IncidentsShow { incident_id } => {
             let map = incidents.read().await;
             if let Some(data) = map.get(&incident_id) {

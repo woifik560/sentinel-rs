@@ -139,6 +139,8 @@ pub enum IpcCommand {
     IncidentsShow { incident_id: String },
     /// sntctl incidents export <ID>
     IncidentsExport { incident_id: String, format: String },
+    /// sntctl incidents clear
+    IncidentsClear,
     /// sntctl policy list
     PolicyList,
     /// sntctl policy show <ID>
