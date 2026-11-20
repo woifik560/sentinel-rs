@@ -111,9 +111,16 @@ pub fn simulate_file_open_check(
     // 5. Browser Credentials App Scope validation
     if path_str.contains("cookies.sqlite") || path_str.contains("/Cookies") || path_str.contains("/Login Data") {
         if !current_exe.ends_with("/firefox")
+            && !current_exe.ends_with("/firefox-esr")
+            && !current_exe.ends_with("/firefox-bin")
             && !current_exe.ends_with("/chrome")
+            && !current_exe.ends_with("/google-chrome")
             && !current_exe.ends_with("/chromium")
+            && !current_exe.ends_with("/chromium-browser")
             && !current_exe.ends_with("/brave")
+            && !current_exe.ends_with("/brave-browser")
+            && !current_exe.ends_with("/opera")
+            && !current_exe.ends_with("/vivaldi-bin")
         {
             return Some(SecretCategory::BrowserCookies);
         }

@@ -360,9 +360,15 @@ impl TaintHygiene {
 
     /// Return the scoped secret domain bitmask owned by this executable name (Owner Policy).
     pub fn get_owner_secret_domain(exe_name: &str) -> u64 {
-        if exe_name == "chrome" || exe_name == "google-chrome" || exe_name == "chromium" || exe_name == "brave" {
+        if exe_name == "chrome"
+            || exe_name == "google-chrome"
+            || exe_name == "chromium"
+            || exe_name == "chromium-browser"
+            || exe_name == "brave"
+            || exe_name == "brave-browser"
+        {
             TaintFlags::BIT_CHROMIUM_DATA
-        } else if exe_name == "firefox" || exe_name == "firefox-bin" {
+        } else if exe_name == "firefox" || exe_name == "firefox-esr" || exe_name == "firefox-bin" {
             TaintFlags::BIT_FIREFOX_DATA
         } else if exe_name == "Telegram" || exe_name == "telegram-desktop" {
             TaintFlags::BIT_TELEGRAM_DATA
@@ -497,8 +503,12 @@ impl TaintHygiene {
             "chrome"
                 | "google-chrome"
                 | "firefox"
+                | "firefox-esr"
                 | "firefox-bin"
                 | "chromium"
+                | "chromium-browser"
+                | "brave"
+                | "brave-browser"
                 | "node"
                 | "nodejs"
                 | "java"

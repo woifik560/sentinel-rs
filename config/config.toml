@@ -28,7 +28,10 @@ db_path = "/var/lib/sentinel/tofu.json"
 [whitelist]
 binaries = [
     "/usr/bin/apt",
-    "/usr/lib/firefox/firefox"
+    "/usr/lib/firefox/firefox",
+    "/usr/lib/firefox-esr/firefox-esr",
+    "/usr/bin/firefox-esr",
+    "/usr/bin/firefox"
 ]
 
 [[context_rules]]

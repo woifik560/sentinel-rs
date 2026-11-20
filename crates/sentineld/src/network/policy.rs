@@ -64,7 +64,13 @@ impl NeverFreezeChecker {
             return true;
         }
 
-        if exe_name.starts_with("kwin") || exe_name.starts_with("pipewire") {
+        if exe_name.starts_with("kwin")
+            || exe_name.starts_with("pipewire")
+            || exe_name.starts_with("lxpanel")
+            || exe_name.starts_with("xfce4-")
+            || exe_name.starts_with("mate-")
+            || exe_name.starts_with("plasma")
+        {
             return true;
         }
 

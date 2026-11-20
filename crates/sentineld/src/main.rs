@@ -681,7 +681,9 @@ async fn main() -> anyhow::Result<()> {
                         // Immediate freeze and block (respecting Never-Freeze Allowlist)
                         let _ = freeze_orchestrator.freeze_process(effective_tgid, &effective_node.exe_path, effective_node.uid);
                         if let Some(ref ip) = dest_ip {
-                            crate::network::nftables::NftablesManager::block_ip(ip);
+                            if ip != "0.0.0.0" && ip != "127.0.0.1" && !ip.starts_with("127.") && !ip.is_empty() {
+                                crate::network::nftables::NftablesManager::block_ip(ip);
+                            }
                         }
                         let _ = freeze_orchestrator.terminate_process(effective_tgid, &effective_node.exe_name(), effective_node.uid);
                         if effective_node.ppid > 1 {
