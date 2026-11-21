@@ -689,18 +689,20 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let _ = freeze_orchestrator.terminate_process(effective_tgid, &effective_node.exe_name(), effective_node.uid);
                         if effective_node.ppid > 1 {
-                            let _ = freeze_orchestrator.terminate_process(effective_node.ppid, "stealer_parent", effective_node.uid);
-                        }
-                        if effective_node.group_leader_tgid > 1 && effective_node.group_leader_tgid != effective_tgid && effective_node.group_leader_tgid != effective_node.ppid {
-                            let leader_is_interactive = lineage_tracker.get(effective_node.group_leader_tgid)
-                                .map(|n| n.is_interactive_shell && n.script_path.is_none())
-                                .unwrap_or(false);
-                            if !leader_is_interactive {
-                                let _ = freeze_orchestrator.terminate_process(effective_node.group_leader_tgid, "stealer_group_leader", effective_node.uid);
+                            // Only terminate parent if it is executing an untrusted script or payload, never interactive shell or desktop manager
+                            let parent_node = lineage_tracker.get(effective_node.ppid)
+                                .or_else(|| LineageTracker::discover_from_procfs(effective_node.ppid));
+                            if let Some(parent) = parent_node {
+                                if !parent.is_interactive_shell && (parent.script_path.is_some() || parent.ancestor_script.is_some()) {
+                                    let _ = freeze_orchestrator.terminate_process(effective_node.ppid, &parent.exe_name(), parent.uid);
+                                }
                             }
                         }
                         if effective_tgid != tgid {
-                            let _ = freeze_orchestrator.terminate_process(tgid, "stealer_host_pid", effective_node.uid);
+                            let host_exe = lineage_tracker.get(tgid)
+                                .map(|n| n.exe_name())
+                                .unwrap_or_else(|| "stealer_host_pid".to_string());
+                            let _ = freeze_orchestrator.terminate_process(tgid, &host_exe, effective_node.uid);
                         }
                         ipc_server.broadcast_event(IpcMessage::Event {
                             timestamp: chrono::Utc::now().to_rfc3339(),

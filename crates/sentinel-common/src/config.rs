@@ -129,6 +129,19 @@ pub fn default_never_freeze_list() -> Vec<String> {
         "foot".into(),
         "wezterm".into(),
         "xterm".into(),
+        "lxterminal".into(),
+        "xfce4-terminal".into(),
+        "mate-terminal".into(),
+        "qterminal".into(),
+        "pcmanfm".into(),
+        "thunar".into(),
+        "nautilus".into(),
+        "nemo".into(),
+        "dolphin".into(),
+        "lxpolkit".into(),
+        "polkit-gnome-authentication-agent-1".into(),
+        "polkit-mate-authentication-agent-1".into(),
+        "lxsession-default-apps".into(),
     ]
 }
 

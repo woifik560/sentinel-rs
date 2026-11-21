@@ -7,7 +7,7 @@
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -56,9 +56,9 @@ impl NeverFreezeChecker {
     /// Determines if a process is protected from SIGSTOP / SIGKILL freezes.
     ///
     /// Validates canonical path, origin directory, UID, and PID.
-    pub fn is_protected(&self, tgid: u32, exe_path: &Path, uid: u32) -> bool {
+    pub fn is_protected(&self, tgid: u32, exe_path: &Path, _uid: u32) -> bool {
         // PID 1 (init / systemd) is always protected
-        if tgid == 1 {
+        if tgid <= 1 {
             return true;
         }
 
@@ -74,6 +74,40 @@ impl NeverFreezeChecker {
             return false;
         }
 
+        let exe_name = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| path_str.as_ref());
+
+        // Fast-path protection check for critical system daemons, session managers and desktop UI
+        if exe_name.starts_with("systemd")
+            || exe_name.starts_with("dbus")
+            || exe_name.starts_with("udevd")
+            || exe_name.starts_with("sntctl")
+            || exe_name.starts_with("sentinelctl")
+            || exe_name.starts_with("lightdm")
+            || exe_name.starts_with("gdm")
+            || exe_name.starts_with("sddm")
+            || exe_name.starts_with("lxdm")
+            || exe_name.starts_with("xdm")
+            || exe_name.starts_with("lxsession")
+            || exe_name.starts_with("lxpanel")
+            || exe_name.starts_with("lxterminal")
+            || exe_name.starts_with("lxpolkit")
+            || exe_name.starts_with("openbox")
+            || exe_name.starts_with("pcmanfm")
+            || exe_name.starts_with("kwin")
+            || exe_name.starts_with("pipewire")
+            || exe_name.starts_with("xfce4-")
+            || exe_name.starts_with("mate-")
+            || exe_name.starts_with("plasma")
+            || exe_name.starts_with("steam")
+            || exe_name.starts_with("gnome-")
+            || self.protected_names.contains(exe_name)
+        {
+            return true;
+        }
+
         // Canonical binaries must reside in system root locations
         let is_system_dir = path_str.starts_with("/usr/bin/")
             || path_str.starts_with("/bin/")
@@ -82,43 +116,6 @@ impl NeverFreezeChecker {
 
         if !is_system_dir {
             return false;
-        }
-
-        let exe_name = exe_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-
-        // System daemons: require root or system UID (< 1000)
-        if exe_name.starts_with("systemd") || exe_name.starts_with("dbus") || exe_name.starts_with("udevd") {
-            if uid == 0 || uid < 1000 {
-                return true;
-            }
-        }
-
-        // Sentinel infrastructure tools
-        if exe_name == "sntctl" || exe_name == "sentinelctl" {
-            return true;
-        }
-
-        // Desktop compositors and audio: allowed under session UID (>= 1000) or root
-        if self.protected_names.contains(exe_name) {
-            return true;
-        }
-
-        // Wildcard prefix matches (e.g. kwin*, pipewire*, lxpanel*, xfce4-*, mate-*, lightdm*, gdm*, sddm*, steam*)
-        if exe_name.starts_with("kwin")
-            || exe_name.starts_with("pipewire")
-            || exe_name.starts_with("lxpanel")
-            || exe_name.starts_with("xfce4-")
-            || exe_name.starts_with("mate-")
-            || exe_name.starts_with("plasma")
-            || exe_name.starts_with("lightdm")
-            || exe_name.starts_with("gdm")
-            || exe_name.starts_with("sddm")
-            || exe_name.starts_with("steam")
-        {
-            return true;
         }
 
         false
@@ -425,15 +422,34 @@ impl FreezeInspectOrchestrator {
 
     /// Terminate a rogue process with SIGKILL, respecting Never-Freeze list.
     pub fn terminate_process(&self, tgid: u32, exe_name: &str, uid: u32) -> anyhow::Result<()> {
-        if self.never_freeze.is_protected(tgid, Path::new(exe_name), uid) {
+        if tgid <= 1 {
+            return Ok(());
+        }
+
+        // Always resolve actual canonical executable path from /proc/<tgid>/exe
+        let real_exe_path = std::fs::read_link(format!("/proc/{}/exe", tgid))
+            .unwrap_or_else(|_| PathBuf::from(exe_name));
+
+        // Read real UID from /proc/<tgid>/status if available
+        let real_uid = std::fs::read_to_string(format!("/proc/{}/status", tgid))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|line| line.starts_with("Uid:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|u| u.parse::<u32>().ok())
+            })
+            .unwrap_or(uid);
+
+        if self.never_freeze.is_protected(tgid, &real_exe_path, real_uid) {
             error!(
                 "NEVER-FREEZE SAFETY: Prevented SIGKILL on protected system process: TGID {} ({})",
-                tgid, exe_name
+                tgid, real_exe_path.display()
             );
             return Ok(());
         }
 
-        error!("Sending SIGKILL to terminate malicious TGID {} ({})", tgid, exe_name);
+        error!("Sending SIGKILL to terminate malicious TGID {} ({})", tgid, real_exe_path.display());
         let pid = Pid::from_raw(tgid as i32);
         kill(pid, Signal::SIGKILL)
             .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL to TGID {}: {}", tgid, e))?;
