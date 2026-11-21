@@ -38,6 +38,79 @@ pub enum SecretCategory {
     Other(String),
 }
 
+/// Canonical process identity with PID, TGID, start timestamp, PID namespace, and binary provenance.
+/// Uniquely distinguishes process execution instances across kernel PID reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub tgid: u32,
+    pub start_time_ns: u64,
+    pub pid_namespace: u64,
+    pub exe_path: Option<PathBuf>,
+    pub dev_ino: Option<(u64, u64)>,
+}
+
+impl ProcessIdentity {
+    pub fn new(pid: u32, tgid: u32, start_time_ns: u64) -> Self {
+        Self {
+            pid,
+            tgid,
+            start_time_ns,
+            pid_namespace: 0,
+            exe_path: None,
+            dev_ino: None,
+        }
+    }
+
+    pub fn with_namespace(mut self, pid_namespace: u64) -> Self {
+        self.pid_namespace = pid_namespace;
+        self
+    }
+
+    pub fn with_exe(mut self, exe_path: PathBuf, dev_ino: (u64, u64)) -> Self {
+        self.exe_path = Some(exe_path);
+        self.dev_ino = Some(dev_ino);
+        self
+    }
+}
+
+/// Typed taint propagation levels (TASK-P1-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TaintLevel {
+    None,
+    Observed,
+    SensitiveAccess,
+    SuspectedPropagation,
+    ConfirmedPropagation,
+}
+
+impl Default for TaintLevel {
+    fn default() -> Self {
+        TaintLevel::None
+    }
+}
+
+/// Typed sensitive secret sources.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SensitiveSource {
+    SshPrivateKey,
+    GpgKey,
+    BrowserVault,
+    CryptoWallet,
+    CloudToken,
+    CustomPath(PathBuf),
+}
+
+/// Contextual taint record capturing who, when, what, and how taint propagated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaintRecord {
+    pub level: TaintLevel,
+    pub source: SensitiveSource,
+    pub target_path: PathBuf,
+    pub timestamp_ns: u64,
+    pub propagation_mechanism: Option<String>,
+}
+
 /// A single secret access event recorded by eBPF `lsm/file_open` or inherited via `lsm/file_permission`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretAccessEvent {
@@ -101,6 +174,12 @@ pub struct ProcessNode {
     pub contacted_ips: HashSet<String>,
     /// All secret file accesses performed or inherited by this process.
     pub secret_accesses: Vec<SecretAccessEvent>,
+    /// Typed taint level of the process (TASK-P1-13).
+    #[serde(default)]
+    pub taint_level: TaintLevel,
+    /// Contextual records tracking how and where taint was acquired or propagated.
+    #[serde(default)]
+    pub taint_records: Vec<TaintRecord>,
 }
 
 impl ProcessNode {
@@ -130,6 +209,8 @@ impl ProcessNode {
             is_interactive_shell: false,
             contacted_ips: HashSet::new(),
             secret_accesses: Vec::new(),
+            taint_level: TaintLevel::None,
+            taint_records: Vec::new(),
         }
     }
 
@@ -218,6 +299,18 @@ impl ProcessNode {
     pub fn is_system_path(&self) -> bool {
         let s = self.exe_path.to_string_lossy();
         s.starts_with("/usr/") || s.starts_with("/opt/") || s.starts_with("/bin/") || s.starts_with("/lib/")
+    }
+
+    /// Extract canonical ProcessIdentity for this process node.
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.tgid,
+            tgid: self.tgid,
+            start_time_ns: self.start_time_ns,
+            pid_namespace: 0,
+            exe_path: Some(self.exe_path.clone()),
+            dev_ino: Some(self.exe_dev_ino),
+        }
     }
 }
 

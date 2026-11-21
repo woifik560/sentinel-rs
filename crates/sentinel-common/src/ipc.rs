@@ -167,6 +167,10 @@ pub enum IpcCommand {
     NetworkBlocked,
     /// sntctl network isolate
     NetworkIsolate,
+    /// sntctl network isolate-timed
+    NetworkIsolateTimed { tier: String, timeout_secs: u64, trusted_ssh_ips: Vec<String> },
+    /// sntctl network confirm-isolation
+    NetworkConfirmIsolation,
     /// sntctl network unisolate
     NetworkUnisolate,
     /// sntctl config validate

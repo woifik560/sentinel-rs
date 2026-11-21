@@ -213,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Network { action } => {
             let default_sock = match action {
-                NetworkAction::Isolate | NetworkAction::Unisolate => DEFAULT_PRIVILEGED_SOCKET,
+                NetworkAction::Isolate { .. } | NetworkAction::Unisolate | NetworkAction::ConfirmIsolation => DEFAULT_PRIVILEGED_SOCKET,
                 _ => DEFAULT_READONLY_SOCKET,
             };
             let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));

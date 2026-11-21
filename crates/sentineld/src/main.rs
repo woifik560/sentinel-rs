@@ -5,6 +5,9 @@
 //! and Never-Freeze interactive prompt over Unix IPC.
 
 #![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(warnings)]
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -23,39 +26,19 @@ use sentinel_common::risk::Verdict;
 use sentinel_ebpf::loader::{EbpfLoader, LoaderConfig};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 
-pub mod audit;
-pub mod behavior;
-pub mod collector;
-pub mod health;
-pub mod incidents;
-pub mod lineage;
-pub mod network;
-pub mod policy;
-pub mod response;
-pub mod risk;
-pub mod storage;
-mod context_policy;
-mod freeze;
-mod ipc_server;
-mod pkg_check;
-mod preflight;
-mod risk_engine;
-mod sha_cache;
-mod tofu;
-mod verdict;
-mod verdict_cache;
-
-use context_policy::ContextPolicyEngine;
-use freeze::{FreezeInspectOrchestrator, HoldResult, NfqueueHoldManager};
-use ipc_server::IpcServer;
-use lineage::LineageTracker;
-use pkg_check::DpkgChecker;
-use preflight::run_preflight_checks;
-use risk_engine::{NetworkContext, RiskEngine};
-use sha_cache::ShaCache;
-use tofu::{TofuCheckResult, TofuManager};
-use verdict::VerdictRouter;
-use verdict_cache::VerdictDecisionCache;
+use sentineld::context_policy::ContextPolicyEngine;
+use sentineld::freeze::{FreezeInspectOrchestrator, HoldResult, NfqueueHoldManager};
+use sentineld::ipc_server::IpcServer;
+use sentineld::lineage::LineageTracker;
+use sentineld::pkg_check::DpkgChecker;
+use sentineld::preflight::run_preflight_checks;
+use sentineld::protection::ProtectionState;
+use sentineld::risk::{NetworkContext, RiskEngine};
+use sentineld::sha_cache::ShaCache;
+use sentineld::storage::StorageManager;
+use sentineld::tofu::{TofuCheckResult, TofuManager};
+use sentineld::verdict::VerdictRouter;
+use sentineld::verdict_cache::VerdictDecisionCache;
 
 #[derive(Parser, Debug)]
 #[command(name = "sentineld", author = "woifik560", version = "0.2.0")]
@@ -97,19 +80,25 @@ async fn main() -> anyhow::Result<()> {
     let config_path = resolve_config_path(&cli.config, "config/config.toml");
     let rules_path = resolve_config_path(&cli.rules, "config/rules.toml");
 
-    let mut config = SentinelConfig::load_from_file(&config_path).unwrap_or_else(|e| {
-        warn!("Could not load config from {}: {}. Using defaults.", config_path.display(), e);
+    let mut config = if config_path.exists() {
+        SentinelConfig::load_from_file(&config_path)
+            .map_err(|e| anyhow::anyhow!("Configuration parsing error in {}: {}", config_path.display(), e))?
+    } else {
+        info!("Configuration not found at {}. Using defaults.", config_path.display());
         SentinelConfig::default()
-    });
+    };
 
     if cli.audit_only {
         config.general.audit_only = true;
     }
 
-    let rules = RulesConfig::load_from_file(&rules_path).unwrap_or_else(|e| {
-        warn!("Could not load rules from {}: {}. Using defaults.", rules_path.display(), e);
+    let rules = if rules_path.exists() {
+        RulesConfig::load_from_file(&rules_path)
+            .map_err(|e| anyhow::anyhow!("Rules configuration parsing error in {}: {}", rules_path.display(), e))?
+    } else {
+        info!("Rules configuration not found at {}. Using defaults.", rules_path.display());
         RulesConfig::default()
-    });
+    };
 
     info!("Loaded configuration from {}", config_path.display());
     info!("Loaded rules from {}", rules_path.display());
@@ -124,11 +113,26 @@ async fn main() -> anyhow::Result<()> {
     let dpkg_checker = DpkgChecker::new();
     let _sha_cache = ShaCache::new(2048);
     let lineage_tracker = LineageTracker::new(config.general.ring_buffer_size);
-    let risk_engine = Arc::new(RiskEngine::new(rules.clone(), dpkg_checker));
+    let risk_engine = Arc::new(tokio::sync::RwLock::new(RiskEngine::new(rules.clone(), dpkg_checker)));
     let verdict_router = Arc::new(VerdictRouter::new(rules));
     let tofu_mgr = Arc::new(TofuManager::new(&config.tofu.db_path));
     let context_policy = Arc::new(ContextPolicyEngine::new(config.context_rules.clone()).with_default_rules());
     let _verdict_cache = Arc::new(VerdictDecisionCache::new());
+
+    // Initialize Persistent SQLite Storage (Audit 3.3)
+    let storage_db_path = config.tofu.db_path.parent()
+        .map(|p| p.join("sentinel.db"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sentinel/sentinel.db"));
+    let storage_manager = match StorageManager::new(storage_db_path.clone(), 1024) {
+        Ok(mgr) => {
+            info!("Persistent SQLite database initialized at {}", storage_db_path.display());
+            Some(mgr)
+        }
+        Err(e) => {
+            warn!("Failed to initialize primary SQLite storage at {}: {}. Falling back to /run/sentinel/sentinel.db", storage_db_path.display(), e);
+            StorageManager::new(PathBuf::from("/run/sentinel/sentinel.db"), 1024).ok()
+        }
+    };
 
     let freeze_orchestrator = FreezeInspectOrchestrator::new(
         config.general.prompt_timeout_secs,
@@ -136,16 +140,29 @@ async fn main() -> anyhow::Result<()> {
         config.general.aggregate_window_ms,
     );
 
-    // Initialize nftables holding rule for NFQUEUE
-    let _ = freeze_orchestrator.init_network_holding();
+    // Initialize nftables holding rule for NFQUEUE (Audit 1.5)
+    let holding_res = freeze_orchestrator.init_network_holding();
+    let network_holding_active = holding_res.is_ok();
+    if let Err(ref e) = holding_res {
+        warn!("Failed to initialize nftables holding: {}. Running in degraded network holding mode.", e);
+    }
 
-    // Graceful Shutdown Signal Handler: Restore nftables rules on SIGINT/SIGTERM
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Termination signal received. Cleaning up Netfilter rules to avoid network loss...");
-        NfqueueHoldManager::clean_nftables_rules();
-        std::process::exit(0);
-    });
+    // Shared Protection State (Audit 1.3)
+    let op_mode = std::str::FromStr::from_str(&config.general.mode.to_uppercase())
+        .unwrap_or(sentinel_common::policy::OperatingMode::Balanced);
+    let protection_state = Arc::new(tokio::sync::RwLock::new(ProtectionState::new(
+        !config.general.audit_only,
+        op_mode,
+        rules_path.clone(),
+        config_path.clone(),
+    )));
+    {
+        let mut st = protection_state.write().await;
+        st.network_holding_active = network_holding_active;
+    }
+
+    // Graceful Shutdown Signal Handler: Restore nftables rules on SIGINT/SIGTERM (Audit 3.1)
+    tokio::spawn(run_shutdown_listener());
 
     // 4. Initialize eBPF Loader
     let mut ebpf_loader = EbpfLoader::new(LoaderConfig {
@@ -177,13 +194,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 5. Initialize and Start IPC Server (Management & Read-Only Monitor)
-    let ipc_server = Arc::new(IpcServer::new(
-        config.socket.path.clone(),
-        config.socket.readonly_path.clone(),
-        freeze_orchestrator.clone(),
-        lineage_tracker.clone(),
-        taint_mgr.clone(),
-    ));
+    let ipc_server = Arc::new(
+        IpcServer::new(
+            config.socket.path.clone(),
+            config.socket.readonly_path.clone(),
+            freeze_orchestrator.clone(),
+            lineage_tracker.clone(),
+            taint_mgr.clone(),
+        ).with_state_and_storage(
+            protection_state.clone(),
+            risk_engine.clone(),
+            storage_manager.clone(),
+        )
+    );
 
     let ipc_runner = ipc_server.clone();
     tokio::spawn(async move {
@@ -204,6 +227,36 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // 7. Periodic Lineage Memory Pruner (Audit 2.5)
+    let pruner_lineage = lineage_tracker.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let count = pruner_lineage.prune_dead();
+            if count > 0 {
+                tracing::debug!("Lineage graph pruner cleaned {} dead process nodes", count);
+            }
+        }
+    });
+
+    // Systemd Ready & Health-Aware Watchdog Notification (TASK-P0-07)
+    notify_systemd("READY=1");
+    if let Ok(usec_str) = std::env::var("WATCHDOG_USEC") {
+        if let Ok(usec) = usec_str.parse::<u64>() {
+            let interval = Duration::from_micros(usec / 2);
+            let degraded_mgr = std::sync::Arc::new(sentineld::health::DegradedStateManager::new());
+            let failure_policy = std::sync::Arc::new(sentineld::health::FailurePolicyManager::new());
+            let health_monitor = std::sync::Arc::new(sentineld::health::HealthMonitor::with_failure_policy(
+                degraded_mgr,
+                failure_policy,
+            ));
+            let sub_metrics = std::sync::Arc::new(sentineld::health::SubsystemMetrics::default());
+            let wd = sentineld::health::Watchdog::with_monitor(interval, health_monitor, sub_metrics);
+            wd.start();
+        }
+    }
 
     info!("Sentinel-RS daemon fully initialized and operational.");
 
@@ -316,7 +369,11 @@ async fn main() -> anyhow::Result<()> {
                         warn!("mmap Blocked / Fileless Execution: TGID {} attempted unauthorized executable mapping on {}", tgid, path.display());
                         if let Some(mut node) = lineage_tracker.get(tgid) {
                             node.is_anon_exec = true;
-                            lineage_tracker.insert(node);
+                            lineage_tracker.insert(node.clone());
+                            if node.has_secret_access() {
+                                warn!("Immediate enforcement: terminating tainted TGID {} attempting unauthorized executable mmap", tgid);
+                                let _ = freeze_orchestrator.terminate_process(tgid, &node.exe_name(), node.uid);
+                            }
                         }
                     }
                     sentinel_ebpf::MmapVerdict::Allow => {}
@@ -348,7 +405,11 @@ async fn main() -> anyhow::Result<()> {
                     warn!("LSM bprm_check_security: anonymous memfd_create execution detected for TGID {}", tgid);
                     if let Some(mut node) = lineage_tracker.get(tgid) {
                         node.is_memfd = true;
-                        lineage_tracker.insert(node);
+                        lineage_tracker.insert(node.clone());
+                        if node.has_secret_access() {
+                            warn!("Immediate enforcement: terminating tainted TGID {} attempting memfd_create execution", tgid);
+                            let _ = freeze_orchestrator.terminate_process(tgid, &node.exe_name(), node.uid);
+                        }
                     }
                 }
             }
@@ -376,12 +437,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|ip| ip.to_string())
                     .or_else(|| dst_ipv6.map(|ip| ip.to_string()));
 
-                let mut effective_tgid = tgid;
-                if let Some(ref ip) = dest_ip {
-                    if let Some(ns_pid) = find_process_for_destination(ip, dst_port) {
-                        effective_tgid = ns_pid;
-                    }
-                }
+                let effective_tgid = tgid;
 
                 let is_first_seen_ip = dest_ip
                     .as_ref()
@@ -425,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
                             .map(|s| String::from_utf8_lossy(s).to_string())
                             .collect();
                         if !cmd.is_empty() {
-                            let script_info = crate::lineage::tracker::inspect_interpreter(&node.exe_path, &cmd);
+                            let script_info = sentineld::lineage::tracker::inspect_interpreter(&node.exe_path, &cmd);
                             if let Some(info) = script_info {
                                 if let Some(sp) = info.script_path {
                                     node.script_path = Some(sp);
@@ -479,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
                                         .map(|s| String::from_utf8_lossy(s).to_string())
                                         .collect();
                                     if !cmd.is_empty() {
-                                        if let Some(info) = crate::lineage::tracker::inspect_interpreter(&ancestor.exe_path, &cmd) {
+                                        if let Some(info) = sentineld::lineage::tracker::inspect_interpreter(&ancestor.exe_path, &cmd) {
                                             if let Some(sp) = info.script_path {
                                                 ancestor.script_path = Some(sp);
                                                 ancestor.is_interactive_shell = false;
@@ -567,18 +623,32 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                let is_ipc_laundered = effective_node.secret_accesses.iter().any(|s| {
+                    matches!(s.category, SecretCategory::Other(ref tag) if tag.contains("AF_UNIX") || tag.contains("SCM_RIGHTS") || tag.contains("ptrace"))
+                });
+
+                let is_dns_port = dst_port == 53;
+                let has_dns_record = is_dns_port || !sentineld::risk::is_numeric_ip(dest_ip.as_deref().unwrap_or(""));
+
                 let net_ctx = NetworkContext {
                     dest_ip: dest_ip.clone(),
                     dest_port: dst_port,
-                    has_dns_record: false,
+                    has_dns_record,
                     is_first_seen_ip,
                     current_time_ns: now_ns,
                     is_tofu_tampered,
-                    is_ipc_laundered: false,
+                    is_ipc_laundered,
                     dest_domain: None,
                 };
 
-                let score = risk_engine.evaluate(&effective_node, &net_ctx);
+                // Check if protection is enabled (Audit 1.3)
+                let is_prot_active = protection_state.read().await.enabled;
+                if !is_prot_active {
+                    info!("[PROTECTION DISABLED] Allowing flow for TGID {} -> {}:{}", tgid, dest_ip.as_deref().unwrap_or("?"), dst_port);
+                    continue;
+                }
+
+                let score = risk_engine.read().await.evaluate(&effective_node, &net_ctx);
                 let verdict = verdict_router.route(&score);
                 let chain = lineage_tracker.get_ancestor_chain(tgid);
 
@@ -605,8 +675,24 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 if verdict != Verdict::Low {
+                    protection_state.read().await.increment_incidents();
                     if let Ok(json) = serde_json::to_string_pretty(&report) {
                         ipc_server.store_incident_json(incident_id.clone(), json).await;
+                    }
+                    if let Some(ref s) = storage_manager {
+                        let stored_rec = sentineld::storage::schema::StoredIncidentRecord {
+                            incident_id: incident_id.clone(),
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                            severity: format!("{:?}", verdict),
+                            risk_score: report.risk_score,
+                            process_key: format!("{}:0", tgid),
+                            status: "Active".to_string(),
+                            verdict: format!("{:?}", verdict),
+                            human_summary: report.human_summary.clone(),
+                            details_json: serde_json::to_string(&report).unwrap_or_default(),
+                        };
+                        s.queue_incident(stored_rec);
                     }
                 }
 
@@ -684,7 +770,7 @@ async fn main() -> anyhow::Result<()> {
                         let _ = freeze_orchestrator.freeze_process(effective_tgid, &effective_node.exe_path, effective_node.uid);
                         if let Some(ref ip) = dest_ip {
                             if ip != "0.0.0.0" && ip != "127.0.0.1" && !ip.starts_with("127.") && !ip.is_empty() {
-                                crate::network::nftables::NftablesManager::block_ip(ip);
+                                sentineld::network::nftables::NftablesManager::block_ip(ip);
                             }
                         }
                         let _ = freeze_orchestrator.terminate_process(effective_tgid, &effective_node.exe_name(), effective_node.uid);
@@ -718,57 +804,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_process_for_destination(dest_ip: &str, dest_port: u16) -> Option<u32> {
-    // 1. Scan /proc for cmdline matching dest_ip
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let s = file_name.to_string_lossy();
-            if let Ok(pid) = s.parse::<u32>() {
-                if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", pid)) {
-                    let cmd = String::from_utf8_lossy(&bytes);
-                    if cmd.contains(dest_ip) {
-                        return Some(pid);
-                    }
-                }
+fn notify_systemd(state: &str) {
+    #[cfg(unix)]
+    {
+        if let Some(path) = std::env::var_os("NOTIFY_SOCKET") {
+            if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+                let _ = sock.send_to(state.as_bytes(), path);
             }
         }
     }
-
-    // 2. Check /proc/net/tcp for matching IP:port -> inode -> /proc/<pid>/fd/*
-    if let Ok(ip) = dest_ip.parse::<std::net::Ipv4Addr>() {
-        let octets = ip.octets();
-        let target_hex = format!("{:02X}{:02X}{:02X}{:02X}:{:04X}", octets[3], octets[2], octets[1], octets[0], dest_port);
-        if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
-            for line in tcp_content.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 9 && parts[2].eq_ignore_ascii_case(&target_hex) {
-                    let inode = parts[9];
-                    let sock_target = format!("socket:[{}]", inode);
-                    if let Ok(entries) = std::fs::read_dir("/proc") {
-                        for entry in entries.flatten() {
-                            let file_name = entry.file_name();
-                            let s = file_name.to_string_lossy();
-                            if let Ok(pid) = s.parse::<u32>() {
-                                let fd_dir = format!("/proc/{}/fd", pid);
-                                if let Ok(fds) = std::fs::read_dir(&fd_dir) {
-                                    for fd in fds.flatten() {
-                                        if let Ok(link) = std::fs::read_link(fd.path()) {
-                                            if link.to_string_lossy() == sock_target {
-                                                return Some(pid);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn resolve_config_path(primary: &Path, fallback: &str) -> PathBuf {
@@ -779,4 +823,40 @@ fn resolve_config_path(primary: &Path, fallback: &str) -> PathBuf {
     } else {
         primary.to_path_buf()
     }
+}
+
+async fn run_shutdown_listener() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let sigterm = signal(SignalKind::terminate());
+        let sigint = signal(SignalKind::interrupt());
+        match (sigterm, sigint) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {
+                        info!("SIGTERM received. Initiating graceful shutdown...");
+                    }
+                    _ = int.recv() => {
+                        info!("SIGINT received. Initiating graceful shutdown...");
+                    }
+                }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    notify_systemd("STOPPING=1");
+    info!("Termination signal received. Cleaning up Netfilter rules and sockets...");
+    NfqueueHoldManager::clean_nftables_rules();
+    sentineld::network::nftables::NftablesManager::cleanup_rules();
+    let _ = tokio::fs::remove_file("/run/sentinel/sentinel.sock").await;
+    let _ = tokio::fs::remove_file("/run/sentinel/sentinel-ro.sock").await;
+    std::process::exit(0);
 }

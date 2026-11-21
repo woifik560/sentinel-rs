@@ -7,7 +7,7 @@ Sentinel-RS operates under a strict Zero-Trust Host Security paradigm:
 2. **Autonomous Determinism**: Prevention, detection, and response decisions occur autonomously via deterministic rules and mathematical risk compounding without requiring interactive user prompts.
 3. **Fail-Closed Default**: In the presence of ambiguous kernel events, saturated queues, or malformed IPC messages, the agent enforces a fail-closed posture for critical threats.
 4. **Kernel-Authenticated Trust Boundaries**: All administrative IPC interactions are authenticated directly by the Linux kernel using `SO_PEERCRED`. No tokens, passwords, or shared secrets are transmitted.
-5. **Anti-PID-Reuse Guarantee**: Process identity incorporates start timestamps from `/proc/<pid>/stat` to eliminate Time-of-Check to Time-of-Use (TOCTOU) races during signal delivery or process termination.
+5. **Anti-PID-Reuse & Safe Signal Delivery Guarantee**: Process identity incorporates start timestamps from `/proc/<pid>/stat`, canonical executable path, and inode to eliminate Time-of-Check to Time-of-Use (TOCTOU) races. Process control relies on Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`), ensuring signals are delivered exclusively to the verified process instance.
 
 ---
 
@@ -81,45 +81,73 @@ When a tainted process attempts:
 
 ---
 
-## 4. Immutable Safety Constraints
+## 4. Immutable Safety Constraints & Process Protection Policy
 
 ### 4.1 The Never-Freeze / Never-Kill Invariant
-To prevent denial-of-service, kernel panics, or agent self-bricking, Sentinel-RS enforces an immutable Stage 1 Safety Filter in the Policy Engine and Response Orchestrator:
+To prevent denial-of-service, kernel panics, or agent self-bricking, Sentinel-RS enforces an immutable Stage 1 Safety Filter via `ProcessProtectionPolicy`:
 
 1. **System Critical Processes**:
    - `PID 1` (`systemd` / init)
    - `PID 2` (`kthreadd`)
    - Any process with `PPID == 0` (kernel worker threads)
+   - Core operating system binaries in trusted paths: `/usr/lib/systemd/*`, `/usr/sbin/sshd`, `/usr/bin/login`, `/usr/bin/sudo`
 2. **Sentinel-RS Processes**:
    - The `sentineld` daemon itself (`std::process::id()`)
+   - The `sentinel-privileged` helper
    - Sub-threads and spawned verification helpers of `sentineld`
 
-Under no circumstances will the agent ever suspend, terminate, or network-isolate these protected identities, even if an administrator manually configures a deny rule.
+### 4.2 Multi-Attribute Anti-Spoofing Verification
+To prevent malware from evading response by masquerading as a protected process (e.g., executing `/tmp/sshd` or naming argv[0] `systemd`), `ProcessProtectionPolicy` validates:
+- Process binary canonical path (`/proc/<pid>/exe`);
+- Filesystem device and inode numbers (`dev_ino`), ensuring binary resides on a trusted read-only/system mount;
+- Package manager provenance (DPKG/RPM database status);
+- Real binary identity vs. self-identity (PID/TGID match).
+
+When a legitimate protected binary is suspected of exploitation, termination is blocked and the response is safely downgraded to `Alert` accompanied by network socket containment.
 
 ---
 
-## 5. Anti-PID-Reuse Verification
+## 5. Anti-PID-Reuse & pidfd Verification Protocol
 
 In Linux systems under high process churn, PIDs are recycled rapidly. A naive `kill(pid, SIGKILL)` introduces a severe race condition where the malicious process exits and a legitimate service receives the recycled PID before the signal arrives.
 
-Sentinel-RS solves this using a two-phase cryptographic process verification protocol:
+Sentinel-RS solves this using Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`) combined with two-phase process identity verification:
 
 ```
-[ 1. Query PID Identity ]
+[ 1. Obtain pidfd & Query Identity ]
        |
+       +---> pidfd = pidfd_open(pid, 0)
        +---> Read /proc/<pid>/stat (extract start_time_ns)
        +---> Readlink /proc/<pid>/exe (extract canonical executable path)
        |
 [ 2. Verify Against ProcessKey ]
        |
-       +---> If start_time != expected_start_time: ABORT (PID Reused)
+       +---> If start_time != expected_start_time: ABORT (Err: PidReuseDetected)
        +---> If exe_path != expected_exe: ABORT (Binary Mismatch)
        |
-[ 3. Atomic Signal Sequence ]
+[ 3. Atomic Signal Sequence via pidfd ]
        |
-       +---> Send SIGSTOP (freeze process)
-       +---> Re-verify /proc/<pid>/stat start_time
-       +---> If verified: Send SIGTERM -> (50ms grace) -> Send SIGKILL
+       +---> pidfd_send_signal(pidfd, SIGSTOP, NULL, 0) (freeze process)
+       +---> Re-verify /proc/<pid>/stat start_time under freeze
+       +---> If verified: pidfd_send_signal(pidfd, SIGTERM, NULL, 0)
+       +---> (50ms grace period)
+       +---> pidfd_send_signal(pidfd, SIGKILL, NULL, 0)
 ```
 
-This guarantees that Sentinel-RS never terminates an innocent process due to PID recycling.
+If the kernel lacks `pidfd_open` support (Linux < 5.3), Sentinel-RS falls back to verifying `/proc/<pid>/stat` *before* issuing any signal, and immediately aborts if identity divergence is detected without sending any signal to the reused PID.
+
+---
+
+## 6. Privilege Separation and Sandboxing
+
+To uphold least privilege, Sentinel-RS segregates functionality into two distinct tiers:
+
+1. **`sentineld` (Detection & Analysis Core)**:
+   - Evaluates process lineage, behavior rules, risk scoring, and policy decisions.
+   - Operates with minimal capabilities, incapable of directly loading kernel modules or modifying raw firewall chains.
+2. **`sentinel-privileged` (Privileged Execution Helper)**:
+   - Performs eBPF map attachment and program loading.
+   - Executes atomic nftables transactions exclusively within table `inet sentinel`.
+   - Sends signals via Linux `pidfd`.
+   - Stripped of dangerous broad capabilities: `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` are dropped.
+   - Restricts capabilities strictly to: `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_KILL`, `CAP_DAC_READ_SEARCH`.

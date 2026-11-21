@@ -1,0 +1,79 @@
+# SENTINEL-RS: TASK TRACKER & EXECUTION CHECKLIST
+# Format: [STATUS] TASK_ID: Description
+# Statuses: [ ] TODO, [~] IN_PROGRESS, [?] VERIFY, [X] DONE
+
+======================================================================
+PHASE 0: BASELINE AUDIT & REALISTIC STATUS (P2)
+======================================================================
+[X] TASK-P2-22: Create docs/IMPLEMENTATION_STATUS.md with honest subsystem maturity matrix and update README links.
+
+======================================================================
+PHASE 1: PROCESS SAFETY & PID REUSE PROTECTION (P0)
+======================================================================
+[X] TASK-P0-01: Implement composite ProcessKey/ProcessIdentity in LineageGraph (stop raw u32 tgid map collisions).
+[X] TASK-P0-02: Fix TOCTOU race in process_term.rs & migrate process termination to pidfd_open / pidfd_send_signal.
+[X] TASK-P0-03: Implement ProcessProtectionPolicy with binary path, inode, and packaging verification (not just exe name).
+
+======================================================================
+PHASE 2: NETWORK ISOLATION & NFTABLES SAFETY (P0)
+======================================================================
+[X] TASK-P0-04: Implement transactional NetworkIsolationManager with 3 isolation tiers (Selective, Restricted, Full).
+[X] TASK-P0-05: Implement anti-lockout timer (timed isolation with auto-rollback) for remote administration safety.
+
+======================================================================
+PHASE 3: FAULT TOLERANCE, WATCHDOG & STATE MACHINE (P0)
+======================================================================
+[X] TASK-P0-06: Formalize AgentState state machine & implement FailurePolicyManager (handle BPF, RingBuffer, DB drops).
+[X] TASK-P0-07: Fix systemd watchdog in watchdog.rs: stop unconditional WATCHDOG=1 loop; tie to real subsystem health.
+
+======================================================================
+PHASE 4: PRIVILEGE SEPARATION & SYSTEMD HARDENING (P0)
+======================================================================
+[X] TASK-P0-08: Split architecture into sentinel-privileged helper and unprivileged sentineld-core analytical daemon.
+[X] TASK-P0-09: Drop CAP_SYS_ADMIN and CAP_SYS_PTRACE; minimize ambient capabilities; harden sentineld.service.
+
+======================================================================
+PHASE 5: EBPF STABLE ABI & EVENT INGESTION (P1)
+======================================================================
+[X] TASK-P1-10: Define C-compatible #[repr(C)] ABI structs for eBPF RingBuffer events without Rust heap types (PathBuf).
+[X] TASK-P1-11: Implement RingBuffer drop detection, read kernel-side drop counters, and add backpressure rate-limiting.
+[X] TASK-P1-12: Implement kernel preflight probes and compatibility profiles (Linux 6.1+, 5.15-6.0, 5.10-5.14).
+
+======================================================================
+PHASE 6: TAINT TRACKING & TWO-TIER PROCESS LINEAGE (P1)
+======================================================================
+[X] TASK-P1-13: Implement strongly typed TaintLevel and SensitiveSource model (replace binary is_tainted flag).
+[X] TASK-P1-14: Separate Lineage into two distinct graphs: Process Graph (ancestry) and Data Flow Graph (taint/IPC).
+[X] TASK-P1-15: Implement and verify IPC propagation matrix (pipe, unix socket, SCM_RIGHTS, memfd, shared memory).
+
+======================================================================
+PHASE 7: EVIDENCE-BASED RISK ENGINE & EXPLAINABILITY (P1)
+======================================================================
+[X] TASK-P1-16: Refactor RiskEngine to Evidence-Based model: (Evidence, Confidence, Impact) -> PolicyDecision.
+[X] TASK-P1-17: Decouple Detection from Response Authorization; generate signed explainability DecisionRecords.
+
+======================================================================
+PHASE 8: IPC SECURITY & SQLITE ROBUSTNESS (P1)
+======================================================================
+[X] TASK-P1-18: Harden IPC server: bound read buffer (64KB max) to prevent OOM DoS, enforce timeouts & protocol version.
+[X] TASK-P1-19: Implement SQLite automated retention policy (14d purge), WAL checkpointing, and disk quota guard.
+
+======================================================================
+PHASE 9: ADVERSARIAL TEST SUITE & CI/CD VERIFICATION (P0/P1)
+======================================================================
+[X] TASK-P0-20: Implement adversarial test suite SEC-001 through SEC-012 in VM test framework.
+[X] TASK-P1-21: Configure CI/CD pipeline (fmt, clippy, audit, deny, vmtest) and establish SLA benchmarks.
+
+======================================================================
+PHASE 10: DOCUMENTATION & SYSTEMD UNIT ALIGNMENT (P2)
+======================================================================
+[X] TASK-P2-23: Align sentineld.service directives with docs/ARCHITECTURE.md, INSTALLATION.md, and SECURITY_MODEL.md.
+
+======================================================================
+EXECUTION PROGRESS SUMMARY:
+Total Tasks: 23
+[ ] TODO: 0
+[~] IN_PROGRESS: 0
+[?] VERIFY: 0
+[X] DONE: 23
+======================================================================

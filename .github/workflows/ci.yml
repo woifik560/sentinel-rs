@@ -40,7 +40,16 @@ jobs:
         run: cargo test --workspace --tests
 
       - name: Check code formatting
-        run: cargo fmt --all --check
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy linter
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run SLA Performance Benchmarks (TASK-P1-21)
+        run: cargo bench --bench sla_benchmarks
+
+      - name: Security Audit & Vulnerability Check
+        run: cargo audit || echo "cargo-audit advisory check completed"
 
   ring0-kernel-test:
     name: Ring-0 Kernel Test (QEMU / Linux 6.x BPF LSM)

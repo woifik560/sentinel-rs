@@ -78,17 +78,20 @@ impl LineageTracker {
 
         let mut node = ProcessNode::new(tgid, ppid, uid, exe_path);
 
-        // Read pgrp from /proc/<tgid>/stat
+        // Read pgrp and starttime from /proc/<tgid>/stat
         let stat_path = format!("{}/stat", proc_dir);
         if let Ok(stat) = std::fs::read_to_string(&stat_path) {
             if let Some(r_paren) = stat.rfind(')') {
                 let rest = &stat[r_paren + 1..];
-                let mut fields = rest.split_whitespace();
-                let _state = fields.next();
-                let _ppid = fields.next();
-                if let Some(pgrp_str) = fields.next() {
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                if let Some(pgrp_str) = fields.get(2) {
                     if let Ok(pgrp) = pgrp_str.parse::<u32>() {
                         node.group_leader_tgid = pgrp;
+                    }
+                }
+                if let Some(starttime_str) = fields.get(19) {
+                    if let Ok(ticks) = starttime_str.parse::<u64>() {
+                        node.start_time_ns = ticks;
                     }
                 }
             }
@@ -123,6 +126,11 @@ impl LineageTracker {
         })
     }
 
+    /// Retrieve a clone of a process node by its canonical ProcessKey.
+    pub fn get_by_key(&self, key: &ProcessKey) -> Option<ProcessNode> {
+        self.graph.get_by_key(key)
+    }
+
     /// Handle process fork: child inherits metadata and parent pointer from parent TGID.
     pub fn handle_fork(&self, parent_tgid: u32, child_tgid: u32) {
         let (uid, exe_path, exe_dev_ino, pkg_origin, parent_has_secrets, parent_is_shell, parent_ancestor_script, parent_group_leader) =
@@ -153,6 +161,9 @@ impl LineageTracker {
         child.exe_dev_ino = exe_dev_ino;
         child.pkg_origin = pkg_origin;
         child.group_leader_tgid = parent_group_leader;
+        if let Some(ticks) = read_proc_starttime(child_tgid) {
+            child.start_time_ns = ticks;
+        }
         if !parent_is_shell {
             child.ancestor_script = parent_ancestor_script;
         }
@@ -191,6 +202,54 @@ impl LineageTracker {
                     initiator_tgid, spawned_tgid
                 );
             });
+        }
+    }
+
+    /// Handles SCM_RIGHTS file descriptor passing (TASK-P1-15).
+    pub fn handle_scm_rights(&self, sender_tgid: u32, receiver_tgid: u32, passed_path: PathBuf) {
+        let (has_secrets, secrets) = if let Some(sender) = self.graph.get(sender_tgid) {
+            (sender.has_secret_access(), sender.secret_accesses.clone())
+        } else {
+            (false, Vec::new())
+        };
+
+        if has_secrets {
+            self.graph.get_mut_with(receiver_tgid, |receiver| {
+                receiver.taint_level = sentinel_common::process::TaintLevel::ConfirmedPropagation;
+                receiver.secret_accesses.extend(secrets.clone());
+                receiver.taint_records.push(sentinel_common::process::TaintRecord {
+                    level: sentinel_common::process::TaintLevel::ConfirmedPropagation,
+                    source: sentinel_common::process::SensitiveSource::CustomPath(passed_path.clone()),
+                    target_path: passed_path.clone(),
+                    timestamp_ns: 0,
+                    propagation_mechanism: Some("SCM_RIGHTS fd passing".into()),
+                });
+            });
+            debug!("SCM_RIGHTS taint propagation: {} -> {}", sender_tgid, receiver_tgid);
+        }
+    }
+
+    /// Handles pipe / FIFO data flow transfer (TASK-P1-15).
+    pub fn handle_pipe_transfer(&self, sender_tgid: u32, receiver_tgid: u32, _pipe_dev: u64, pipe_ino: u64) {
+        let (has_secrets, secrets) = if let Some(sender) = self.graph.get(sender_tgid) {
+            (sender.has_secret_access(), sender.secret_accesses.clone())
+        } else {
+            (false, Vec::new())
+        };
+
+        if has_secrets {
+            self.graph.get_mut_with(receiver_tgid, |receiver| {
+                receiver.taint_level = sentinel_common::process::TaintLevel::ConfirmedPropagation;
+                receiver.secret_accesses.extend(secrets.clone());
+                receiver.taint_records.push(sentinel_common::process::TaintRecord {
+                    level: sentinel_common::process::TaintLevel::ConfirmedPropagation,
+                    source: sentinel_common::process::SensitiveSource::CustomPath(PathBuf::from(format!("pipe:[{}]", pipe_ino))),
+                    target_path: PathBuf::from(format!("pipe:[{}]", pipe_ino)),
+                    timestamp_ns: 0,
+                    propagation_mechanism: Some("pipe/fifo IPC".into()),
+                });
+            });
+            debug!("Pipe IPC taint propagation: {} -> {}", sender_tgid, receiver_tgid);
         }
     }
 
@@ -354,6 +413,11 @@ impl LineageTracker {
         });
     }
 
+    /// Prune terminated processes that hold no active secrets from the lineage graph.
+    pub fn prune_dead(&self) -> usize {
+        self.graph.prune_dead()
+    }
+
     /// Walk the ancestry chain of a process up to root or maximum 16 steps.
     pub fn get_ancestor_chain(&self, tgid: u32) -> Vec<LineageStep> {
         let mut chain = Vec::new();
@@ -486,6 +550,16 @@ pub fn inspect_interpreter(exe_path: &Path, cmdline: &[String]) -> Option<Script
         is_inline,
         is_suspicious_flags,
     })
+}
+
+/// Read field 19 (clock ticks after boot) from /proc/<tgid>/stat for anti-PID-reuse verification.
+pub fn read_proc_starttime(tgid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{}/stat", tgid);
+    let stat = std::fs::read_to_string(&stat_path).ok()?;
+    let r_paren = stat.rfind(')')?;
+    let rest = &stat[r_paren + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19)?.parse::<u64>().ok()
 }
 
 #[cfg(test)]

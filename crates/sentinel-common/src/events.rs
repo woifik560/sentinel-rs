@@ -79,6 +79,34 @@ pub const PROT_READ: u32 = 0x00000001;
 pub const PROT_WRITE: u32 = 0x00000002;
 pub const PROT_EXEC: u32 = 0x00000004;
 
+// ----------------------------------------------------------------------------
+// Stable C-compatible #[repr(C)] ABI for eBPF RingBuffer events (TASK-P1-10)
+// Free of heap types (PathBuf, Vec, etc.), matching kernel-space BPF structs.
+// ----------------------------------------------------------------------------
+
+pub const EVENT_TYPE_FILE_OPEN: u32 = 1;
+pub const EVENT_TYPE_FILE_PERMISSION: u32 = 2;
+pub const EVENT_TYPE_BPRM_CHECK: u32 = 3;
+pub const EVENT_TYPE_PROCESS_FORK: u32 = 4;
+pub const EVENT_TYPE_PROCESS_EXEC: u32 = 5;
+pub const EVENT_TYPE_SOCKET_CONNECT: u32 = 6;
+pub const EVENT_TYPE_SOCKET_SENDMSG: u32 = 7;
+pub const EVENT_TYPE_UNIX_MAY_SEND: u32 = 8;
+pub const EVENT_TYPE_PTRACE_CHECK: u32 = 9;
+pub const EVENT_TYPE_MMAP_FILE: u32 = 10;
+pub const EVENT_TYPE_FILE_RECEIVE: u32 = 11;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawEbpfHeader {
+    pub event_type: u32,
+    pub cpu_id: u32,
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub uid: u32,
+}
+
 /// Raw event structure as received from eBPF ring buffer.
 ///
 /// Fields use fixed-size types compatible with `#[repr(C)]` eBPF structs.

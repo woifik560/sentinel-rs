@@ -423,4 +423,116 @@ impl EventNormalizer {
             }
         }
     }
+
+    /// Deserializes a raw C-compatible #[repr(C)] eBPF byte slice directly into a NormalizedEvent.
+    /// Strictly guarantees safe unaligned reading, bounds checks, and stable ABI across compilers.
+    pub fn normalize_raw_bytes(event_type: u32, bytes: &[u8]) -> Option<NormalizedEvent> {
+        use sentinel_common::events::*;
+
+        let event_id = Uuid::new_v4().to_string();
+        let timestamp = Utc::now();
+
+        match event_type {
+            EVENT_TYPE_FILE_OPEN => {
+                if bytes.len() < std::mem::size_of::<RawFileOpenEvent>() {
+                    return None;
+                }
+                let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawFileOpenEvent) };
+                let len = (raw.path_len as usize).min(raw.path.len());
+                let path_str = String::from_utf8_lossy(&raw.path[..len]).to_string();
+                let path = PathBuf::from(path_str);
+                let key = ProcessKey::new(raw.tgid, 0);
+
+                Some(NormalizedEvent {
+                    event_id,
+                    timestamp,
+                    event_type: NormalizedEventType::FileOpen,
+                    source: EventSource::EbpfLsm,
+                    process_key: key,
+                    pid: raw.tgid,
+                    tgid: raw.tgid,
+                    uid: raw.uid,
+                    gid: 0,
+                    exe_path: None,
+                    exe_hash: None,
+                    parent_key: None,
+                    details: EventDetails::FileOpen {
+                        path,
+                        flags: raw.flags,
+                        dev: raw.dev,
+                        ino: raw.ino,
+                    },
+                })
+            }
+            EVENT_TYPE_PROCESS_FORK => {
+                if bytes.len() < std::mem::size_of::<RawProcessForkEvent>() {
+                    return None;
+                }
+                let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawProcessForkEvent) };
+                let key = ProcessKey::new(raw.child_tgid, 0);
+                Some(NormalizedEvent {
+                    event_id,
+                    timestamp,
+                    event_type: NormalizedEventType::ProcessFork,
+                    source: EventSource::Tracepoint,
+                    process_key: key,
+                    pid: raw.child_tgid,
+                    tgid: raw.child_tgid,
+                    uid: 0,
+                    gid: 0,
+                    exe_path: None,
+                    exe_hash: None,
+                    parent_key: Some(ProcessKey::new(raw.parent_tgid, 0)),
+                    details: EventDetails::ProcessFork {
+                        parent_tgid: raw.parent_tgid,
+                        child_tgid: raw.child_tgid,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_common::events::{RawFileOpenEvent, EVENT_TYPE_FILE_OPEN, MAX_PATH_LEN};
+
+    #[test]
+    fn test_raw_c_abi_deserialization_safety() {
+        let mut raw_event = RawFileOpenEvent {
+            tgid: 1234,
+            uid: 1000,
+            path: [0u8; MAX_PATH_LEN],
+            path_len: 11,
+            dev: 2049,
+            ino: 554433,
+            flags: 0o644,
+        };
+
+        let path_bytes = b"/etc/shadow";
+        raw_event.path[..path_bytes.len()].copy_from_slice(path_bytes);
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &raw_event as *const RawFileOpenEvent as *const u8,
+                std::mem::size_of::<RawFileOpenEvent>(),
+            )
+        };
+
+        let normalized = EventNormalizer::normalize_raw_bytes(EVENT_TYPE_FILE_OPEN, bytes).expect("Failed to normalize raw bytes");
+        assert_eq!(normalized.event_type, NormalizedEventType::FileOpen);
+        assert_eq!(normalized.pid, 1234);
+        assert_eq!(normalized.tgid, 1234);
+        match normalized.details {
+            EventDetails::FileOpen { path, flags, dev, ino } => {
+                assert_eq!(path, PathBuf::from("/etc/shadow"));
+                assert_eq!(flags, 0o644);
+                assert_eq!(dev, 2049);
+                assert_eq!(ino, 554433);
+            }
+            _ => panic!("Expected FileOpen details"),
+        }
+    }
 }

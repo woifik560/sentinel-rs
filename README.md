@@ -246,6 +246,8 @@ crates/
 ##  Дополнительная документация
 
 Полный комплект инженерной документации находится в каталоге [`docs/`](docs/):
+* **[Статус реализации компонентов (Implementation Status)](docs/IMPLEMENTATION_STATUS.md)**
+* **[Дорожная карта и реестр задач (Tasks Roadmap)](TASKS_ROADMAP.md)**
 * **[Руководство пользователя и сценарий живой демонстрации (Live Showcase)](docs/USER_GUIDE_AND_DEMO.md)**
 * [Архитектурная спецификация](docs/ARCHITECTURE.md)
 * [Модель безопасности и RBAC](docs/SECURITY_MODEL.md)

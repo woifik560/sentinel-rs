@@ -94,10 +94,14 @@ sudo chmod 0640 /etc/sentinel/config.toml /etc/sentinel/rules.toml
 ```
 
 ### 3.2 Linux Capabilities (Non-Root Execution Option)
-While `sentineld` is typically managed by systemd as `root`, it only requires specific kernel capabilities rather than unrestricted root:
+While `sentineld` is typically managed by systemd as `root`, it only requires a strictly minimized set of kernel capabilities rather than unrestricted root. Notably, `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` have been completely removed from the service bounding set:
 ```bash
-sudo setcap 'cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin,cap_sys_ptrace,cap_dac_read_search,cap_kill=ep' /usr/local/bin/sentineld
+# Set minimal required capabilities (CAP_SYS_ADMIN and CAP_SYS_PTRACE are strictly excluded):
+sudo setcap 'cap_bpf,cap_perfmon,cap_net_admin,cap_kill,cap_dac_read_search=ep' /usr/local/bin/sentineld
 ```
+
+### 3.3 Privilege Separation
+Sentinel-RS employs privilege separation between `sentineld` (the unprivileged analysis core) and `sentinel-privileged` (a dedicated helper for eBPF loading, atomic nftables batch execution, and pidfd-based process control). The privileged helper runs in an isolated context communicating via Unix domain sockets, enforcing least privilege for the detection daemon.
 
 ---
 

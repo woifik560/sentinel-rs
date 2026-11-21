@@ -6,6 +6,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use sentinel_common::policy::{PolicyAction, PolicyDecision};
 use crate::policy::PolicyContext;
+use crate::protection::ProcessProtectionPolicy;
 use crate::storage::{StorageManager, StoredResponseRecord};
 use super::network_block::NetworkBlockManager;
 use super::process_term::safe_terminate_process;
@@ -13,6 +14,7 @@ use super::process_term::safe_terminate_process;
 pub struct ResponseOrchestrator {
     storage: Arc<StorageManager>,
     network_blocks: Arc<NetworkBlockManager>,
+    protection_policy: ProcessProtectionPolicy,
 }
 
 impl ResponseOrchestrator {
@@ -20,7 +22,13 @@ impl ResponseOrchestrator {
         Self {
             storage,
             network_blocks,
+            protection_policy: ProcessProtectionPolicy::new(),
         }
+    }
+
+    pub fn with_protection_policy(mut self, policy: ProcessProtectionPolicy) -> Self {
+        self.protection_policy = policy;
+        self
     }
 
     /// Executes the required policy action against the target process context.
@@ -61,7 +69,23 @@ impl ResponseOrchestrator {
                 }
             }
             PolicyAction::TerminateProcess => {
-                if let Err(e) = safe_terminate_process(
+                // TASK-P0-03: ProcessProtectionPolicy enforcement
+                if self.protection_policy.is_critical_system_process(
+                    target_pid,
+                    &ctx.exe_path,
+                    ctx.process_key.dev_ino,
+                    None,
+                ) {
+                    warn!(
+                        "Process PID {} ({}) is a critical system process under ProcessProtectionPolicy. Refusing automatic SIGKILL! Downgrading to Alert and socket isolation.",
+                        target_pid, ctx.exe_path.display()
+                    );
+                    self.network_blocks.block_pid(target_pid);
+                    if let Some(ref ip) = ctx.dest_ip {
+                        self.network_blocks.block_ip(ip.clone());
+                    }
+                    status = "PROTECTED_PROCESS_ISOLATED".to_string();
+                } else if let Err(e) = safe_terminate_process(
                     &ctx.process_key,
                     Some(&ctx.exe_path),
                     Duration::from_millis(500),

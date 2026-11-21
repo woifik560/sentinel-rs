@@ -125,16 +125,16 @@ The previous GUI attestation protected against unprivileged local malware connec
 
 ## 7. Systemd and Linux Capabilities
 
-### 7.1. Current Unit Configuration (`config/sentineld.service`)
-- `Type=simple`
-- Capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`.
+### 7.1. Unit Configuration (`config/sentineld.service`)
+- `Type=notify`, `WatchdogSec=15s`
+- Capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_KILL`, `CAP_DAC_READ_SEARCH` (`CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` dropped).
 - Hardening: `ProtectHome=read-only`, `ProtectSystem=strict`, `PrivateTmp=yes`, `LockPersonality=yes`, `RestrictRealtime=yes`, `NoNewPrivileges=yes`.
 
-### 7.2. Transformation Requirements
-- Switch to `Type=notify` using native `sd_notify` (`READY=1` on complete initialization, `WATCHDOG=1` during active processing loop).
-- Add signal handling for `SIGTERM`/`SIGINT` (graceful shutdown) and `SIGHUP` (transactional configuration reload).
-- Remove `sentinel-gui.service`.
-- Audit capabilities: ensure `CAP_SYS_ADMIN` or fallback capabilities are documented for older kernels.
+### 7.2. Transformation Implementation
+- Configured `Type=notify` using native `sd_notify` (`READY=1` on complete initialization, `WATCHDOG=1` during healthy processing loop, `STOPPING=1` on shutdown).
+- Signal handling for `SIGTERM`/`SIGINT` (graceful shutdown) and `SIGHUP` (transactional configuration reload).
+- Removed `sentinel-gui.service`.
+- Minimized capabilities: strictly restricted to least privilege.
 
 ---
 

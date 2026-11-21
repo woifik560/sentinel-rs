@@ -1,0 +1,20 @@
+[package]
+name = "sentinel-privileged"
+description = "Minimal privileged helper for Sentinel-RS (eBPF loader, nftables batch transactions, pidfd signaling)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sentinel-common = { path = "../sentinel-common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+nix = { version = "0.29", features = ["signal", "process", "socket", "user", "fs"] }
+libc = "0.2"

@@ -2,7 +2,7 @@
 
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -17,12 +17,30 @@ pub enum StorageCommand {
     StoreResponse(StoredResponseRecord),
     LinkIncidentEvent { incident_id: String, event_id: String },
     PurgeOldRecords { retention_days: i64 },
+    CheckpointWal,
 }
 
 #[derive(Clone)]
 pub struct StorageManager {
     cmd_tx: mpsc::Sender<StorageCommand>,
     db_path: PathBuf,
+}
+
+/// Check available disk space in megabytes using statvfs on Unix.
+pub fn get_available_disk_space_mb(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap_or_default();
+        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+            let s = unsafe { stat.assume_init() };
+            let free_bytes = s.f_bavail as u64 * s.f_frsize as u64;
+            return free_bytes / (1024 * 1024);
+        }
+    }
+    1024
 }
 
 impl StorageManager {
@@ -42,6 +60,13 @@ impl StorageManager {
             }
         }
 
+        // Restrict SQLite database file permissions to root/daemon owner only (0600)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
+
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<StorageCommand>(queue_capacity);
         let worker_path = db_path.clone();
 
@@ -58,11 +83,22 @@ impl StorageManager {
             info!("SQLite storage worker thread active on {}", worker_path.display());
 
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                if let Err(e) = execute_storage_command(&mut conn, cmd) {
+                if let Err(e) = execute_storage_command(&mut conn, &worker_path, cmd) {
                     warn!("Storage worker error: {}", e);
                 }
             }
             info!("SQLite storage worker thread shutdown");
+        });
+
+        // Spawn periodic retention and checkpointing maintenance task (TASK-P1-19)
+        let maint_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Every 1h
+            loop {
+                interval.tick().await;
+                let _ = maint_tx.try_send(StorageCommand::PurgeOldRecords { retention_days: 14 });
+                let _ = maint_tx.try_send(StorageCommand::CheckpointWal);
+            }
         });
 
         Ok(Self { cmd_tx, db_path })
@@ -90,9 +126,14 @@ impl StorageManager {
         let _ = self.cmd_tx.try_send(StorageCommand::LinkIncidentEvent { incident_id, event_id });
     }
 
-    /// Trigger retention purge.
+    /// Trigger retention purge (default 14 days).
     pub fn purge_retention(&self, retention_days: i64) {
         let _ = self.cmd_tx.try_send(StorageCommand::PurgeOldRecords { retention_days });
+    }
+
+    /// Trigger WAL truncation checkpoint.
+    pub fn checkpoint_wal(&self) {
+        let _ = self.cmd_tx.try_send(StorageCommand::CheckpointWal);
     }
 
     /// Query recent incidents synchronously for sntctl CLI.
@@ -172,13 +213,36 @@ impl StorageManager {
             Ok(None)
         }
     }
+
+    /// Clear all stored incidents (for sntctl incidents clear).
+    pub fn clear_all_incidents(&self) -> rusqlite::Result<usize> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute("DELETE FROM incidents", [])
+    }
+
+    /// Count total recorded incidents.
+    pub fn count_incidents(&self) -> rusqlite::Result<usize> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| row.get(0))
+    }
 }
 
-fn execute_storage_command(conn: &mut Connection, cmd: StorageCommand) -> rusqlite::Result<()> {
+fn execute_storage_command(conn: &mut Connection, db_path: &Path, cmd: StorageCommand) -> rusqlite::Result<()> {
     match cmd {
         StorageCommand::StoreEvent(event) => {
+            // TASK-P1-19: Disk Quota Guard: if disk space is < 500 MB, drop raw events to prevent disk exhaustion
+            let free_mb = get_available_disk_space_mb(db_path);
+            if free_mb < 500 {
+                warn!(
+                    "DISK QUOTA GUARD: Low disk space ({} MB available < 500 MB). Dropping raw event to preserve host integrity!",
+                    free_mb
+                );
+                return Ok(());
+            }
+
             let details_json = serde_json::to_string(&event.details).unwrap_or_default();
             let exe_str = event.exe_path.map(|p| p.to_string_lossy().to_string());
+
             conn.execute(
                 "INSERT OR IGNORE INTO events
                  (event_id, timestamp, event_type, source, process_key, pid, tgid, uid, gid, exe_path, details_json)
@@ -255,8 +319,14 @@ fn execute_storage_command(conn: &mut Connection, cmd: StorageCommand) -> rusqli
             let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
             let count = conn.execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff])?;
             if count > 0 {
-                info!("Purged {} events older than {} days", count, retention_days);
+                info!("Purged {} raw events older than {} days (retention policy)", count, retention_days);
             }
+        }
+
+        StorageCommand::CheckpointWal => {
+            // TASK-P1-19: PRAGMA wal_checkpoint(TRUNCATE) to reset WAL file size
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            info!("SQLite PRAGMA wal_checkpoint(TRUNCATE) executed successfully.");
         }
     }
     Ok(())

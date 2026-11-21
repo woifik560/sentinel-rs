@@ -93,6 +93,43 @@ pub struct RuleFiring {
     pub reason: String,
 }
 
+/// Confidence level for evidence causation (TASK-P1-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+    Certain,
+}
+
+/// Potential security impact of the evaluated activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Impact {
+    Informational,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Three-tier Evidence-Based risk evaluation model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceEvaluation {
+    pub score: u32,
+    pub confidence: Confidence,
+    pub impact: Impact,
+    pub confirmed_propagation: bool,
+    pub reasons: Vec<String>,
+}
+
+impl EvidenceEvaluation {
+    /// Strict criterion for automated process termination:
+    /// Impact == Critical && Confidence >= High && confirmed_propagation == true
+    pub fn allows_auto_termination(&self) -> bool {
+        self.impact == Impact::Critical && self.confidence >= Confidence::High && self.confirmed_propagation
+    }
+}
+
 /// Computed risk score with all contributing rule firings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskScore {

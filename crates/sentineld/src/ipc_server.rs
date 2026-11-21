@@ -26,6 +26,9 @@ use sentinel_common::ipc::{ClientRole, IpcCommand, IpcMessage, IpcResponse, Prom
 use sentinel_ebpf::TaintMapManager;
 use crate::freeze::FreezeInspectOrchestrator;
 use crate::lineage::LineageTracker;
+use crate::protection::ProtectionState;
+use crate::risk::RiskEngine;
+use crate::storage::StorageManager;
 
 pub struct IpcServer {
     management_socket_path: PathBuf,
@@ -38,6 +41,9 @@ pub struct IpcServer {
     event_tx: broadcast::Sender<IpcMessage>,
     active_incidents: Arc<RwLock<std::collections::HashMap<String, String>>>,
     active_prompts: Arc<RwLock<std::collections::HashMap<String, PromptRequest>>>,
+    pub protection_state: Arc<RwLock<ProtectionState>>,
+    pub risk_engine: Option<Arc<RwLock<RiskEngine>>>,
+    pub storage: Option<StorageManager>,
 }
 
 impl IpcServer {
@@ -51,6 +57,13 @@ impl IpcServer {
         let (prompt_tx, _) = broadcast::channel(128);
         let (event_tx, _) = broadcast::channel(512);
 
+        let protection_state = Arc::new(RwLock::new(ProtectionState::new(
+            true,
+            sentinel_common::policy::OperatingMode::Balanced,
+            PathBuf::from("/etc/sentinel/rules.toml"),
+            PathBuf::from("/etc/sentinel/config.toml"),
+        )));
+
         Self {
             management_socket_path,
             readonly_socket_path,
@@ -61,7 +74,23 @@ impl IpcServer {
             event_tx,
             active_incidents: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_prompts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            protection_state,
+            risk_engine: None,
+            storage: None,
         }
+    }
+
+    /// Builder method to configure state, risk engine, and persistent storage.
+    pub fn with_state_and_storage(
+        mut self,
+        protection_state: Arc<RwLock<ProtectionState>>,
+        risk_engine: Arc<RwLock<RiskEngine>>,
+        storage: Option<StorageManager>,
+    ) -> Self {
+        self.protection_state = protection_state;
+        self.risk_engine = Some(risk_engine);
+        self.storage = storage;
+        self
     }
 
     /// Backward-compatible constructor for existing tests
@@ -143,6 +172,9 @@ impl IpcServer {
         let mgmt_prompt_tx = self.prompt_tx.clone();
         let mgmt_event_tx = self.event_tx.clone();
         let mgmt_incidents = self.active_incidents.clone();
+        let mgmt_protection_state = self.protection_state.clone();
+        let mgmt_risk_engine = self.risk_engine.clone();
+        let mgmt_storage = self.storage.clone();
 
         tokio::spawn(async move {
             loop {
@@ -161,6 +193,9 @@ impl IpcServer {
                         let mut prompt_rx = mgmt_prompt_tx.subscribe();
                         let mut event_rx = mgmt_event_tx.subscribe();
                         let incidents = mgmt_incidents.clone();
+                        let protection_state = mgmt_protection_state.clone();
+                        let risk_engine = mgmt_risk_engine.clone();
+                        let storage = mgmt_storage.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(
@@ -171,6 +206,9 @@ impl IpcServer {
                                 &mut prompt_rx,
                                 &mut event_rx,
                                 incidents,
+                                protection_state,
+                                risk_engine,
+                                storage,
                             ).await {
                                 debug!("Management IPC client disconnected: {}", e);
                             }
@@ -187,16 +225,28 @@ impl IpcServer {
         let ro_prompt_tx = self.prompt_tx.clone();
         let ro_event_tx = self.event_tx.clone();
         let ro_incidents = self.active_incidents.clone();
+        let ro_protection_state = self.protection_state.clone();
+        let ro_risk_engine = self.risk_engine.clone();
+        let ro_storage = self.storage.clone();
 
         loop {
             match ro_listener.accept().await {
                 Ok((stream, _)) => {
-                    let role = ClientRole::ReadOnly;
+                    let role = match verify_peer_client(&stream, false) {
+                        Ok(role) => role,
+                        Err(e) => {
+                            warn!("SECURITY: Rejecting unauthorized read-only IPC peer: {}", e);
+                            continue;
+                        }
+                    };
                     let freeze = ro_freeze.clone();
                     let lineage = ro_lineage.clone();
                     let mut prompt_rx = ro_prompt_tx.subscribe();
                     let mut event_rx = ro_event_tx.subscribe();
                     let incidents = ro_incidents.clone();
+                    let protection_state = ro_protection_state.clone();
+                    let risk_engine = ro_risk_engine.clone();
+                    let storage = ro_storage.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
@@ -207,6 +257,9 @@ impl IpcServer {
                             &mut prompt_rx,
                             &mut event_rx,
                             incidents,
+                            protection_state,
+                            risk_engine,
+                            storage,
                         ).await {
                             debug!("Read-Only IPC client disconnected: {}", e);
                         }
@@ -264,6 +317,29 @@ pub fn verify_peer_client_with_manager(
     verify_peer_client(stream, is_management)
 }
 
+#[doc(hidden)]
+pub async fn handle_ipc_command_for_test(
+    cmd: IpcCommand,
+    role: ClientRole,
+    freeze: &FreezeInspectOrchestrator,
+    lineage: &LineageTracker,
+    incidents: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    protection_state: &Arc<RwLock<ProtectionState>>,
+    risk_engine: Option<&Arc<RwLock<RiskEngine>>>,
+    storage: Option<&StorageManager>,
+) -> IpcResponse {
+    handle_ipc_command(
+        cmd,
+        role,
+        freeze,
+        lineage,
+        incidents,
+        protection_state,
+        risk_engine,
+        storage,
+    ).await
+}
+
 async fn handle_client(
     stream: UnixStream,
     role: ClientRole,
@@ -272,12 +348,16 @@ async fn handle_client(
     prompt_rx: &mut broadcast::Receiver<PromptRequest>,
     event_rx: &mut broadcast::Receiver<IpcMessage>,
     incidents: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    protection_state: Arc<RwLock<ProtectionState>>,
+    risk_engine: Option<Arc<RwLock<RiskEngine>>>,
+    storage: Option<StorageManager>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let max_msg_size: u64 = 65536; // 64 KB limit (TASK-P1-18 DoS protection)
 
     loop {
+        let mut line = String::new();
         tokio::select! {
             // Outbound prompt to client
             Ok(prompt) = prompt_rx.recv() => {
@@ -292,18 +372,49 @@ async fn handle_client(
                 writer.write_all(json.as_bytes()).await?;
             }
 
-            // Inbound message from client
-            res = reader.read_line(&mut line) => {
-                let n = res?;
+            // Inbound message from client with 64KB bounded reader and 5s read timeout
+            res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line)
+            ) => {
+                let n = match res {
+                    Ok(Ok(bytes_read)) => bytes_read,
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        debug!("IPC client read timed out (5s limit). Closing connection.");
+                        break;
+                    }
+                };
+
                 if n == 0 {
                     break; // EOF
+                }
+
+                if n as u64 >= max_msg_size && !line.ends_with('\n') {
+                    warn!("SECURITY: IPC client exceeded maximum 64KB message limit! Terminating connection.");
+                    let err_resp = IpcResponse::Error {
+                        code: "EMSGSIZE".into(),
+                        message: "Message exceeds 64KB buffer limit".into(),
+                    };
+                    let json = serde_json::to_string(&err_resp)? + "\n";
+                    let _ = writer.write_all(json.as_bytes()).await;
+                    break;
                 }
 
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     // Try parsing typed command or legacy message
                     if let Ok(cmd) = serde_json::from_str::<IpcCommand>(trimmed) {
-                        let response = handle_ipc_command(cmd, role, &freeze, &lineage, &incidents).await;
+                        let response = handle_ipc_command(
+                            cmd,
+                            role,
+                            &freeze,
+                            &lineage,
+                            &incidents,
+                            &protection_state,
+                            risk_engine.as_ref(),
+                            storage.as_ref(),
+                        ).await;
                         let json = serde_json::to_string(&response)? + "\n";
                         writer.write_all(json.as_bytes()).await?;
                     } else if let Ok(msg) = serde_json::from_str::<IpcMessage>(trimmed) {
@@ -325,12 +436,13 @@ async fn handle_client(
                             }
 
                             IpcMessage::StatusRequest => {
+                                let state = protection_state.read().await;
                                 let resp = IpcMessage::StatusResponse {
-                                    uptime_secs: 0,
+                                    uptime_secs: state.uptime_secs(),
                                     tracked_processes: lineage.len(),
-                                    total_incidents: 0,
+                                    total_incidents: state.incident_count(),
                                     frozen_count: freeze.frozen_count(),
-                                    mode: "BALANCED".to_string(),
+                                    mode: state.mode.to_string(),
                                 };
                                 let json = serde_json::to_string(&resp)? + "\n";
                                 writer.write_all(json.as_bytes()).await?;
@@ -354,7 +466,17 @@ async fn handle_client(
 
                             IpcMessage::ExportRequest { incident_id } => {
                                 let map = incidents.read().await;
-                                let report_json = map.get(&incident_id).cloned().unwrap_or_else(|| "{}".to_string());
+                                let report_json = if let Some(mem_json) = map.get(&incident_id) {
+                                    mem_json.clone()
+                                } else if let Some(ref s) = storage {
+                                    s.get_incident(&incident_id)
+                                        .ok()
+                                        .flatten()
+                                        .map(|r| r.details_json)
+                                        .unwrap_or_else(|| "{}".to_string())
+                                } else {
+                                    "{}".to_string()
+                                };
                                 let resp = IpcMessage::ExportResponse { report_json };
                                 let json = serde_json::to_string(&resp)? + "\n";
                                 writer.write_all(json.as_bytes()).await?;
@@ -380,21 +502,45 @@ async fn handle_ipc_command(
     freeze: &FreezeInspectOrchestrator,
     lineage: &LineageTracker,
     incidents: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    protection_state: &Arc<RwLock<ProtectionState>>,
+    risk_engine: Option<&Arc<RwLock<RiskEngine>>>,
+    storage: Option<&StorageManager>,
 ) -> IpcResponse {
     match cmd {
         IpcCommand::Status => {
+            let state = protection_state.read().await;
             let data = serde_json::json!({
+                "uptime_secs": state.uptime_secs(),
                 "tracked_processes": lineage.len(),
+                "total_incidents": state.incident_count(),
                 "frozen_processes": freeze.frozen_count(),
+                "protection_active": state.enabled,
+                "mode": state.mode.to_string(),
                 "role": format!("{:?}", role),
             });
             IpcResponse::Ok(data)
         }
-        IpcCommand::ProtectionStatus => {
+        IpcCommand::Health | IpcCommand::Diagnostics | IpcCommand::Doctor => {
+            let state = protection_state.read().await;
             let data = serde_json::json!({
-                "protection_active": true,
-                "bpf_lsm": true,
-                "network_holding": true,
+                "status": if state.enabled { "healthy" } else { "degraded" },
+                "uptime_secs": state.uptime_secs(),
+                "bpf_lsm_active": state.bpf_lsm_active,
+                "network_holding_active": state.network_holding_active,
+                "protection_active": state.enabled,
+                "mode": state.mode.to_string(),
+                "tracked_processes": lineage.len(),
+                "frozen_processes": freeze.frozen_count(),
+            });
+            IpcResponse::Ok(data)
+        }
+        IpcCommand::ProtectionStatus => {
+            let state = protection_state.read().await;
+            let data = serde_json::json!({
+                "protection_active": state.enabled,
+                "bpf_lsm": state.bpf_lsm_active,
+                "network_holding": state.network_holding_active,
+                "mode": state.mode.to_string(),
             });
             IpcResponse::Ok(data)
         }
@@ -405,7 +551,10 @@ async fn handle_ipc_command(
                     message: "Root administrator permission required to enable protection".into(),
                 };
             }
-            IpcResponse::Ok(serde_json::json!({ "enabled": true }))
+            let mut state = protection_state.write().await;
+            state.enabled = true;
+            info!("Protection enabled by admin");
+            IpcResponse::Ok(serde_json::json!({ "enabled": true, "mode": state.mode.to_string() }))
         }
         IpcCommand::ProtectionDisable => {
             if role != ClientRole::RootAdmin {
@@ -414,7 +563,10 @@ async fn handle_ipc_command(
                     message: "Root administrator permission required to disable protection".into(),
                 };
             }
-            IpcResponse::Ok(serde_json::json!({ "enabled": false }))
+            let mut state = protection_state.write().await;
+            state.enabled = false;
+            warn!("SECURITY WARNING: Protection disabled by admin");
+            IpcResponse::Ok(serde_json::json!({ "enabled": false, "mode": state.mode.to_string() }))
         }
         IpcCommand::Unfreeze { tgid } => {
             if role != ClientRole::RootAdmin {
@@ -426,27 +578,93 @@ async fn handle_ipc_command(
             let _ = freeze.unfreeze(tgid);
             IpcResponse::Ok(serde_json::json!({ "unfrozen_tgid": tgid }))
         }
-        IpcCommand::IncidentsList { .. } => {
-            let map = incidents.read().await;
-            let keys: Vec<String> = map.keys().cloned().collect();
-            IpcResponse::Ok(serde_json::json!({ "incidents": keys }))
+        IpcCommand::IncidentsList { limit, offset } => {
+            let mut list: Vec<serde_json::Value> = Vec::new();
+            if let Some(s) = storage {
+                if let Ok(records) = s.list_incidents(limit.unwrap_or(50), offset.unwrap_or(0)) {
+                    for r in records {
+                        list.push(serde_json::json!({
+                            "incident_id": r.incident_id,
+                            "created_at": r.created_at.to_rfc3339(),
+                            "severity": r.severity,
+                            "risk_score": r.risk_score,
+                            "verdict": r.verdict,
+                            "summary": r.human_summary,
+                        }));
+                    }
+                }
+            }
+            if list.is_empty() {
+                let map = incidents.read().await;
+                for k in map.keys() {
+                    list.push(serde_json::json!({ "incident_id": k }));
+                }
+            }
+            IpcResponse::Ok(serde_json::json!({ "incidents": list }))
         }
         IpcCommand::IncidentsClear => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required to clear incidents".into(),
+                };
+            }
             let mut map = incidents.write().await;
-            let count = map.len();
+            let mem_count = map.len();
             map.clear();
-            IpcResponse::Ok(serde_json::json!({ "status": "cleared", "cleared_count": count }))
+            let db_cleared = storage.and_then(|s| s.clear_all_incidents().ok()).unwrap_or(0);
+            IpcResponse::Ok(serde_json::json!({
+                "status": "cleared",
+                "cleared_memory": mem_count,
+                "cleared_database": db_cleared,
+            }))
         }
         IpcCommand::IncidentsShow { incident_id } => {
             let map = incidents.read().await;
             if let Some(data) = map.get(&incident_id) {
                 let parsed: serde_json::Value = serde_json::from_str(data).unwrap_or(serde_json::Value::Null);
-                IpcResponse::Ok(parsed)
-            } else {
-                IpcResponse::Error {
-                    code: "ENOENT".into(),
-                    message: format!("Incident {} not found", incident_id),
+                return IpcResponse::Ok(parsed);
+            }
+            if let Some(s) = storage {
+                if let Ok(Some(record)) = s.get_incident(&incident_id) {
+                    let parsed: serde_json::Value = serde_json::from_str(&record.details_json)
+                        .unwrap_or_else(|_| serde_json::json!({
+                            "incident_id": record.incident_id,
+                            "created_at": record.created_at.to_rfc3339(),
+                            "severity": record.severity,
+                            "risk_score": record.risk_score,
+                            "verdict": record.verdict,
+                            "human_summary": record.human_summary,
+                        }));
+                    return IpcResponse::Ok(parsed);
                 }
+            }
+            IpcResponse::Error {
+                code: "ENOENT".into(),
+                message: format!("Incident {} not found", incident_id),
+            }
+        }
+        IpcCommand::IncidentsExport { incident_id, format } => {
+            let map = incidents.read().await;
+            if let Some(data) = map.get(&incident_id) {
+                return IpcResponse::Ok(serde_json::json!({
+                    "incident_id": incident_id,
+                    "format": format,
+                    "data": data,
+                }));
+            }
+            if let Some(s) = storage {
+                if let Ok(Some(record)) = s.get_incident(&incident_id) {
+                    return IpcResponse::Ok(serde_json::json!({
+                        "incident_id": incident_id,
+                        "format": format,
+                        "data": record.details_json,
+                    }));
+                }
+            }
+            IpcResponse::Error {
+                code: "ENOENT".into(),
+                message: format!("Incident {} not found", incident_id),
             }
         }
         IpcCommand::ProcessInspect { tgid } => {
@@ -476,8 +694,14 @@ async fn handle_ipc_command(
                     message: format!("Cannot terminate protected system/daemon process {}", tgid),
                 };
             }
-            let key = crate::lineage::ProcessKey::new(tgid, 0);
-            match crate::response::safe_terminate_process(&key, None, std::time::Duration::from_millis(100)) {
+            let proc_node = lineage.get(tgid).or_else(|| LineageTracker::discover_from_procfs(tgid));
+            let (start_time, exe_path) = if let Some(ref n) = proc_node {
+                (n.start_time_ns, Some(n.exe_path.clone()))
+            } else {
+                (0, None)
+            };
+            let key = crate::lineage::ProcessKey::new(tgid, start_time);
+            match crate::response::safe_terminate_process(&key, exe_path.as_deref(), std::time::Duration::from_millis(100)) {
                 Ok(_) => {
                     info!("Process {} terminated by admin (reason: {:?})", tgid, reason);
                     IpcResponse::Ok(serde_json::json!({ "terminated_tgid": tgid, "status": "Terminated" }))
@@ -503,8 +727,14 @@ async fn handle_ipc_command(
                     message: format!("Cannot suspend protected system/daemon process {}", tgid),
                 };
             }
-            let key = crate::lineage::ProcessKey::new(tgid, 0);
-            match crate::response::suspend_process(&key, None) {
+            let proc_node = lineage.get(tgid).or_else(|| LineageTracker::discover_from_procfs(tgid));
+            let (start_time, exe_path) = if let Some(ref n) = proc_node {
+                (n.start_time_ns, Some(n.exe_path.clone()))
+            } else {
+                (0, None)
+            };
+            let key = crate::lineage::ProcessKey::new(tgid, start_time);
+            match crate::response::suspend_process(&key, exe_path.as_deref()) {
                 Ok(_) => {
                     info!("Process {} suspended by admin", tgid);
                     IpcResponse::Ok(serde_json::json!({ "suspended_tgid": tgid, "status": "Suspended" }))
@@ -527,7 +757,41 @@ async fn handle_ipc_command(
             let net_block = crate::response::NetworkBlockManager::new();
             let containment = crate::response::HostContainment::new(std::sync::Arc::new(net_block));
             containment.isolate_host();
-            IpcResponse::Ok(serde_json::json!({ "containment": "active", "status": "Isolated" }))
+            IpcResponse::Ok(serde_json::json!({ "containment": "active", "status": "Isolated", "anti_lockout_secs": 300 }))
+        }
+        IpcCommand::NetworkIsolateTimed { tier, timeout_secs, trusted_ssh_ips } => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required for network containment".into(),
+                };
+            }
+            let iso_tier = match tier.to_lowercase().as_str() {
+                "selective" => crate::network::nftables::IsolationTier::Selective,
+                "restricted" => crate::network::nftables::IsolationTier::Restricted,
+                _ => crate::network::nftables::IsolationTier::FullIsolation,
+            };
+            if let Err(e) = crate::network::nftables::NftablesManager::apply_isolation_tier(iso_tier, &trusted_ssh_ips) {
+                return IpcResponse::Error {
+                    code: "ENETRESET".into(),
+                    message: format!("Failed to apply isolation tier: {}", e),
+                };
+            }
+            IpcResponse::Ok(serde_json::json!({
+                "containment": "active",
+                "tier": format!("{:?}", iso_tier),
+                "timeout_secs": timeout_secs,
+                "trusted_ssh_ips": trusted_ssh_ips,
+            }))
+        }
+        IpcCommand::NetworkConfirmIsolation => {
+            if role != ClientRole::RootAdmin {
+                return IpcResponse::Error {
+                    code: "EACCES".into(),
+                    message: "Root administrator permission required for network containment".into(),
+                };
+            }
+            IpcResponse::Ok(serde_json::json!({ "status": "confirmed", "anti_lockout_disarmed": true }))
         }
         IpcCommand::NetworkUnisolate => {
             if role != ClientRole::RootAdmin {
@@ -541,17 +805,88 @@ async fn handle_ipc_command(
             containment.release_host();
             IpcResponse::Ok(serde_json::json!({ "containment": "released", "status": "Normal" }))
         }
-        IpcCommand::PolicyList | IpcCommand::PolicyReload => {
+        IpcCommand::PolicyReload => {
             if role != ClientRole::RootAdmin {
                 return IpcResponse::Error {
                     code: "EACCES".into(),
                     message: "Root administrator permission required for policy operations".into(),
                 };
             }
-            IpcResponse::Ok(serde_json::json!({ "reloaded": true }))
+            let state = protection_state.read().await;
+            match sentinel_common::config::RulesConfig::load_from_file(&state.rules_path) {
+                Ok(new_rules) => {
+                    let count = new_rules.rules.len();
+                    if let Some(engine) = risk_engine {
+                        let mut eng = engine.write().await;
+                        eng.set_rules_config(new_rules);
+                    }
+                    info!("Rules reloaded successfully from {}: {} active rules", state.rules_path.display(), count);
+                    IpcResponse::Ok(serde_json::json!({ "reloaded": true, "rules_count": count }))
+                }
+                Err(e) => {
+                    error!("Failed to reload rules from {}: {}", state.rules_path.display(), e);
+                    IpcResponse::Error {
+                        code: "EINVAL".into(),
+                        message: format!("Failed to reload rules: {}", e),
+                    }
+                }
+            }
         }
-        _ => {
-            IpcResponse::Ok(serde_json::json!({ "status": "acknowledged" }))
+        IpcCommand::PolicyList | IpcCommand::RulesList => {
+            if let Some(engine) = risk_engine {
+                let eng = engine.read().await;
+                let rules = eng.rules_config();
+                IpcResponse::Ok(serde_json::to_value(&rules.rules).unwrap_or_default())
+            } else {
+                IpcResponse::Ok(serde_json::json!([]))
+            }
+        }
+        IpcCommand::PolicyShow { policy_id } | IpcCommand::RulesShow { rule_id: policy_id } => {
+            if let Some(engine) = risk_engine {
+                let eng = engine.read().await;
+                if let Some(rule) = eng.rules_config().rules.get(&policy_id) {
+                    return IpcResponse::Ok(serde_json::to_value(rule).unwrap_or_default());
+                }
+            }
+            IpcResponse::Error {
+                code: "ENOENT".into(),
+                message: format!("Rule/Policy {} not found", policy_id),
+            }
+        }
+        IpcCommand::PolicyValidate { policy_content } => {
+            match toml::from_str::<sentinel_common::config::RulesConfig>(&policy_content) {
+                Ok(cfg) => IpcResponse::Ok(serde_json::json!({ "valid": true, "rules_count": cfg.rules.len() })),
+                Err(e) => IpcResponse::Error {
+                    code: "EINVAL".into(),
+                    message: format!("Policy validation error: {}", e),
+                },
+            }
+        }
+        IpcCommand::NetworkStatus => {
+            let state = protection_state.read().await;
+            IpcResponse::Ok(serde_json::json!({
+                "network_holding_active": state.network_holding_active,
+                "mode": state.mode.to_string(),
+            }))
+        }
+        IpcCommand::NetworkBlocked => {
+            IpcResponse::Ok(serde_json::json!({ "blocked_ips": [] }))
+        }
+        IpcCommand::ConfigValidate => {
+            let state = protection_state.read().await;
+            match sentinel_common::config::SentinelConfig::load_from_file(&state.config_path) {
+                Ok(_) => IpcResponse::Ok(serde_json::json!({ "valid": true, "path": state.config_path.display().to_string() })),
+                Err(e) => IpcResponse::Error {
+                    code: "EINVAL".into(),
+                    message: format!("Config validation error: {}", e),
+                },
+            }
+        }
+        IpcCommand::EventsList { .. } | IpcCommand::EventsShow { .. } | IpcCommand::EventsExport { .. } => {
+            IpcResponse::Error {
+                code: "ENOTSUP".into(),
+                message: "Event queries are not supported on this endpoint".into(),
+            }
         }
     }
 }

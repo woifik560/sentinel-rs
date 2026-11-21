@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sentinel-common",
     "crates/sentinel-ebpf",
+    "crates/sentinel-privileged",
     "crates/sentineld",
     "crates/sntctl",
 ]
@@ -24,3 +25,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

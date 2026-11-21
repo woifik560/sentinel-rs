@@ -238,6 +238,8 @@ crates/
 ## 📚 Technical Documentation
 
 Full documentation is available in the [`docs/`](docs/) directory:
+* **[Component Implementation Status](docs/IMPLEMENTATION_STATUS.md)**
+* **[Tasks Roadmap & Implementation Checklist](TASKS_ROADMAP.md)**
 * **[User Guide & Live Demonstration Showcase](docs/USER_GUIDE_AND_DEMO.md)**
 * [Architecture Specification](docs/ARCHITECTURE.md)
 * [Security Model & RBAC](docs/SECURITY_MODEL.md)

@@ -15,34 +15,46 @@ The system enforces real-time kernel-level behavioral prevention, deep causal pr
                                     Unix Sockets
                                           v
 +-----------------------------------------------------------------------------------+
-|                             sentineld (Host Daemon)                                |
+|                          sentineld (Core Daemon, Unprivileged)                    |
 |                                                                                   |
 |  +---------------------+   +---------------------+   +--------------------------+ |
 |  |   Event Collector   |-->|   Event Normalizer  |-->|  Process Lineage Engine  | |
-|  | (Bounded RingBuffer)|   | (PID reuse, timing) |   | (Causal DAG & Identity)  | |
-|  +---------------------+   +---------------------+   +--------------------------+ |
-|                                                                    |              |
-|  +---------------------+   +---------------------+                 v              |
-|  |     Watchdog        |<--|    Health Monitor   |<----+ +----------------------+ |
-|  | (sd_notify & BPF)   |   | (Subsystem Metrics) |     | |   Behavior Engine    | |
+|  | (RingBuffer Drops)  |   | (C ABI, Repr C, TS) |   | (2-Tier DAG: Process &   | |
+|  +---------------------+   +---------------------+   |  Data Flow, ProcessKey)  | |
+|                                                      +--------------------------+ |
+|  +---------------------+   +---------------------+                 |              |
+|  |     Watchdog        |<--|    Health Monitor   |<----+           v              |
+|  | (sd_notify 15s /    |   | (AgentState Machine,|     | +----------------------+ |
+|  |  WATCHDOG=1 on OK)  |   |  FailurePolicyMgr)  |     | |   Behavior Engine    | |
 |  +---------------------+   +---------------------+     | | (Detection Rules)    | |
 |                                                        | +----------------------+ |
 |  +---------------------+   +---------------------+     |           |              |
 |  |     Audit Logger    |<--|   Storage Manager   |     |           v              |
-|  |  (RFC 5424 / WAL)   |   | (SQLite WAL Worker) |     | +----------------------+ |
-|  +---------------------+   +---------------------+     | |     Risk Engine      | |
-|                                      ^                 | | (Multi-stage Decay)  | |
+|  |  (RFC 5424 / WAL)   |   | (SQLite WAL/Checkpt)|     | +----------------------+ |
+|  +---------------------+   +---------------------+     | |  Evidence Risk Engine| |
+|                                      ^                 | |(Confidence & Impact) | |
 |                                      |                 | +----------------------+ |
 |  +---------------------+             |                 |           |              |
 |  |  Incident Manager   |-------------+                 |           v              |
 |  | (Temporal Correl.)  |                               | +----------------------+ |
 |  +---------------------+                               | |    Policy Engine     | |
-|            ^                                           | | (6-Stage Precedence) | |
+|            ^                                           | |(Decision Verification)| |
 |            |                                           | +----------------------+ |
 |  +---------------------------------------------------+ |           |              |
 |  |                 Response Orchestrator             |<+           v              |
-|  |  (Anti-PID-Reuse Kill, Process Suspend, NetBlock) |<------------+              |
+|  | (ProcessProtectionPolicy, Anti-Lockout Isolation) |<------------+              |
 |  +---------------------------------------------------+                            |
++-----------------------------------------------------------------------------------+
+                                          |
+                               Privileged IPC (/run/sentinel/privileged.sock)
+                                          v
++-----------------------------------------------------------------------------------+
+|                         sentinel-privileged (Privileged Helper)                   |
+|  - eBPF probe attach/detach & BPF maps management                                  |
+|  - Linux pidfd operations (pidfd_open, pidfd_send_signal SIGSTOP/SIGTERM/SIGKILL)   |
+|  - nftables atomic batch transactions (table inet sentinel only)                  |
+|  - Minimized capabilities: CAP_BPF, CAP_PERFMON, CAP_NET_ADMIN, CAP_KILL,          |
+|    CAP_DAC_READ_SEARCH (CAP_SYS_ADMIN and CAP_SYS_PTRACE dropped)                |
 +-----------------------------------------------------------------------------------+
                                           |
                                     eBPF / Netfilter
@@ -57,7 +69,7 @@ The system enforces real-time kernel-level behavioral prevention, deep causal pr
 |  +---------------------+   +---------------------+   +--------------------------+ |
 |                                                                                   |
 |  +---------------------+   +----------------------------------------------------+ |
-|  |  Netfilter NFQUEUE  |   | nftables ruleset (sentinel-filter)                 | |
+|  |  Netfilter NFQUEUE  |   | nftables ruleset (table inet sentinel)             | |
 |  +---------------------+   +----------------------------------------------------+ |
 +-----------------------------------------------------------------------------------+
 ```
@@ -88,28 +100,29 @@ The kernel component operates at Ring 0 via eBPF (Extended Berkeley Packet Filte
 
 ## 3. Userspace Daemon Subsystem (`sentineld`)
 
-The daemon runs continuously as a privileged background systemd service (`Type=notify`).
+The daemon runs continuously as a hardened background systemd service (`Type=notify`, `WatchdogSec=15s`).
 
 ### 3.1 Event Pipeline
-1. **Collector (`src/collector/`)**: Pulls raw eBPF events from the BPF ring buffer asynchronously. Employs bounded queues to prevent unbounded memory growth under event bursts.
-2. **Normalizer (`src/collector/event_normalizer.rs`)**: Transforms raw kernel structs into unified `NormalizedEvent` records, resolving PIDs, start timestamps, execution hashes, and security context.
-3. **Process Lineage Engine (`src/lineage/`)**: Constructs a causal Directed Acyclic Graph (DAG) of all running processes. Tracks ancestor chains (`ancestor_chain`), detects orphan re-parenting, and identifies PID reuse via `/proc/<pid>/stat` start times.
+1. **Collector (`src/collector/`)**: Pulls raw eBPF events from the BPF ring buffer asynchronously. Tracks ring buffer loss metrics (`RingBufferMetrics`), per-PID rate limits with safety bypass for critical events, and bounds check guarantees.
+2. **Normalizer (`src/collector/event_normalizer.rs`)**: Transforms raw C-compatible kernel structs (`#[repr(C)]`) into validated, type-safe `NormalizedEvent` records, preventing unsafe slice casts and validating alignment and string bounds.
+3. **Two-Tier Process Lineage Engine (`src/lineage/`)**:
+   - **Composite ProcessKey**: Processes are tracked using `ProcessKey` (`pid`, `tgid`, `start_time_ns`, `pid_namespace`, `dev_ino`, `exe_path`), stored in an `LruCache<ProcessKey, ProcessNode>` with secondary `tgid -> Vec<ProcessKey>` indexing to eliminate PID reuse collisions.
+   - **Process Graph**: Maintains lifecycle ancestry edges (`ProcessEdge`: Fork, Exec, Exit).
+   - **Data Flow Graph**: Maintains data propagation edges (`DataFlowEdge`: `ScmRightsTransfer`, `PipeTransfer`, `SocketDataTransfer`) for causal taint tracking through Unix sockets, pipes, and FIFOs.
 
-### 3.2 Detection and Risk Evaluation
-1. **Behavior Engine (`src/behavior/`)**: Evaluates incoming process, file, and network operations against a deterministic rule engine (LoLBin execution, reverse shells, shadow harvesting, memory dumping).
-2. **Risk Engine (`src/risk/`)**: Calculates a normalized deterministic score ($0 \le S \le 100$). Supports:
-   - Evidence deduplication within rolling evaluation windows.
-   - Exponential half-life decay ($T_{1/2} = 300\text{s}$) for transient events.
-   - Multi-stage attack compounding ($1.0\times$ for single tactic up to $1.6\times$ for full kill-chain progression).
-   - Severity classification: **Low** (0-29), **Medium** (30-59), **High** (60-84), **Critical** (85-100).
+### 3.2 Evidence-Based Risk Evaluation (`src/risk/`)
+Evaluates events using an evidence-based engine:
+- **Evidence Framework**: Evaluates threat evidence with calibrated `Confidence` (`Low`, `Medium`, `High`, `Certain`) and `Impact` (`Informational`, `Low`, `Medium`, `High`, `Critical`).
+- **Taint-Aware Scoring**: Compounds risk based on `TaintLevel` (`None`, `Observed`, `SensitiveAccess`, `SuspectedPropagation`, `ConfirmedPropagation`) and `SensitiveSource` (SSH keys, shadow file, cloud metadata, API tokens).
+- **Multi-Stage Compounding**: Combines evidence across attack stages ($1.0\times$ up to $1.6\times$ for full kill-chain progression) with exponential half-life decay ($T_{1/2} = 300\text{s}$).
 
 ### 3.3 Autonomous Policy Engine (`src/policy/`)
-Evaluates decisions strictly through an immutable 6-stage precedence hierarchy:
-1. **Stage 1 (Safety Rules)**: Never-Freeze allowlist (PID 1 systemd, PID 2 kthreadd, sentinel-rs processes). Absolute immunity against termination or suspension.
+Evaluates decisions strictly through an immutable 6-stage precedence hierarchy and records audit trails in `DecisionRecord`:
+1. **Stage 1 (Safety Rules / ProcessProtectionPolicy)**: Critical process protection (PID 1, PID 2, sentinel daemon, canonical system binaries like `/usr/lib/systemd/systemd`, `/usr/sbin/sshd`). Absolute immunity against termination or suspension.
 2. **Stage 2 (Protected Resources)**: Kernel and system-critical integrity invariants.
 3. **Stage 3 (Administrative Deny)**: Explicit administrator blacklist rules (`PathPrefix`, `ExactPath`, `Sha256`, `CidrBlock`).
 4. **Stage 4 (Administrative Allow)**: Explicit administrator whitelist rules.
-5. **Stage 5 (Behavior Detection Matches)**: Rule-triggered actions based on confirmed high-confidence attack behaviors.
+5. **Stage 5 (Behavior Detection Matches)**: Rule-triggered actions based on confirmed high-confidence attack behaviors. Automated process kill requires high confidence, critical impact, and confirmed taint propagation.
 6. **Stage 6 (Operating Mode Defaults)**:
    - **AUDIT**: Log all events, permit all execution.
    - **BALANCED**: Terminate Critical threats, isolate/deny High network threats, monitor Medium/Low.
@@ -118,13 +131,29 @@ Evaluates decisions strictly through an immutable 6-stage precedence hierarchy:
 
 ### 3.4 Response Orchestrator (`src/response/`)
 Executes precise response actions without human intervention:
-- **Process Termination**: Enforces two-phase verification. Queries `/proc/<pid>/stat` (start time) and `/proc/<pid>/exe` prior to sending signals (`SIGSTOP` $\rightarrow$ verify $\rightarrow$ `SIGTERM` $\rightarrow$ `SIGKILL`) to prevent killing reused PIDs.
-- **Process Suspension**: Issues `SIGSTOP` to halt suspect processes for forensic memory inspection; supports administrative unfreeze via `SIGCONT`.
-- **Network Blocking & Isolation**: Manipulates kernel netfilter sets dynamically via `nftables` to drop targeted TCP/UDP flows or place the entire host in emergency quarantine (preserving loopback and management IPC).
+- **Process Termination with Linux `pidfd`**: Eliminates TOCTOU races by obtaining a file descriptor via `pidfd_open(pid, 0)`. The protocol follows: `pidfd_open` $\rightarrow$ verify `/proc/<pid>/stat` start timestamp $\rightarrow$ `pidfd_send_signal(SIGSTOP)` $\rightarrow$ re-verify under freeze $\rightarrow$ `pidfd_send_signal(SIGTERM)` $\rightarrow$ (50ms grace) $\rightarrow$ `pidfd_send_signal(SIGKILL)`. On kernels $< 5.3$, fallback verification verifies `/proc/<pid>/stat` prior to sending any signal, returning `Err(PidReuseDetected)` without touching mismatched processes.
+- **Process Protection Policy (`src/protection.rs`)**: Verifies executable canonical paths, device/inode on trusted filesystems, package provenance, and sentinel self-identity. If a protected binary is compromised, actions are downgraded to `Alert` and network socket isolation.
+- **Transactional Network Isolation Manager (`src/network/`)**: Implements 3 containment tiers:
+  - `Selective`: Drops targeted malicious sockets/flows.
+  - `Restricted`: Permits only essential services (DNS, Sentinel C2, loopback, trusted SSH).
+  - `FullIsolation`: Complete quarantine preserving only loopback and recovery channels.
+  All rules are applied atomically inside table `inet sentinel` via batch commands (`nft -f -`). Never executes `nft flush ruleset`. Includes an **Anti-Lockout Timer** (default 300s) that automatically rolls back isolation if not confirmed via `sntctl network confirm-isolation`.
 
 ### 3.5 Storage and Audit
-- **Storage Manager (`src/storage/`)**: Asynchronous worker thread managing SQLite in Write-Ahead Logging (WAL) mode. Bounded event queue (`10,000` items) drops non-critical telemetry under extreme load to prevent memory exhaustion, while response actions and incident records are guaranteed storage.
+- **Storage Manager (`src/storage/database.rs`)**: SQLite in Write-Ahead Logging (`WAL`) mode with automatic checkpointing (`PRAGMA wal_checkpoint(TRUNCATE)`), disk space monitoring (disk quota guard suppresses raw events when free disk $< 500\text{MB}$), and an automated background retention policy thread.
 - **Audit Logger (`src/audit/`)**: Emits structured RFC 5424 syslog and JSON audit trails for compliance and SIEM integration.
+
+### 3.6 Privilege Separation (`sentinel-privileged`)
+To reduce attack surface, privileged actions are isolated into `sentinel-privileged`:
+- Handles eBPF program loading and attachment, atomic nftables batch execution, and pidfd signal delivery.
+- Drops dangerous capabilities `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE`.
+- Restricts ambient and bounding capabilities strictly to: `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_KILL`, and `CAP_DAC_READ_SEARCH`.
+- The core analysis engine `sentineld` runs with minimal privileges and connects to the privileged helper over a restricted Unix domain socket (`/run/sentinel/privileged.sock`).
+
+### 3.7 Health Monitoring, Watchdog & State Machine (`src/health/`)
+- **Agent State Machine**: Formal state transitions: `Starting` $\rightarrow$ `Healthy` $\rightarrow$ `Degraded` $\rightarrow$ `ProtectionUnavailable` $\rightarrow$ `Recovering` $\rightarrow$ `Stopping`.
+- **FailurePolicyManager**: Coordinates subsystem degradation policies (ring buffer drops, eBPF sensor failures, storage pressure).
+- **Systemd Watchdog Integration**: Sends `READY=1` upon completed initialization. Sends `WATCHDOG=1` every 4 seconds only if `HealthMonitor::check_all()` passes. Suppresses heartbeat if in `ProtectionUnavailable` for $> 30\text{s}$ (forcing systemd to restart the agent), and sends `STOPPING=1` on clean shutdown.
 
 ---
 

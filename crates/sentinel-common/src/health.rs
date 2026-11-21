@@ -18,6 +18,30 @@ pub enum HealthStatus {
     Failed,
 }
 
+/// Formal state machine of the Sentinel-RS agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentState {
+    Starting,
+    Healthy,
+    Degraded,
+    ProtectionUnavailable,
+    Recovering,
+    Stopping,
+}
+
+impl std::fmt::Display for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentState::Starting => write!(f, "STARTING"),
+            AgentState::Healthy => write!(f, "HEALTHY"),
+            AgentState::Degraded => write!(f, "DEGRADED"),
+            AgentState::ProtectionUnavailable => write!(f, "PROTECTION_UNAVAILABLE"),
+            AgentState::Recovering => write!(f, "RECOVERING"),
+            AgentState::Stopping => write!(f, "STOPPING"),
+        }
+    }
+}
+
 impl std::fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -85,6 +109,7 @@ pub struct SubsystemHealth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentHealthReport {
     pub overall_status: HealthStatus,
+    pub agent_state: AgentState,
     pub timestamp: DateTime<Utc>,
     pub uptime_secs: u64,
     pub subsystems: Vec<SubsystemHealth>,
@@ -113,12 +138,24 @@ impl AgentHealthReport {
             }
         }
 
+        let agent_state = match overall {
+            HealthStatus::Healthy => AgentState::Healthy,
+            HealthStatus::Degraded => AgentState::Degraded,
+            HealthStatus::Failed => AgentState::ProtectionUnavailable,
+        };
+
         Self {
             overall_status: overall,
+            agent_state,
             timestamp: Utc::now(),
             uptime_secs,
             subsystems,
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    pub fn with_agent_state(mut self, state: AgentState) -> Self {
+        self.agent_state = state;
+        self
     }
 }

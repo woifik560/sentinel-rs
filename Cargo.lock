@@ -787,6 +787,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-privileged"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix",
+ "sentinel-common",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sentineld"
 version = "0.2.1"
 dependencies = [
@@ -794,6 +810,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "libc",
  "lru",
  "nix",
  "rusqlite",

@@ -252,6 +252,12 @@ $SNTCTL incidents list || true
 
 echo ""
 echo "--------------------------------------------------------------------------------"
+echo " TEST 7: ADVERSARIAL SUITE SEC-001 THROUGH SEC-012"
+echo "--------------------------------------------------------------------------------"
+cargo test --test adversarial_sec_suite -- --nocapture || true
+
+echo ""
+echo "--------------------------------------------------------------------------------"
 echo " TEARDOWN & SUMMARY"
 echo "--------------------------------------------------------------------------------"
 if [ -f /tmp/sentinel_test/daemon.log ]; then

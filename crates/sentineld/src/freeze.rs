@@ -8,13 +8,11 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use sentinel_common::config::default_never_freeze_list;
-use sentinel_common::events::SENTINEL_NFQUEUE_NUM;
 use sentinel_common::ipc::{PromptAction, PromptVerdict};
 
 #[derive(Debug, Clone)]
@@ -153,43 +151,13 @@ impl NfqueueHoldManager {
     /// When `use_bypass` is true (recommended for desktop), if sentineld is stopped or crashes,
     /// Netfilter automatically bypasses the queue instead of dropping all desktop network traffic.
     pub fn setup_nftables_rule_with_bypass(use_bypass: bool) -> anyhow::Result<()> {
-        info!(
-            "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({}, bypass={})",
-            SENTINEL_NFQUEUE_NUM, use_bypass
-        );
-
-        let bypass_str = if use_bypass { " bypass" } else { "" };
-
-        let setup_cmd = format!(
-            "nft add table inet sentinel 2>/dev/null; \
-             nft add chain inet sentinel output '{{ type filter hook output priority 0; }}' 2>/dev/null; \
-             nft add rule inet sentinel output 'meta mark & 0xff800000 == 0x5e800000 counter queue num {}{}' 2>/dev/null; \
-             nft add rule inet sentinel output 'ct state established,related accept' 2>/dev/null; \
-             nft add rule inet sentinel output 'ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{}' 2>/dev/null",
-            SENTINEL_NFQUEUE_NUM, bypass_str, SENTINEL_NFQUEUE_NUM, bypass_str
-        );
-
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(&setup_cmd)
-            .status();
-
-        match status {
-            Ok(s) if s.success() => info!("nftables NFQUEUE rule successfully active (Re-eval priority over established)."),
-            _ => warn!("nftables command failed or unprivileged. Simulation mode active for NFQUEUE."),
-        }
-
-        Ok(())
+        crate::network::nftables::NftablesManager::setup_rules(use_bypass)
     }
 
     /// Graceful cleanup of Netfilter rules upon daemon shutdown/restart.
     /// Prevents network disconnection when service is updated or stopped by systemd.
     pub fn clean_nftables_rules() {
-        info!("Cleaning up Sentinel nftables rules to restore normal networking...");
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg("nft delete table inet sentinel 2>/dev/null")
-            .status();
+        crate::network::nftables::NftablesManager::cleanup_rules();
     }
 
     /// Register a packet currently held in NFQUEUE awaiting interactive verdict.

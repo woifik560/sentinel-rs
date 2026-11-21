@@ -8,4 +8,4 @@ pub mod tracker;
 pub use graph::LineageGraph;
 pub use process_key::ProcessKey;
 #[allow(unused_imports)]
-pub use tracker::{detect_memfd, inspect_interpreter, LineageTracker, ScriptInfo};
+pub use tracker::{detect_memfd, inspect_interpreter, read_proc_starttime, LineageTracker, ScriptInfo};
