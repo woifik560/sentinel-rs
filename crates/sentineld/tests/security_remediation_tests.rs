@@ -216,3 +216,179 @@ fn test_rules_config_parsing_error() {
     let res = toml::from_str::<RulesConfig>(malformed_toml);
     assert!(res.is_err(), "Malformed TOML must return error");
 }
+
+#[tokio::test]
+async fn test_readonly_denied_sensitive_queries() {
+    let freeze = FreezeInspectOrchestrator::new(10, 64, 500);
+    let lineage = LineageTracker::new(64);
+    let incidents = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let protection_state = Arc::new(RwLock::new(ProtectionState::new(
+        true,
+        OperatingMode::Balanced,
+        PathBuf::from("/etc/sentinel/rules.toml"),
+        PathBuf::from("/etc/sentinel/config.toml"),
+    )));
+    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(RulesConfig::default(), DpkgChecker::new())));
+
+    // 1. ReadOnly client attempts IncidentsList -> MUST return EACCES
+    let resp = sentineld::ipc_server::handle_ipc_command_for_test(
+        IpcCommand::IncidentsList { limit: None, offset: None },
+        ClientRole::ReadOnly,
+        &freeze,
+        &lineage,
+        &incidents,
+        &protection_state,
+        Some(&risk_engine),
+        None,
+    ).await;
+    assert!(matches!(resp, IpcResponse::Error { ref code, .. } if code == "EACCES"));
+
+    // 2. ReadOnly client attempts ProcessLineage -> MUST return EACCES
+    let resp_lineage = sentineld::ipc_server::handle_ipc_command_for_test(
+        IpcCommand::ProcessLineage { tgid: 1 },
+        ClientRole::ReadOnly,
+        &freeze,
+        &lineage,
+        &incidents,
+        &protection_state,
+        Some(&risk_engine),
+        None,
+    ).await;
+    assert!(matches!(resp_lineage, IpcResponse::Error { ref code, .. } if code == "EACCES"));
+
+    // 3. ReadOnly client attempts PolicyList -> MUST return EACCES
+    let resp_policy = sentineld::ipc_server::handle_ipc_command_for_test(
+        IpcCommand::PolicyList,
+        ClientRole::ReadOnly,
+        &freeze,
+        &lineage,
+        &incidents,
+        &protection_state,
+        Some(&risk_engine),
+        None,
+    ).await;
+    assert!(matches!(resp_policy, IpcResponse::Error { ref code, .. } if code == "EACCES"));
+
+    // 4. Operator client is permitted to query incidents
+    let resp_op = sentineld::ipc_server::handle_ipc_command_for_test(
+        IpcCommand::IncidentsList { limit: None, offset: None },
+        ClientRole::Operator,
+        &freeze,
+        &lineage,
+        &incidents,
+        &protection_state,
+        Some(&risk_engine),
+        None,
+    ).await;
+    assert!(matches!(resp_op, IpcResponse::Ok(_)));
+}
+
+#[test]
+fn test_nftables_syntax_generator_correctness() {
+    use sentineld::network::nftables::{IsolationTier, NftablesManager};
+
+    // Full Isolation Script
+    let full_script = NftablesManager::generate_isolation_script(IsolationTier::FullIsolation, &[]);
+    assert!(full_script.contains("add table inet sentinel"));
+    assert!(full_script.contains("policy drop"));
+    assert!(full_script.contains("oif lo accept"));
+
+    // Restricted Isolation with SSH Anti-Lockout
+    let restricted_script = NftablesManager::generate_isolation_script(
+        IsolationTier::Restricted,
+        &["192.168.1.50".to_string()],
+    );
+    assert!(restricted_script.contains("tcp dport 22 accept"));
+    // Crucial anti-lockout fix on output:
+    assert!(restricted_script.contains("tcp sport 22 ct state established,related accept"));
+    assert!(restricted_script.contains("192.168.1.50"));
+
+    // Selective Isolation
+    let selective_script = NftablesManager::generate_isolation_script(IsolationTier::Selective, &[]);
+    assert!(selective_script.contains("blocked_v4"));
+    assert!(selective_script.contains("blocked_v6"));
+}
+
+#[tokio::test]
+async fn test_network_anti_lockout_confirm_state() {
+    use sentineld::network::nftables::IsolationTier;
+    let block_mgr = Arc::new(sentineld::response::NetworkBlockManager::new());
+    let net_mgr = sentineld::network::NetworkProtectionManager::new(block_mgr, 500);
+
+    // Initial state: not isolated (IsolationTier::None)
+    assert_eq!(*net_mgr.isolation_tier.read().await, IsolationTier::None);
+    // Confirm when not isolated must return error
+    let unisolated_err = net_mgr.confirm_isolation().await;
+    assert!(unisolated_err.is_err(), "Confirming isolation while not isolated must fail");
+
+    // Simulate active isolation and timer
+    *net_mgr.isolation_tier.write().await = IsolationTier::FullIsolation;
+    net_mgr.isolation_timer_active.store(true, std::sync::atomic::Ordering::SeqCst);
+    net_mgr.isolation_confirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Operator confirms isolation
+    let confirmed = net_mgr.confirm_isolation().await.expect("Failed to confirm isolation");
+    assert!(confirmed);
+    assert!(net_mgr.isolation_confirmed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!net_mgr.isolation_timer_active.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Second confirmation returns false (already confirmed/disarmed)
+    let second_confirm = net_mgr.confirm_isolation().await.expect("Failed second confirm");
+    assert!(!second_confirm);
+}
+
+#[test]
+fn test_missing_start_time_fails_closed() {
+    let current_pid = std::process::id();
+    let key_missing_ticks = ProcessKey::new(current_pid, 0);
+    // Without alternative identity, 0 ticks must fail closed
+    let result = verify_process_identity(&key_missing_ticks, None);
+    assert!(result.is_err(), "Zero start time ticks must fail closed without alternative identity");
+}
+
+#[test]
+fn test_selective_isolation_policy_blocks_designated_targets() {
+    use sentineld::network::nftables::{IsolationTier, NftablesManager, SelectivePolicy};
+
+    let mut policy = SelectivePolicy::default();
+    policy.blocked_ips.push("203.0.113.5".parse().unwrap());
+    policy.blocked_ports.push(4444);
+
+    let script = NftablesManager::generate_isolation_script_with_policy(IsolationTier::Selective, &[], &policy);
+    assert!(script.contains("203.0.113.5"));
+    assert!(script.contains("tcp dport 4444 counter drop"));
+    assert!(script.contains("udp dport 4444 counter drop"));
+    assert!(script.contains("blocked_v4"));
+}
+
+#[test]
+fn test_restricted_isolation_omits_broad_established_bypass() {
+    use sentineld::network::nftables::{IsolationTier, NftablesManager};
+
+    let script = NftablesManager::generate_isolation_script(
+        IsolationTier::Restricted,
+        &["192.168.1.10".to_string()],
+    );
+    // Verified: No top-level unrestricted ct state established,related accept in output chain
+    assert!(!script.contains("add rule inet sentinel output ct state established,related accept"));
+    // Verified: Anti-lockout SSH establishes only for trusted target
+    assert!(script.contains("add rule inet sentinel output ip daddr 192.168.1.10 tcp sport 22 ct state established,related accept"));
+}
+
+#[tokio::test]
+async fn test_privileged_helper_rejection_for_unauthorized_user() {
+    use sentinel_privileged::server::PrivilegedExecutor;
+    use sentinel_privileged::PrivilegedResult;
+
+    // Test that flush ruleset is rejected
+    let res = PrivilegedExecutor::execute_nft_batch("flush ruleset\n");
+    assert!(matches!(res, PrivilegedResult::Error { ref code, .. } if code == "EPERM"));
+
+    // Test that foreign table manipulation is rejected
+    let res_foreign = PrivilegedExecutor::execute_nft_batch("add table ip filter\n");
+    assert!(matches!(res_foreign, PrivilegedResult::Error { ref code, .. } if code == "EPERM"));
+
+    // Test that targeting PID 1 is rejected
+    let res_pid1 = PrivilegedExecutor::signal_process(1, libc::SIGTERM);
+    assert!(matches!(res_pid1, PrivilegedResult::Error { ref code, .. } if code == "EPERM"));
+}

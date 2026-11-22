@@ -7,6 +7,36 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Operational state of a security mechanism or probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MechanismState {
+    /// Kernel or platform does not support this mechanism.
+    Unsupported,
+    /// Supported by kernel/platform but not available in current configuration or binary missing.
+    Unavailable,
+    /// Currently initializing or attaching to kernel hooks.
+    Loading,
+    /// Successfully loaded, attached, and generating/intercepting telemetry.
+    Active,
+    /// Operating with degraded capabilities (e.g. non-critical hooks or fallback mode).
+    Degraded,
+    /// Initialization or execution failed with an error.
+    Failed,
+}
+
+impl std::fmt::Display for MechanismState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MechanismState::Unsupported => write!(f, "UNSUPPORTED"),
+            MechanismState::Unavailable => write!(f, "UNAVAILABLE"),
+            MechanismState::Loading => write!(f, "LOADING"),
+            MechanismState::Active => write!(f, "ACTIVE"),
+            MechanismState::Degraded => write!(f, "DEGRADED"),
+            MechanismState::Failed => write!(f, "FAILED"),
+        }
+    }
+}
+
 /// Operational state of a subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HealthStatus {

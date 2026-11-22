@@ -19,16 +19,18 @@ impl HostContainment {
         }
     }
 
-    pub fn isolate_host(&self) {
+    pub fn isolate_host(&self) -> anyhow::Result<()> {
+        self.network_blocks.set_host_containment(true)?;
         self.active.store(true, Ordering::SeqCst);
-        self.network_blocks.set_host_containment(true);
         info!("Host containment activated.");
+        Ok(())
     }
 
-    pub fn release_host(&self) {
+    pub fn release_host(&self) -> anyhow::Result<()> {
+        self.network_blocks.set_host_containment(false)?;
         self.active.store(false, Ordering::SeqCst);
-        self.network_blocks.set_host_containment(false);
         info!("Host containment released.");
+        Ok(())
     }
 
     pub fn is_isolated(&self) -> bool {

@@ -7,7 +7,7 @@
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -388,15 +388,20 @@ impl FreezeInspectOrchestrator {
         Ok(())
     }
 
-    /// Terminate a rogue process with SIGKILL, respecting Never-Freeze list.
-    pub fn terminate_process(&self, tgid: u32, exe_name: &str, uid: u32) -> anyhow::Result<()> {
+    /// Terminate a rogue process safely with anti-PID-reuse verification and pidfd, respecting Never-Freeze list.
+    pub fn terminate_process(&self, tgid: u32, _exe_name: &str, uid: u32) -> anyhow::Result<()> {
         if tgid <= 1 {
             return Ok(());
         }
 
         // Always resolve actual canonical executable path from /proc/<tgid>/exe
-        let real_exe_path = std::fs::read_link(format!("/proc/{}/exe", tgid))
-            .unwrap_or_else(|_| PathBuf::from(exe_name));
+        let real_exe_path = match std::fs::read_link(format!("/proc/{}/exe", tgid)) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Cannot verify exe for TGID {} before termination: {}. Aborting termination for safety.", tgid, e);
+                return Ok(());
+            }
+        };
 
         // Read real UID from /proc/<tgid>/status if available
         let real_uid = std::fs::read_to_string(format!("/proc/{}/status", tgid))
@@ -417,14 +422,34 @@ impl FreezeInspectOrchestrator {
             return Ok(());
         }
 
-        error!("Sending SIGKILL to terminate malicious TGID {} ({})", tgid, real_exe_path.display());
-        let pid = Pid::from_raw(tgid as i32);
-        kill(pid, Signal::SIGKILL)
-            .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL to TGID {}: {}", tgid, e))?;
+        // Retrieve start_time from /proc/<tgid>/stat to build a ProcessKey
+        let start_time_ns = match std::fs::read_to_string(format!("/proc/{}/stat", tgid)) {
+            Ok(stat) => {
+                stat.rfind(')')
+                    .and_then(|r| stat[r + 1..].split_whitespace().nth(19))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+            Err(_) => 0,
+        };
 
-        let mut map = self.frozen_processes.write().unwrap();
-        map.remove(&tgid);
-        Ok(())
+        if start_time_ns == 0 {
+            warn!("Cannot determine start time for TGID {}. Aborting termination to prevent killing reused PID.", tgid);
+            return Ok(());
+        }
+
+        let key = crate::lineage::ProcessKey::new(tgid, start_time_ns);
+        match crate::response::safe_terminate_process(&key, Some(&real_exe_path), Duration::from_millis(100)) {
+            Ok(_) => {
+                let mut map = self.frozen_processes.write().unwrap();
+                map.remove(&tgid);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Safe termination failed for TGID {}: {}", tgid, e);
+                Err(anyhow::anyhow!("Termination failed for TGID {}: {}", tgid, e))
+            }
+        }
     }
 
     /// Handle user verdict from GUI or CLI.

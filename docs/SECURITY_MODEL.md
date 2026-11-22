@@ -7,7 +7,7 @@ Sentinel-RS operates under a strict Zero-Trust Host Security paradigm:
 2. **Autonomous Determinism**: Prevention, detection, and response decisions occur autonomously via deterministic rules and mathematical risk compounding without requiring interactive user prompts.
 3. **Fail-Closed Default**: In the presence of ambiguous kernel events, saturated queues, or malformed IPC messages, the agent enforces a fail-closed posture for critical threats.
 4. **Kernel-Authenticated Trust Boundaries**: All administrative IPC interactions are authenticated directly by the Linux kernel using `SO_PEERCRED`. No tokens, passwords, or shared secrets are transmitted.
-5. **Anti-PID-Reuse & Safe Signal Delivery Guarantee**: Process identity incorporates start timestamps from `/proc/<pid>/stat`, canonical executable path, and inode to eliminate Time-of-Check to Time-of-Use (TOCTOU) races. Process control relies on Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`), ensuring signals are delivered exclusively to the verified process instance.
+5. **Anti-PID-Reuse & Safe Signal Delivery Guarantee**: Process identity incorporates start timestamps from `/proc/<pid>/stat`, canonical executable path, and inode to eliminate Time-of-Check to Time-of-Use (TOCTOU) races. Process control relies on Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`, `libc::poll`), ensuring signals are delivered exclusively to the verified process instance.
 
 ---
 
@@ -31,19 +31,19 @@ Because `SO_PEERCRED` is populated directly by the kernel networking stack based
 
 ### 2.2 Role-Based Access Control (RBAC) Hierarchy
 
-| Role | Required Credential | Permitted Operations |
-| :--- | :--- | :--- |
-| **`RootAdmin`** | Effective UID `0` | - Enable / disable global protection<br>- Reload and update security policies (`rules.toml`)<br>- Manual process termination, suspension, and unfreeze<br>- Emergency host network isolation / un-isolation<br>- Manual IP block/unblock<br>- Full diagnostic report export |
-| **`Operator`** | Effective GID `0` (or `sentinel` group) | - Query agent status, health metrics, and daemon statistics<br>- Inspect process lineage DAG<br>- List and view incident reports<br>- Stream real-time security events<br>- Run environment diagnostics (`sntctl doctor`) |
-| **`ReadOnly`** | UID $\ge 1000$ (on `sentinel-ro.sock`) | - Stream non-sensitive audit events<br>- Query basic daemon uptime and version |
+| Role | Required Credential | Permitted Operations | Denied Operations |
+| :--- | :--- | :--- | :--- |
+| **`RootAdmin`** | Effective UID `0` | - Enable / disable global protection<br>- Reload and update security policies (`rules.toml`)<br>- Manual process termination, suspension, and unfreeze<br>- Emergency host network isolation (`FullIsolation`, `Restricted`, `Selective`)<br>- Network isolation confirmation (`confirm_isolation`)<br>- Clear incidents database (`IncidentsClear`)<br>- Full diagnostic report export | None (Full Access) |
+| **`Operator`** | Effective GID `0` (or `sentinel` group) | - Query agent status and health metrics<br>- Inspect process lineage DAG (`ProcessLineage`, `ProcessInspect`)<br>- List and view incident reports (`IncidentsList`, `IncidentsShow`)<br>- Read security policies (`PolicyList`, `PolicyShow`)<br>- Run environment diagnostics (`sntctl doctor`) | - Mutating protection state<br>- Mutating firewall / network isolation<br>- Terminating / suspending processes<br>- Clearing incident logs |
+| **`ReadOnly`** | UID $\ge 1000$ (on `sentinel-ro.sock`) | - Query public daemon uptime and version (`Status`, `Doctor`, `Diagnostics`)<br>- Query public health status (`Health`) | - All mutating operations (`EACCES`)<br>- Incidents inspection (`IncidentsList`, `IncidentsShow`)<br>- Process lineage inspection (`ProcessLineage`, `ProcessInspect`)<br>- Policy listing (`PolicyList`, `PolicyShow`) |
 
-Any unprivileged client attempting to invoke administrative commands on `/run/sentinel/sentinel.sock` receives an immediate `EACCES` response and triggers an audit violation log.
+Any client attempting to invoke unauthorized commands receives an immediate `EACCES` response with a security violation log. Connection floods are bounded by an atomic connection semaphore (max 16 concurrent IPC clients) to protect against DoS attacks.
 
 ---
 
 ## 3. Defense-in-Depth & Causal Taint Tracking
 
-Sentinel-RS uses BPF LSM to implement continuous multi-vector taint tracking across the entire OS lifecycle:
+Sentinel-RS implements continuous multi-vector taint tracking across the entire OS lifecycle:
 
 ```
 [ Sensitive Asset ]
@@ -111,7 +111,7 @@ When a legitimate protected binary is suspected of exploitation, termination is 
 
 In Linux systems under high process churn, PIDs are recycled rapidly. A naive `kill(pid, SIGKILL)` introduces a severe race condition where the malicious process exits and a legitimate service receives the recycled PID before the signal arrives.
 
-Sentinel-RS solves this using Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`) combined with two-phase process identity verification:
+Sentinel-RS solves this using Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`, `libc::poll` on `POLLIN`) combined with strict two-phase process identity verification:
 
 ```
 [ 1. Obtain pidfd & Query Identity ]
@@ -127,6 +127,7 @@ Sentinel-RS solves this using Linux `pidfd` (`pidfd_open`, `pidfd_send_signal`) 
        |
 [ 3. Atomic Signal Sequence via pidfd ]
        |
+       +---> Verify liveness with libc::poll(fd, POLLIN, 0)
        +---> pidfd_send_signal(pidfd, SIGSTOP, NULL, 0) (freeze process)
        +---> Re-verify /proc/<pid>/stat start_time under freeze
        +---> If verified: pidfd_send_signal(pidfd, SIGTERM, NULL, 0)
@@ -151,3 +152,17 @@ To uphold least privilege, Sentinel-RS segregates functionality into two distinc
    - Sends signals via Linux `pidfd`.
    - Stripped of dangerous broad capabilities: `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` are dropped.
    - Restricts capabilities strictly to: `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_KILL`, `CAP_DAC_READ_SEARCH`.
+
+---
+
+## 7. Network Isolation & Anti-Lockout Architecture
+
+All Netfilter rulesets are managed transactionally within the dedicated `inet sentinel` table using `nft -c -f -` atomic pre-validation.
+
+Three isolation tiers are supported:
+- **`FullIsolation`**: Drops all ingress and egress traffic except loopback (`iif "lo"`) and authenticated SSH rescue sessions.
+- **`Restricted`**: Permits DNS (53) and established SSH sessions. Outbound server responses match `tcp sport 22 ct state established,related accept`, preventing operator lockout.
+- **`Selective`**: Selectively drops malicious IP sets (`@blocked_v4`, `@blocked_v6`) while preserving normal host network traffic.
+
+### Anti-Lockout Safety Timer
+When `isolate` is engaged with a non-zero timeout (e.g. `sntctl network isolate-timed --timeout 300`), an asynchronous rollback timer is armed. If the administrator does not call `sntctl network confirm-isolation` within the allotted window, Sentinel-RS automatically reverts the Netfilter ruleset to `IsolationTier::None`, restoring network connectivity and preventing headless remote lockouts.

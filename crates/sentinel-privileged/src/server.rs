@@ -45,6 +45,31 @@ impl PrivilegedExecutor {
             "nft"
         };
 
+        // Step 1: Pre-validate syntax before applying (`nft -c -f -`)
+        if let Ok(mut check_child) = Command::new(nft_bin)
+            .arg("-c")
+            .arg("-f")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = check_child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(batch.as_bytes());
+            }
+            if let Ok(out) = check_child.wait_with_output() {
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    return PrivilegedResult::Error {
+                        code: "EBADSYNTAX".into(),
+                        message: format!("Syntax error: {}", err.trim()),
+                    };
+                }
+            }
+        }
+
         let mut child = match Command::new(nft_bin)
             .arg("-f")
             .arg("-")

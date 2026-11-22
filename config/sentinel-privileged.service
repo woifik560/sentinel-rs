@@ -1,0 +1,34 @@
+[Unit]
+Description=Sentinel-RS Privileged Security Operations Helper
+Documentation=https://github.com/woifik560/sentinel-rs
+Before=sentineld.service
+ConditionVirtualization=!container
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinel-privileged
+Restart=always
+RestartSec=3s
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0750
+
+# Minimal required capabilities for network isolation, process termination, and eBPF
+AmbientCapabilities=CAP_NET_ADMIN CAP_KILL CAP_BPF CAP_PERFMON CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_KILL CAP_BPF CAP_PERFMON CAP_DAC_READ_SEARCH
+
+# System Hardening Directives
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+NoNewPrivileges=yes
+ReadWritePaths=/run/sentinel
+
+[Install]
+WantedBy=multi-user.target

@@ -161,6 +161,15 @@ async fn main() -> anyhow::Result<()> {
         st.network_holding_active = network_holding_active;
     }
 
+    // Network Protection Manager for nftables isolation & anti-lockout
+    let block_mgr = Arc::new(sentineld::response::NetworkBlockManager::new());
+    let network_manager = Arc::new(
+        sentineld::network::NetworkProtectionManager::new(
+            block_mgr,
+            config.general.aggregate_window_ms,
+        ),
+    );
+
     // Graceful Shutdown Signal Handler: Restore nftables rules on SIGINT/SIGTERM (Audit 3.1)
     tokio::spawn(run_shutdown_listener());
 
@@ -173,8 +182,21 @@ async fn main() -> anyhow::Result<()> {
         min_kernel_version: config.general.min_kernel_version.clone(),
     });
     ebpf_loader.load_and_attach().await?;
-    let mut event_rx = ebpf_loader.take_event_receiver().expect("Receiver must be present");
+    let raw_event_rx = ebpf_loader.take_event_receiver().expect("Receiver must be present");
     let taint_mgr = ebpf_loader.taint_manager();
+
+    {
+        let mut st = protection_state.write().await;
+        st.bpf_lsm_active = (ebpf_loader.bpf_lsm_state() == sentinel_common::health::MechanismState::Active);
+    }
+
+    // Bounded RingBuffer Consumer with DoS rate-limiting
+    let event_metrics = Arc::new(sentineld::collector::EventMetrics::default());
+    let consumer = sentineld::collector::RingBufferConsumer::new(
+        event_metrics.clone(),
+        config.general.ring_buffer_size,
+    );
+    let mut event_rx = consumer.start_consumer(raw_event_rx);
 
     // Register daemon PID for kernel self-defense and systemd as IPC broker
     taint_mgr.set_daemon_pid(std::process::id());
@@ -201,11 +223,13 @@ async fn main() -> anyhow::Result<()> {
             freeze_orchestrator.clone(),
             lineage_tracker.clone(),
             taint_mgr.clone(),
-        ).with_state_and_storage(
+        )
+        .with_state_and_storage(
             protection_state.clone(),
             risk_engine.clone(),
             storage_manager.clone(),
         )
+        .with_network_manager(network_manager.clone()),
     );
 
     let ipc_runner = ipc_server.clone();
@@ -228,15 +252,17 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 7. Periodic Lineage Memory Pruner (Audit 2.5)
+    // 7. Periodic Lineage & Taint Memory Pruner (Audit 2.5)
     let pruner_lineage = lineage_tracker.clone();
+    let pruner_taint = taint_mgr.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
         loop {
             interval.tick().await;
-            let count = pruner_lineage.prune_dead();
-            if count > 0 {
-                tracing::debug!("Lineage graph pruner cleaned {} dead process nodes", count);
+            let count_lineage = pruner_lineage.prune_dead();
+            let count_taint = pruner_taint.prune_dead();
+            if count_lineage > 0 || count_taint > 0 {
+                tracing::debug!("Memory pruner cleaned {} lineage nodes, {} taint records", count_lineage, count_taint);
             }
         }
     });

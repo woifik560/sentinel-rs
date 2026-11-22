@@ -87,7 +87,8 @@ impl StorageManager {
                     warn!("Storage worker error: {}", e);
                 }
             }
-            info!("SQLite storage worker thread shutdown");
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            info!("SQLite storage worker thread shutdown and WAL truncated");
         });
 
         // Spawn periodic retention and checkpointing maintenance task (TASK-P1-19)

@@ -105,13 +105,19 @@ impl NetworkProtectionManager {
     }
 
     /// Operator confirms network isolation, disarming the Anti-Lockout auto-rollback timer.
-    pub fn confirm_isolation(&self) -> bool {
+    pub async fn confirm_isolation(&self) -> anyhow::Result<bool> {
+        let tier = *self.isolation_tier.read().await;
+        if tier == IsolationTier::None {
+            anyhow::bail!("Cannot confirm isolation: Host is not currently isolated");
+        }
         if self.isolation_timer_active.swap(false, Ordering::SeqCst) {
             self.isolation_confirmed.store(true, Ordering::SeqCst);
             info!("Anti-Lockout timer disarmed: Network isolation confirmed by operator.");
-            true
+            Ok(true)
+        } else if self.isolation_confirmed.load(Ordering::SeqCst) {
+            Ok(false) // Already confirmed
         } else {
-            false
+            anyhow::bail!("No active anti-lockout timer to confirm");
         }
     }
 

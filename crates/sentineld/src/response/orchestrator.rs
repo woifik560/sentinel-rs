@@ -65,7 +65,9 @@ impl ResponseOrchestrator {
             PolicyAction::Deny | PolicyAction::DenyNetwork => {
                 self.network_blocks.block_pid(target_pid);
                 if let Some(ref ip) = ctx.dest_ip {
-                    self.network_blocks.block_ip(ip.clone());
+                    if let Err(e) = self.network_blocks.block_ip(ip.clone()) {
+                        warn!("Failed to block IP {} in nftables: {}", ip, e);
+                    }
                 }
             }
             PolicyAction::TerminateProcess => {
@@ -82,7 +84,9 @@ impl ResponseOrchestrator {
                     );
                     self.network_blocks.block_pid(target_pid);
                     if let Some(ref ip) = ctx.dest_ip {
-                        self.network_blocks.block_ip(ip.clone());
+                        if let Err(e) = self.network_blocks.block_ip(ip.clone()) {
+                            warn!("Failed to block IP {} in nftables: {}", ip, e);
+                        }
                     }
                     status = "PROTECTED_PROCESS_ISOLATED".to_string();
                 } else if let Err(e) = safe_terminate_process(

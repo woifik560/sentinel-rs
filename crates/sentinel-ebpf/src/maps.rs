@@ -1382,6 +1382,45 @@ impl TaintMapManager {
 
         false
     }
+
+    /// Prune exited tasks and stale mappings to prevent memory leaks and map exhaustion.
+    pub fn prune_dead(&self) -> usize {
+        let dead_tgids: Vec<u32> = {
+            let tasks = self.tasks.read().unwrap();
+            tasks
+                .keys()
+                .copied()
+                .filter(|&tgid| {
+                    if tgid <= 2 {
+                        return false;
+                    }
+                    !Path::new(&format!("/proc/{}", tgid)).exists()
+                })
+                .collect()
+        };
+
+        let count = dead_tgids.len();
+        if count > 0 {
+            let mut tasks = self.tasks.write().unwrap();
+            let mut allowed = self.allowed_tgids.write().unwrap();
+            let mut threads = self.thread_to_group.write().unwrap();
+            for tgid in &dead_tgids {
+                tasks.remove(tgid);
+                allowed.remove(tgid);
+            }
+            threads.retain(|_tid, leader| !dead_tgids.contains(leader));
+        }
+
+        // Limit size of flow_mark_ctx to prevent memory exhaustion under attack
+        {
+            let mut flow_map = self.flow_mark_ctx.write().unwrap();
+            if flow_map.len() > 8192 {
+                flow_map.clear();
+            }
+        }
+
+        count
+    }
 }
 
 #[cfg(test)]

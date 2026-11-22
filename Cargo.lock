@@ -816,6 +816,7 @@ dependencies = [
  "rusqlite",
  "sentinel-common",
  "sentinel-ebpf",
+ "sentinel-privileged",
  "serde",
  "serde_json",
  "sha2",

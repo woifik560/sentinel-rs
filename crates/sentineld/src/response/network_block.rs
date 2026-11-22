@@ -40,34 +40,34 @@ impl NetworkBlockManager {
         self.blocked_pids.read().unwrap().contains(&pid)
     }
 
-    pub fn block_ip(&self, ip: String) {
+    pub fn block_ip(&self, ip: String) -> anyhow::Result<()> {
         info!("Blocking network destination IP {}", ip);
-        self.blocked_ips.write().unwrap().insert(ip);
+        self.blocked_ips.write().unwrap().insert(ip.clone());
+        crate::network::nftables::NftablesManager::block_ip(&ip)
     }
 
     pub fn is_ip_blocked(&self, ip: &str) -> bool {
         self.blocked_ips.read().unwrap().contains(ip)
     }
 
-    pub fn set_host_containment(&self, enabled: bool) {
+    pub fn set_host_containment(&self, enabled: bool) -> anyhow::Result<()> {
         let mut contained = self.is_contained.write().unwrap();
-        *contained = enabled;
         if enabled {
             warn!("EMERGENCY: Host network containment ENABLED! All outbound traffic blocked except loopback.");
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("nft add rule inet sentinel output oifname != \"lo\" counter drop 2>/dev/null")
-                .status();
+            crate::network::nftables::NftablesManager::apply_isolation_tier(
+                crate::network::nftables::IsolationTier::FullIsolation,
+                &[],
+            )?;
+            *contained = true;
         } else {
             info!("Host network containment disabled. Normal network policy restored.");
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("nft flush chain inet sentinel output 2>/dev/null; \
-                      nft add rule inet sentinel output 'meta mark & 0xff800000 == 0x5e800000 counter queue num 100 bypass' 2>/dev/null; \
-                      nft add rule inet sentinel output 'ct state established,related accept' 2>/dev/null; \
-                      nft add rule inet sentinel output 'ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num 100 bypass' 2>/dev/null")
-                .status();
+            crate::network::nftables::NftablesManager::apply_isolation_tier(
+                crate::network::nftables::IsolationTier::None,
+                &[],
+            )?;
+            *contained = false;
         }
+        Ok(())
     }
 
     pub fn is_host_contained(&self) -> bool {

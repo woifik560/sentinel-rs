@@ -14,6 +14,8 @@ pub enum TerminationError {
     PidReuseDetected(u32),
     #[error("Process {0} not found")]
     NotFound(u32),
+    #[error("Process verification failed for PID {0}: {1}")]
+    VerificationFailed(u32, String),
     #[error("System error signaling process {0}: {1}")]
     SignalFailed(u32, nix::Error),
     #[error("Permission denied terminating process {0}")]
@@ -89,13 +91,41 @@ impl PidFd {
     }
 
     /// Checks if the process instance pinned by this pidfd is still alive.
+    /// On Linux, poll on a pidfd returns POLLIN when the process exits.
+    /// Strictly inspects the pidfd itself without relying on racily re-inspecting /proc.
     pub fn is_alive(&self) -> bool {
-        let fd_stat = format!("/proc/self/fd/{}/stat", self.fd);
-        if Path::new(&fd_stat).exists() {
-            return true;
+        #[cfg(target_os = "linux")]
+        {
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    // Descriptor invalid or polling failure
+                    return false;
+                } else if ret > 0 {
+                    // When the pinned process exits, pidfd becomes readable (POLLIN).
+                    // POLLHUP/POLLERR may also accompany exit.
+                    if (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                        return false;
+                    }
+                }
+                // ret == 0 (timeout) means no event -> process is still running
+                return true;
+            }
         }
-        let proc_path = format!("/proc/{}", self.pid);
-        Path::new(&proc_path).exists()
+        #[cfg(not(target_os = "linux"))]
+        {
+            let proc_path = format!("/proc/{}", self.pid);
+            Path::new(&proc_path).exists()
+        }
     }
 }
 
@@ -110,71 +140,84 @@ impl Drop for PidFd {
 }
 
 /// Verifies that the process currently running at `pid` matches the expected `ProcessKey` and `expected_exe`.
-/// Supports reading from direct /proc/<pid> or via /proc/self/fd/<pidfd> if a pidfd is provided.
 pub fn verify_process_identity(key: &ProcessKey, expected_exe: Option<&Path>) -> Result<(), TerminationError> {
     verify_process_identity_internal(key, expected_exe, None)
 }
 
-/// Internal identity verification with optional pidfd path resolution.
+/// Internal identity verification with strict fail-closed validation.
 pub fn verify_process_identity_internal(
     key: &ProcessKey,
     expected_exe: Option<&Path>,
     pidfd_fd: Option<libc::c_int>,
 ) -> Result<(), TerminationError> {
     let pid = key.pid;
-    let proc_path = if let Some(fd) = pidfd_fd {
-        format!("/proc/self/fd/{}", fd)
-    } else {
-        format!("/proc/{}", pid)
-    };
+    let proc_path = format!("/proc/{}", pid);
 
     if !Path::new(&proc_path).exists() {
         return Err(TerminationError::NotFound(pid));
     }
 
-    // 1. Verify start time from stat if key has start_time_ns (clock ticks)
-    if key.start_time_ns > 0 {
-        let stat_path = format!("{}/stat", proc_path);
-        let stat_fallback = format!("/proc/{}/stat", pid);
-        let content_opt = fs::read_to_string(&stat_path).or_else(|_| fs::read_to_string(&stat_fallback));
+    // Fail closed: If start_time_ns is 0 and no strong alternative identity (pidfd or expected_exe) is provided, reject!
+    if key.start_time_ns == 0 && expected_exe.is_none() && pidfd_fd.is_none() {
+        return Err(TerminationError::VerificationFailed(
+            pid,
+            "Process start time is 0/missing without strong alternative identity (fail-closed)".into(),
+        ));
+    }
 
-        if let Ok(content) = content_opt {
-            if let Some(rparen) = content.rfind(')') {
-                let rest = &content[rparen + 1..];
-                let fields: Vec<&str> = rest.split_whitespace().collect();
-                if let Some(starttime_str) = fields.get(19) {
-                    if let Ok(curr_start_time) = starttime_str.parse::<u64>() {
-                        if curr_start_time != key.start_time_ns {
-                            warn!(
-                                "PID reuse detected for PID {}! Expected start_time {}, found {}",
-                                pid, key.start_time_ns, curr_start_time
-                            );
-                            return Err(TerminationError::PidReuseDetected(pid));
-                        }
-                    }
-                }
-            }
+    // 1. Verify start time from /proc/<pid>/stat
+    let stat_path = format!("{}/stat", proc_path);
+    let content = fs::read_to_string(&stat_path).map_err(|e| {
+        match e.raw_os_error() {
+            Some(libc::ENOENT) => TerminationError::NotFound(pid),
+            Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
+            _ => TerminationError::VerificationFailed(pid, format!("Cannot read {}: {}", stat_path, e)),
+        }
+    })?;
+
+    let rparen = content.rfind(')').ok_or_else(|| {
+        TerminationError::VerificationFailed(pid, format!("Malformed stat file for PID {}", pid))
+    })?;
+    let rest = &content[rparen + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let starttime_str = fields.get(19).ok_or_else(|| {
+        TerminationError::VerificationFailed(pid, format!("Missing starttime field in stat for PID {}", pid))
+    })?;
+    let curr_start_time = starttime_str.parse::<u64>().map_err(|e| {
+        TerminationError::VerificationFailed(pid, format!("Failed to parse starttime in stat for PID {}: {}", pid, e))
+    })?;
+
+    if key.start_time_ns > 0 {
+        if curr_start_time != key.start_time_ns {
+            warn!(
+                "PID reuse detected for PID {}! Expected start_time {}, found {}",
+                pid, key.start_time_ns, curr_start_time
+            );
+            return Err(TerminationError::PidReuseDetected(pid));
         }
     }
 
     // 2. Verify exe symlink if provided
     if let Some(expected) = expected_exe {
         let exe_link = format!("{}/exe", proc_path);
-        let exe_fallback = format!("/proc/{}/exe", pid);
-        let actual_target_opt = fs::read_link(&exe_link).or_else(|_| fs::read_link(&exe_fallback));
-
-        if let Ok(actual_target) = actual_target_opt {
-            let actual_str = actual_target.to_string_lossy();
-            let exp_str = expected.to_string_lossy();
-            let actual_clean = actual_str.trim_end_matches(" (deleted)");
-            let exp_clean = exp_str.trim_end_matches(" (deleted)");
-            if actual_clean != exp_clean && !actual_clean.ends_with(exp_clean) {
-                warn!(
-                    "PID reuse binary mismatch for PID {}! Expected {:?}, found {:?}",
-                    pid, expected, actual_target
-                );
-                return Err(TerminationError::PidReuseDetected(pid));
+        let actual_target = fs::read_link(&exe_link).map_err(|e| {
+            match e.raw_os_error() {
+                Some(libc::ENOENT) => TerminationError::NotFound(pid),
+                Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
+                _ => TerminationError::VerificationFailed(pid, format!("Cannot read link {}: {}", exe_link, e)),
             }
+        })?;
+
+        let actual_str = actual_target.to_string_lossy();
+        let exp_str = expected.to_string_lossy();
+        let actual_clean = actual_str.trim_end_matches(" (deleted)");
+        let exp_clean = exp_str.trim_end_matches(" (deleted)");
+        if actual_clean != exp_clean && !actual_clean.ends_with(exp_clean) {
+            warn!(
+                "PID reuse binary mismatch for PID {}! Expected {:?}, found {:?}",
+                pid, expected, actual_target
+            );
+            return Err(TerminationError::PidReuseDetected(pid));
         }
     }
 
@@ -199,7 +242,7 @@ pub fn safe_terminate_process(
 
     // Attempt pidfd-based termination if available on Linux >= 5.3
     if let Ok(pidfd) = PidFd::open(pid) {
-        // 1. Pre-freeze identity verification using pidfd
+        // 1. Pre-freeze identity verification
         verify_process_identity_internal(key, expected_exe, Some(pidfd.fd))?;
 
         // 2. Freeze pinned process instance
@@ -214,12 +257,12 @@ pub fn safe_terminate_process(
 
         // 4. Send SIGTERM for graceful exit
         info!("Sending SIGTERM via pidfd to PID {}", pid);
-        let _ = pidfd.send_signal(Signal::SIGTERM);
+        pidfd.send_signal(Signal::SIGTERM)?;
         let _ = pidfd.send_signal(Signal::SIGCONT);
 
         // Check if exited within grace period
         let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(50);
+        let poll_interval = Duration::from_millis(10);
         while start.elapsed() < grace_period {
             if !pidfd.is_alive() {
                 info!("Process {} terminated gracefully with SIGTERM", pid);
@@ -235,8 +278,34 @@ pub fn safe_terminate_process(
         return Ok(true);
     }
 
-    // Fallback path for older kernels (< 5.3):
-    // CRITICAL FIX: Verify identity BEFORE sending ANY signal to avoid freezing innocent reused PID!
+    // Privilege separation fallback: if pidfd open failed (e.g. unprivileged daemon),
+    // delegate process signaling to the sentinel-privileged helper.
+    let priv_client = sentinel_privileged::client::PrivilegedClient::default();
+    if priv_client.is_available() {
+        info!("Privilege separation: delegating signal to sentinel-privileged helper for PID {}", pid);
+        verify_process_identity(key, expected_exe)?;
+        match priv_client.execute_sync(&sentinel_privileged::PrivilegedOp::SignalProcess {
+            pid,
+            signal: libc::SIGTERM,
+        }) {
+            Ok(sentinel_privileged::PrivilegedResult::Ok(_)) => {
+                info!("Privileged helper signaled process {}", pid);
+                return Ok(true);
+            }
+            Ok(sentinel_privileged::PrivilegedResult::Error { code, message }) => {
+                warn!("Privileged helper error signaling {pid} ({code}): {message}");
+            }
+            Err(e) => {
+                warn!("Failed to communicate with privileged helper for PID {pid}: {e}");
+            }
+        }
+    }
+
+    // Fallback path for older kernels (< 5.3) or direct unprivileged execution:
+    // WEAKER GUARANTEE NOTICE: Without pidfd, there exists a fundamental kernel TOCTOU window
+    // between /proc validation and signal delivery. This fallback is NOT fully race-free.
+    // To minimize the race window, we strictly verify identity, freeze immediately with SIGSTOP,
+    // re-validate identity while frozen, and fail-closed if any check fails.
     verify_process_identity(key, expected_exe)?;
 
     let nix_pid = Pid::from_raw(pid as i32);
@@ -257,11 +326,11 @@ pub fn safe_terminate_process(
 
     // 3. Send SIGTERM
     info!("Sending SIGTERM to process {}", pid);
-    let _ = kill(nix_pid, Signal::SIGTERM);
+    kill(nix_pid, Signal::SIGTERM).map_err(|e| TerminationError::SignalFailed(pid, e))?;
     let _ = kill(nix_pid, Signal::SIGCONT);
 
     let start = std::time::Instant::now();
-    let poll_interval = Duration::from_millis(50);
+    let poll_interval = Duration::from_millis(10);
     while start.elapsed() < grace_period {
         let proc_path = format!("/proc/{}", pid);
         if !Path::new(&proc_path).exists() {

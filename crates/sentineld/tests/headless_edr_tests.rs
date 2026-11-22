@@ -18,10 +18,15 @@ use sentineld::risk::{AttackStage, EvidenceAggregator, RiskAssessment};
 fn test_pid_reuse_protection_mechanisms() {
     // Current PID of our test process
     let current_pid = std::process::id();
+    let current_ticks = sentineld::lineage::read_proc_starttime(current_pid).unwrap_or(1);
 
-    // Key with correct current PID and 0 start time (passes existence check)
-    let valid_key = LineageKey::new(current_pid, 0);
+    // Key with correct current PID and real start time -> MUST succeed
+    let valid_key = LineageKey::new(current_pid, current_ticks);
     assert!(verify_process_identity(&valid_key, None).is_ok());
+
+    // Key with zero start time without alternative identity -> MUST fail closed
+    let zero_key = LineageKey::new(current_pid, 0);
+    assert!(verify_process_identity(&zero_key, None).is_err());
 
     // Key targeting a nonexistent high PID (should fail with NotFound)
     let invalid_key = LineageKey::new(999_999_999, 0);

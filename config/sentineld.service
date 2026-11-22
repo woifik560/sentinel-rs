@@ -1,7 +1,8 @@
 [Unit]
 Description=Sentinel-RS Headless Linux HIPS/EDR Daemon
 Documentation=https://github.com/woifik560/sentinel-rs
-After=network.target network-pre.target local-fs.target
+Wants=sentinel-privileged.service
+After=sentinel-privileged.service network.target network-pre.target local-fs.target
 Before=network-online.target
 
 [Service]

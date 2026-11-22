@@ -1,10 +1,19 @@
 //! Userspace loader and RingBuffer event listener for Sentinel eBPF probes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+#[cfg(target_os = "linux")]
+use aya::programs::Program;
+#[cfg(target_os = "linux")]
+use aya::programs::lsm::LsmLinkId;
+#[cfg(target_os = "linux")]
+use aya::{Btf, Ebpf};
+
 use sentinel_common::events::EbpfEvent;
+use sentinel_common::health::MechanismState;
 use crate::maps::TaintMapManager;
 
 /// Configuration for loading eBPF programs.
@@ -38,6 +47,14 @@ pub struct EbpfLoader {
     taint_manager: Arc<TaintMapManager>,
     event_tx: mpsc::Sender<EbpfEvent>,
     event_rx: Option<mpsc::Receiver<EbpfEvent>>,
+    bpf_lsm_state: MechanismState,
+    tracepoints_state: MechanismState,
+    ring_buffer_state: MechanismState,
+    fanotify_state: MechanismState,
+    #[cfg(target_os = "linux")]
+    bpf_instance: Option<Ebpf>,
+    #[cfg(target_os = "linux")]
+    attached_links: Vec<LsmLinkId>,
 }
 
 impl EbpfLoader {
@@ -61,7 +78,40 @@ impl EbpfLoader {
             taint_manager,
             event_tx: tx,
             event_rx: Some(rx),
+            bpf_lsm_state: MechanismState::Unavailable,
+            tracepoints_state: MechanismState::Unavailable,
+            ring_buffer_state: MechanismState::Unavailable,
+            fanotify_state: MechanismState::Unavailable,
+            #[cfg(target_os = "linux")]
+            bpf_instance: None,
+            #[cfg(target_os = "linux")]
+            attached_links: Vec::new(),
         }
+    }
+
+    pub fn bpf_lsm_state(&self) -> MechanismState {
+        self.bpf_lsm_state
+    }
+
+    pub fn tracepoints_state(&self) -> MechanismState {
+        self.tracepoints_state
+    }
+
+    pub fn ring_buffer_state(&self) -> MechanismState {
+        self.ring_buffer_state
+    }
+
+    pub fn fanotify_state(&self) -> MechanismState {
+        self.fanotify_state
+    }
+
+    pub fn mechanism_states(&self) -> HashMap<String, MechanismState> {
+        let mut map = HashMap::new();
+        map.insert("bpf_lsm".into(), self.bpf_lsm_state);
+        map.insert("tracepoints".into(), self.tracepoints_state);
+        map.insert("ring_buffer".into(), self.ring_buffer_state);
+        map.insert("fanotify".into(), self.fanotify_state);
+        map
     }
 
     /// Access the taint map manager.
@@ -82,6 +132,8 @@ impl EbpfLoader {
     /// Attempt to load and attach eBPF programs to the running Linux kernel.
     pub async fn load_and_attach(&mut self) -> anyhow::Result<()> {
         info!("Initializing Sentinel-RS eBPF kernel probes (LSM & tracepoints)...");
+        self.bpf_lsm_state = MechanismState::Loading;
+        self.ring_buffer_state = MechanismState::Loading;
 
         // 1. Check if BPF LSM is active in the running kernel
         let lsm_content = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
@@ -91,15 +143,9 @@ impl EbpfLoader {
         let os_release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
         let is_kernel_safe = verify_kernel_version_safe(&os_release, &self.config.min_kernel_version);
 
-        if self.config.strict_preflight {
-            if !lsm_supported {
-                anyhow::bail!(
-                    "PREFLIGHT FAILED: BPF LSM is not active in /sys/kernel/security/lsm (current: '{}'). \
-                     Add 'lsm=...,bpf' to kernel cmdline or GRUB_CMDLINE_LINUX to prevent kernel lockups.",
-                    lsm_content.trim()
-                );
-            }
-            if !is_kernel_safe {
+        if !is_kernel_safe {
+            self.bpf_lsm_state = MechanismState::Unsupported;
+            if self.config.strict_preflight {
                 anyhow::bail!(
                     "PREFLIGHT FAILED: Running kernel '{}' is older than required safe threshold '{}'. \
                      Refusing to load BPF INODE_STORAGE to prevent potential kernel panics (CVE-2026-64192 mitigation).",
@@ -109,21 +155,160 @@ impl EbpfLoader {
             }
         }
 
-        if lsm_supported {
-            info!("Kernel BPF LSM support verified in /sys/kernel/security/lsm");
+        if !lsm_supported {
+            if self.bpf_lsm_state != MechanismState::Unsupported {
+                self.bpf_lsm_state = MechanismState::Unavailable;
+            }
+            if self.config.strict_preflight {
+                anyhow::bail!(
+                    "PREFLIGHT FAILED: BPF LSM is not active in /sys/kernel/security/lsm (current: '{}'). \
+                     Add 'lsm=...,bpf' to kernel cmdline or GRUB_CMDLINE_LINUX to prevent kernel lockups.",
+                    lsm_content.trim()
+                );
+            }
+        }
+
+        // 3. Attempt Aya ELF loading and BPF LSM hook attachment if an eBPF ELF binary is present
+        let bpf_obj_paths = [
+            std::env::var("SENTINEL_BPF_OBJ").ok().map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from("/usr/lib/sentinel/bpf/sentinel.bpf.o")),
+            Some(std::path::PathBuf::from("/etc/sentinel/sentinel.bpf.o")),
+        ];
+
+        let mut loaded_and_attached = false;
+        #[cfg(target_os = "linux")]
+        {
+            for opt_path in &bpf_obj_paths {
+                if let Some(ref path) = opt_path {
+                    if path.exists() {
+                        info!("Attempting to load eBPF ELF object from {}", path.display());
+                        match aya::Ebpf::load_file(path) {
+                            Ok(mut bpf) => {
+                                info!("Successfully parsed eBPF ELF object from {}", path.display());
+
+                                // Load BTF from kernel
+                                let btf = match Btf::from_sys_fs() {
+                                    Ok(btf) => btf,
+                                    Err(e) => {
+                                        warn!("Kernel BTF not available (/sys/kernel/btf/vmlinux): {}. Cannot attach LSM programs.", e);
+                                        self.bpf_lsm_state = MechanismState::Unsupported;
+                                        break;
+                                    }
+                                };
+
+                                let mut current_links = Vec::new();
+                                let mut attach_failed = false;
+                                let mut attached_count = 0;
+
+                                for (name, program) in bpf.programs_mut() {
+                                    match program {
+                                        Program::Lsm(lsm) => {
+                                            info!("Found LSM program '{}' in ELF object", name);
+                                            // Load into verifier
+                                            if let Err(e) = lsm.load(name, &btf) {
+                                                warn!("BPF verifier rejected LSM program '{}': {}", name, e);
+                                                attach_failed = true;
+                                                break;
+                                            }
+                                            // Attach to LSM hook
+                                            match lsm.attach() {
+                                                Ok(link_id) => {
+                                                    info!("Successfully attached BPF LSM hook '{}'", name);
+                                                    current_links.push(link_id);
+                                                    attached_count += 1;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to attach BPF LSM hook '{}': {}", name, e);
+                                                    attach_failed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            info!("Found non-LSM program '{}' in ELF object", name);
+                                        }
+                                    }
+                                }
+
+                                if attach_failed {
+                                    warn!("Partial or complete LSM attachment failure! Rolling back previously attached hooks...");
+                                    current_links.clear(); // Dropping links detaches them
+                                    self.bpf_lsm_state = MechanismState::Failed;
+                                } else if attached_count > 0 {
+                                    info!("All {} LSM programs attached and validated.", attached_count);
+                                    self.attached_links = current_links;
+                                    self.bpf_instance = Some(bpf);
+                                    self.bpf_lsm_state = MechanismState::Active;
+                                    loaded_and_attached = true;
+                                    break;
+                                } else {
+                                    warn!("ELF object contained no attachable LSM programs.");
+                                    self.bpf_lsm_state = MechanismState::Unavailable;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to load eBPF ELF object from {}: {}", path.display(), e);
+                                self.bpf_lsm_state = MechanismState::Failed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !loaded_and_attached && self.bpf_lsm_state != MechanismState::Unsupported && self.bpf_lsm_state != MechanismState::Failed {
+            self.bpf_lsm_state = MechanismState::Unavailable;
+        }
+
+        if lsm_supported && loaded_and_attached {
+            info!("Kernel BPF LSM support verified and active with live attachments");
         } else {
-            warn!("BPF LSM not active in kernel or running in test/container environment. Event simulation & tracepoint mode ready.");
+            warn!(
+                "BPF LSM is in state '{}'. Operating in tracepoint & fanotify monitoring mode.",
+                self.bpf_lsm_state
+            );
         }
 
         #[cfg(target_os = "linux")]
         {
             if self.config.enable_tracepoints {
-                self.start_live_monitors();
+                let trace_dirs = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+                if trace_dirs.iter().any(|d| std::path::Path::new(d).exists()) {
+                    self.tracepoints_state = MechanismState::Active;
+                    self.start_live_monitors();
+                } else {
+                    self.tracepoints_state = MechanismState::Unavailable;
+                    warn!("Tracing directory not found (/sys/kernel/tracing). Tracepoint monitoring unavailable.");
+                }
+            } else {
+                self.tracepoints_state = MechanismState::Unavailable;
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.tracepoints_state = MechanismState::Unsupported;
+            self.fanotify_state = MechanismState::Unsupported;
+        }
 
-        info!("eBPF RingBuffer listener configured (size: {})", self.config.ring_buffer_size);
+        if self.tracepoints_state == MechanismState::Active || self.bpf_lsm_state == MechanismState::Active {
+            self.ring_buffer_state = MechanismState::Active;
+        } else {
+            self.ring_buffer_state = MechanismState::Unavailable;
+        }
+        info!("eBPF RingBuffer listener configured (size: {}, state: {:?})", self.config.ring_buffer_size, self.ring_buffer_state);
         Ok(())
+    }
+
+    /// Detaches all kernel hooks and safely frees eBPF resources.
+    pub fn unload(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.attached_links.clear();
+            self.bpf_instance.take();
+        }
+        self.bpf_lsm_state = MechanismState::Unavailable;
+        self.ring_buffer_state = MechanismState::Unavailable;
+        info!("EbpfLoader unloaded all BPF programs and detached hooks");
     }
 
     #[cfg(target_os = "linux")]
