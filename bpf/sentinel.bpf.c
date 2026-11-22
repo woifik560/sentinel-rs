@@ -72,7 +72,8 @@ static __always_inline __u32 next_flow_mark(bool reval) {
     __u32 *seq = bpf_map_lookup_elem(&flow_seq, &key);
     __u32 val = 1;
     if (seq) {
-        val = __sync_fetch_and_add(seq, 1);
+        __sync_fetch_and_add(seq, 1);
+        val = *seq;
     }
     val &= 0x007FFFFF; // 23-bit flow ID
     __u32 mark = 0x5E000000 | val;
