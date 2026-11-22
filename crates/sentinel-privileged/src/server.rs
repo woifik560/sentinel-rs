@@ -11,7 +11,27 @@ static WATCHDOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn lockout_state_path() -> PathBuf {
     let p = Path::new("/run/sentinel");
-    if p.exists() || std::fs::create_dir_all(p).is_ok() {
+    let usable = if p.exists() {
+        let probe = p.join(".probe_write");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            true
+        } else {
+            false
+        }
+    } else if std::fs::create_dir_all(p).is_ok() {
+        let probe = p.join(".probe_write");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if usable {
         p.join("isolation_lockout.state")
     } else {
         std::env::temp_dir().join("sentinel_isolation_lockout.state")
