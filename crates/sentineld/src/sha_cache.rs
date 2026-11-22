@@ -93,7 +93,9 @@ impl ShaCache {
         #[cfg(not(unix))]
         {
             if let Ok(meta) = std::fs::metadata(path) {
-                let mtime_ns = meta.modified().ok()
+                let mtime_ns = meta
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
@@ -118,7 +120,11 @@ pub fn compute_sha256(path: &Path) -> Option<String> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            warn!("Failed to open file for SHA-256 hash: {}: {}", path.display(), e);
+            warn!(
+                "Failed to open file for SHA-256 hash: {}: {}",
+                path.display(),
+                e
+            );
             return None;
         }
     };

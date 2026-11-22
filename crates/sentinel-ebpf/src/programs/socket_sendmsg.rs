@@ -21,9 +21,9 @@
 //!    - For tainted tasks with packets already in-flight or on pre-opened sockets,
 //!      `cgroup_skb/egress` drops the packet (`return 0`) until user verdict is granted.
 
-use sentinel_common::events::{encode_flow_mark, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK};
-use crate::maps::TaintMapManager;
 use super::socket_connect::{evaluate_socket_connect_with_mark, SocketConnectVerdict};
+use crate::maps::TaintMapManager;
+use sentinel_common::events::{encode_flow_mark, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK};
 
 /// Action to be taken by network hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +126,7 @@ pub fn evaluate_socket_sendmsg_raw(
             };
         }
 
-        return SocketConnectVerdict::SlowPathHoldNfqueue {
-            so_mark: flow_mark,
-        };
+        return SocketConnectVerdict::SlowPathHoldNfqueue { so_mark: flow_mark };
     }
 
     evaluate_socket_connect_with_mark(

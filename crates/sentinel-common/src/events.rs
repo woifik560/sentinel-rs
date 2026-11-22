@@ -21,7 +21,7 @@ pub const SENTINEL_MARK_REVAL_BIT: u32 = 0x00800000;
 /// Mask for matching Sentinel prefix + reval flag in Netfilter: 0xFF800000.
 pub const SENTINEL_MARK_NETFILTER_MASK: u32 = 0xFF800000;
 pub const SENTINEL_MARK_REVAL_MATCH: u32 = 0x5E800000; // prefix | reval_bit (0x5E000000 | 0x00800000)
-pub const SENTINEL_MARK_NEW_MATCH: u32 = 0x5E000000;   // prefix only
+pub const SENTINEL_MARK_NEW_MATCH: u32 = 0x5E000000; // prefix only
 
 /// 23-bit mask for dynamic flow sequence IDs (bits 22..0: 0..8,388,607).
 pub const SENTINEL_MARK_FLOW_ID_MASK: u32 = 0x007FFFFF;
@@ -147,10 +147,7 @@ pub enum EbpfEvent {
     },
 
     /// Tracepoint `sched/sched_process_fork` — a new process was forked.
-    ProcessFork {
-        parent_tgid: u32,
-        child_tgid: u32,
-    },
+    ProcessFork { parent_tgid: u32, child_tgid: u32 },
 
     /// Tracepoint `sched/sched_process_exec` — a process executed a new binary.
     ProcessExec {

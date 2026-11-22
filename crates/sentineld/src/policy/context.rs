@@ -1,10 +1,10 @@
 //! Evaluation context for security policy decisions.
 
-use std::path::PathBuf;
-use sentinel_common::process::SecretCategory;
+use crate::behavior::DetectionMatch;
 use crate::lineage::ProcessKey;
 use crate::risk::RiskAssessment;
-use crate::behavior::DetectionMatch;
+use sentinel_common::process::SecretCategory;
+use std::path::PathBuf;
 
 /// Contextual data provided to the policy engine for verdict determination.
 #[derive(Debug, Clone)]

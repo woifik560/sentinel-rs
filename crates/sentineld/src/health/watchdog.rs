@@ -1,10 +1,10 @@
 //! Hybrid watchdog integrating systemd watchdog and kernel heartbeat.
 
+use sentinel_common::health::AgentState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use sentinel_common::health::AgentState;
 
 use super::metrics::SubsystemMetrics;
 use super::monitor::HealthMonitor;

@@ -5,11 +5,11 @@
 //! If the binary is modified, replaced, or tampered on disk, its SHA-256 changes,
 //! automatically invalidating the decision cache and forcing re-verification.
 
+use sentinel_common::ipc::PromptAction;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use sentinel_common::ipc::PromptAction;
 
 type VerdictKey = (PathBuf, String, bool, String);
 

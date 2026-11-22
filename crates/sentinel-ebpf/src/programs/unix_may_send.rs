@@ -7,15 +7,15 @@
 //! 2. If the sender is `TAINTED`:
 //!    - Verifies if destination socket is an exempt system infrastructure socket
 //!      (Wayland compositor `/run/user/<uid>/wayland-0`, X11 `/tmp/.X11-unix/X0`,
-//!       D-Bus session bus `/run/user/<uid>/bus`, or Sentinel `/run/sentinel/sentinel.sock`).
+//!      D-Bus session bus `/run/user/<uid>/bus`, or Sentinel `/run/sentinel/sentinel.sock`).
 //!    - If not exempt:
 //!      - Propagates taint to the receiving process's `TASK_STORAGE` (group leader)
 //!        or blocks the transfer with `-EPERM`, completely neutralizing AF_UNIX taint laundering!
 //! 3. Emits `RawUnixMaySendEvent` to the RingBuffer.
 
-use std::path::Path;
-use sentinel_common::events::{RawUnixMaySendEvent, MAX_PATH_LEN};
 use crate::maps::{TaintMapManager, UnixSendVerdict};
+use sentinel_common::events::{RawUnixMaySendEvent, MAX_PATH_LEN};
+use std::path::Path;
 
 /// Evaluates a `unix_may_send` hook invocation in userspace or simulation.
 pub fn evaluate_unix_may_send(

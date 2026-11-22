@@ -23,42 +23,51 @@ impl VerdictRouter {
         let verdict = self.route(score);
         match mode {
             OperatingMode::Audit => {
-                info!("Autonomous policy AUDIT mode: score {} recorded for audit", score.total);
+                info!(
+                    "Autonomous policy AUDIT mode: score {} recorded for audit",
+                    score.total
+                );
                 PolicyAction::Audit
             }
-            OperatingMode::Balanced => {
-                match verdict {
-                    Verdict::Low => PolicyAction::Allow,
-                    Verdict::Grey => {
-                        warn!("Autonomous policy BALANCED mode: score {} monitored without prompt", score.total);
-                        PolicyAction::Monitor
-                    }
-                    Verdict::High => {
-                        error!("Autonomous policy BALANCED mode: score {} denied network", score.total);
-                        PolicyAction::DenyNetwork
-                    }
+            OperatingMode::Balanced => match verdict {
+                Verdict::Low => PolicyAction::Allow,
+                Verdict::Grey => {
+                    warn!(
+                        "Autonomous policy BALANCED mode: score {} monitored without prompt",
+                        score.total
+                    );
+                    PolicyAction::Monitor
                 }
-            }
-            OperatingMode::Strict => {
-                match verdict {
-                    Verdict::Low => PolicyAction::Allow,
-                    Verdict::Grey => {
-                        warn!("Autonomous policy STRICT mode: score {} denied network", score.total);
-                        PolicyAction::DenyNetwork
-                    }
-                    Verdict::High => {
-                        error!("Autonomous policy STRICT mode: high risk {} denied network", score.total);
-                        PolicyAction::DenyNetwork
-                    }
+                Verdict::High => {
+                    error!(
+                        "Autonomous policy BALANCED mode: score {} denied network",
+                        score.total
+                    );
+                    PolicyAction::DenyNetwork
                 }
-            }
-            OperatingMode::Custom => {
-                match verdict {
-                    Verdict::Low => PolicyAction::Allow,
-                    Verdict::Grey => PolicyAction::Monitor,
-                    Verdict::High => PolicyAction::DenyNetwork,
+            },
+            OperatingMode::Strict => match verdict {
+                Verdict::Low => PolicyAction::Allow,
+                Verdict::Grey => {
+                    warn!(
+                        "Autonomous policy STRICT mode: score {} denied network",
+                        score.total
+                    );
+                    PolicyAction::DenyNetwork
                 }
-            }
+                Verdict::High => {
+                    error!(
+                        "Autonomous policy STRICT mode: high risk {} denied network",
+                        score.total
+                    );
+                    PolicyAction::DenyNetwork
+                }
+            },
+            OperatingMode::Custom => match verdict {
+                Verdict::Low => PolicyAction::Allow,
+                Verdict::Grey => PolicyAction::Monitor,
+                Verdict::High => PolicyAction::DenyNetwork,
+            },
         }
     }
 

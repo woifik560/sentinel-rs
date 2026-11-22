@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
-#![allow(warnings)]
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -65,7 +64,11 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let log_level = if cli.verbose { Level::DEBUG } else { Level::INFO };
+    let log_level = if cli.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
     let subscriber = FmtSubscriber::builder()
         .with_max_level(log_level)
         .with_target(false)
@@ -81,10 +84,18 @@ async fn main() -> anyhow::Result<()> {
     let rules_path = resolve_config_path(&cli.rules, "config/rules.toml");
 
     let mut config = if config_path.exists() {
-        SentinelConfig::load_from_file(&config_path)
-            .map_err(|e| anyhow::anyhow!("Configuration parsing error in {}: {}", config_path.display(), e))?
+        SentinelConfig::load_from_file(&config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Configuration parsing error in {}: {}",
+                config_path.display(),
+                e
+            )
+        })?
     } else {
-        info!("Configuration not found at {}. Using defaults.", config_path.display());
+        info!(
+            "Configuration not found at {}. Using defaults.",
+            config_path.display()
+        );
         SentinelConfig::default()
     };
 
@@ -93,10 +104,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let rules = if rules_path.exists() {
-        RulesConfig::load_from_file(&rules_path)
-            .map_err(|e| anyhow::anyhow!("Rules configuration parsing error in {}: {}", rules_path.display(), e))?
+        RulesConfig::load_from_file(&rules_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Rules configuration parsing error in {}: {}",
+                rules_path.display(),
+                e
+            )
+        })?
     } else {
-        info!("Rules configuration not found at {}. Using defaults.", rules_path.display());
+        info!(
+            "Rules configuration not found at {}. Using defaults.",
+            rules_path.display()
+        );
         RulesConfig::default()
     };
 
@@ -113,19 +132,29 @@ async fn main() -> anyhow::Result<()> {
     let dpkg_checker = DpkgChecker::new();
     let _sha_cache = ShaCache::new(2048);
     let lineage_tracker = LineageTracker::new(config.general.ring_buffer_size);
-    let risk_engine = Arc::new(tokio::sync::RwLock::new(RiskEngine::new(rules.clone(), dpkg_checker)));
+    let risk_engine = Arc::new(tokio::sync::RwLock::new(RiskEngine::new(
+        rules.clone(),
+        dpkg_checker,
+    )));
     let verdict_router = Arc::new(VerdictRouter::new(rules));
     let tofu_mgr = Arc::new(TofuManager::new(&config.tofu.db_path));
-    let context_policy = Arc::new(ContextPolicyEngine::new(config.context_rules.clone()).with_default_rules());
+    let context_policy =
+        Arc::new(ContextPolicyEngine::new(config.context_rules.clone()).with_default_rules());
     let _verdict_cache = Arc::new(VerdictDecisionCache::new());
 
     // Initialize Persistent SQLite Storage (Audit 3.3)
-    let storage_db_path = config.tofu.db_path.parent()
+    let storage_db_path = config
+        .tofu
+        .db_path
+        .parent()
         .map(|p| p.join("sentinel.db"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/sentinel/sentinel.db"));
     let storage_manager = match StorageManager::new(storage_db_path.clone(), 1024) {
         Ok(mgr) => {
-            info!("Persistent SQLite database initialized at {}", storage_db_path.display());
+            info!(
+                "Persistent SQLite database initialized at {}",
+                storage_db_path.display()
+            );
             Some(mgr)
         }
         Err(e) => {
@@ -144,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
     let holding_res = freeze_orchestrator.init_network_holding();
     let network_holding_active = holding_res.is_ok();
     if let Err(ref e) = holding_res {
-        warn!("Failed to initialize nftables holding: {}. Running in degraded network holding mode.", e);
+        warn!(
+            "Failed to initialize nftables holding: {}. Running in degraded network holding mode.",
+            e
+        );
     }
 
     // Shared Protection State (Audit 1.3)
@@ -163,12 +195,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Network Protection Manager for nftables isolation & anti-lockout
     let block_mgr = Arc::new(sentineld::response::NetworkBlockManager::new());
-    let network_manager = Arc::new(
-        sentineld::network::NetworkProtectionManager::new(
-            block_mgr,
-            config.general.aggregate_window_ms,
-        ),
-    );
+    let network_manager = Arc::new(sentineld::network::NetworkProtectionManager::new(
+        block_mgr,
+        config.general.aggregate_window_ms,
+    ));
 
     // Graceful Shutdown Signal Handler: Restore nftables rules on SIGINT/SIGTERM (Audit 3.1)
     tokio::spawn(run_shutdown_listener());
@@ -182,12 +212,15 @@ async fn main() -> anyhow::Result<()> {
         min_kernel_version: config.general.min_kernel_version.clone(),
     });
     ebpf_loader.load_and_attach().await?;
-    let raw_event_rx = ebpf_loader.take_event_receiver().expect("Receiver must be present");
+    let raw_event_rx = ebpf_loader
+        .take_event_receiver()
+        .expect("Receiver must be present");
     let taint_mgr = ebpf_loader.taint_manager();
 
     {
         let mut st = protection_state.write().await;
-        st.bpf_lsm_active = (ebpf_loader.bpf_lsm_state() == sentinel_common::health::MechanismState::Active);
+        st.bpf_lsm_active =
+            ebpf_loader.bpf_lsm_state() == sentinel_common::health::MechanismState::Active;
     }
 
     // Bounded RingBuffer Consumer with DoS rate-limiting
@@ -247,7 +280,10 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             let expired = freeze_reaper.check_timeouts();
             if !expired.is_empty() {
-                warn!("Fail-Closed reaper dropped held packets for expired TGIDs: {:?}", expired);
+                warn!(
+                    "Fail-Closed reaper dropped held packets for expired TGIDs: {:?}",
+                    expired
+                );
             }
         }
     });
@@ -262,7 +298,11 @@ async fn main() -> anyhow::Result<()> {
             let count_lineage = pruner_lineage.prune_dead();
             let count_taint = pruner_taint.prune_dead();
             if count_lineage > 0 || count_taint > 0 {
-                tracing::debug!("Memory pruner cleaned {} lineage nodes, {} taint records", count_lineage, count_taint);
+                tracing::debug!(
+                    "Memory pruner cleaned {} lineage nodes, {} taint records",
+                    count_lineage,
+                    count_taint
+                );
             }
         }
     });
@@ -273,13 +313,14 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(usec) = usec_str.parse::<u64>() {
             let interval = Duration::from_micros(usec / 2);
             let degraded_mgr = std::sync::Arc::new(sentineld::health::DegradedStateManager::new());
-            let failure_policy = std::sync::Arc::new(sentineld::health::FailurePolicyManager::new());
-            let health_monitor = std::sync::Arc::new(sentineld::health::HealthMonitor::with_failure_policy(
-                degraded_mgr,
-                failure_policy,
-            ));
+            let failure_policy =
+                std::sync::Arc::new(sentineld::health::FailurePolicyManager::new());
+            let health_monitor = std::sync::Arc::new(
+                sentineld::health::HealthMonitor::with_failure_policy(degraded_mgr, failure_policy),
+            );
             let sub_metrics = std::sync::Arc::new(sentineld::health::SubsystemMetrics::default());
-            let wd = sentineld::health::Watchdog::with_monitor(interval, health_monitor, sub_metrics);
+            let wd =
+                sentineld::health::Watchdog::with_monitor(interval, health_monitor, sub_metrics);
             wd.start();
         }
     }
@@ -289,7 +330,14 @@ async fn main() -> anyhow::Result<()> {
     // 7. Main RingBuffer Event Dispatch Loop
     while let Some(event) = event_rx.recv().await {
         match event {
-            EbpfEvent::FileOpen { tgid, uid: _, ref path, dev: _, ino: _, flags: _ } => {
+            EbpfEvent::FileOpen {
+                tgid,
+                uid: _,
+                ref path,
+                dev: _,
+                ino: _,
+                flags: _,
+            } => {
                 let path_str = path.to_string_lossy();
                 let current_exe = lineage_tracker
                     .get(tgid)
@@ -310,13 +358,25 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::FilePermission { tgid, uid: _, ref path, dev, ino, mask, is_pipe, is_fifo } => {
-                if let Some(_taint) = taint_mgr.handle_file_permission(tgid, dev, ino, path, mask, is_pipe, is_fifo) {
+            EbpfEvent::FilePermission {
+                tgid,
+                uid: _,
+                ref path,
+                dev,
+                ino,
+                mask,
+                is_pipe,
+                is_fifo,
+            } => {
+                if let Some(_taint) =
+                    taint_mgr.handle_file_permission(tgid, dev, ino, path, mask, is_pipe, is_fifo)
+                {
                     let is_read = (mask & MAY_READ) != 0;
                     if is_read {
                         warn!(
                             "Data-flow taint propagation: TGID {} inherited taint via pipe/file {}",
-                            tgid, path.display()
+                            tgid,
+                            path.display()
                         );
                         let now_ns = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -332,7 +392,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::UnixMaySend { sender_tgid, receiver_tgid, ref sock_path, is_blocked: _ } => {
+            EbpfEvent::UnixMaySend {
+                sender_tgid,
+                receiver_tgid,
+                ref sock_path,
+                is_blocked: _,
+            } => {
                 let verdict = taint_mgr.handle_unix_may_send(sender_tgid, receiver_tgid, sock_path);
                 if verdict == sentinel_ebpf::UnixSendVerdict::TaintReceiver {
                     warn!(
@@ -352,7 +417,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::PtraceAccessCheck { tracer_tgid, tracee_tgid, mode, is_blocked: _ } => {
+            EbpfEvent::PtraceAccessCheck {
+                tracer_tgid,
+                tracee_tgid,
+                mode,
+                is_blocked: _,
+            } => {
                 let verdict = taint_mgr.handle_ptrace_access_check(tracer_tgid, tracee_tgid, mode);
                 if verdict == sentinel_ebpf::PtraceVerdict::Deny {
                     warn!(
@@ -362,7 +432,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::ProcEnvironAccess { reader_tgid, target_tgid, ref path, is_blocked: _ } => {
+            EbpfEvent::ProcEnvironAccess {
+                reader_tgid,
+                target_tgid,
+                ref path,
+                is_blocked: _,
+            } => {
                 warn!(
                     "Cross-Process Credential Snoop: TGID {} attempted to read environ/mem of TGID {} ({})",
                     reader_tgid, target_tgid, path.display()
@@ -370,11 +445,26 @@ async fn main() -> anyhow::Result<()> {
                 taint_mgr.mark_tainted(reader_tgid);
             }
 
-            EbpfEvent::MmapFile { tgid, uid: _, ref path, dev, ino, prot, flags, is_secret: _, is_write_shared: _, is_exec: _ } => {
+            EbpfEvent::MmapFile {
+                tgid,
+                uid: _,
+                ref path,
+                dev,
+                ino,
+                prot,
+                flags,
+                is_secret: _,
+                is_write_shared: _,
+                is_exec: _,
+            } => {
                 let verdict = taint_mgr.handle_mmap_file(tgid, dev, ino, path, prot, flags);
                 match verdict {
                     sentinel_ebpf::MmapVerdict::TaintTask => {
-                        warn!("mmap Secret Access: TGID {} mapped secret {}", tgid, path.display());
+                        warn!(
+                            "mmap Secret Access: TGID {} mapped secret {}",
+                            tgid,
+                            path.display()
+                        );
                         let now_ns = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
@@ -398,7 +488,11 @@ async fn main() -> anyhow::Result<()> {
                             lineage_tracker.insert(node.clone());
                             if node.has_secret_access() {
                                 warn!("Immediate enforcement: terminating tainted TGID {} attempting unauthorized executable mmap", tgid);
-                                let _ = freeze_orchestrator.terminate_process(tgid, &node.exe_name(), node.uid);
+                                let _ = freeze_orchestrator.terminate_process(
+                                    tgid,
+                                    &node.exe_name(),
+                                    node.uid,
+                                );
                             }
                         }
                     }
@@ -406,8 +500,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::FileReceive { receiver_tgid, sender_tgid, ref path, dev, ino, is_tainted: _ } => {
-                let verdict = taint_mgr.handle_file_receive(receiver_tgid, sender_tgid, dev, ino, path);
+            EbpfEvent::FileReceive {
+                receiver_tgid,
+                sender_tgid,
+                ref path,
+                dev,
+                ino,
+                is_tainted: _,
+            } => {
+                let verdict =
+                    taint_mgr.handle_file_receive(receiver_tgid, sender_tgid, dev, ino, path);
                 if verdict == sentinel_ebpf::FileReceiveVerdict::TaintReceiver {
                     warn!(
                         "SCM_RIGHTS Taint Propagation: TGID {} inherited descriptor to {} from TGID {}",
@@ -426,7 +528,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            EbpfEvent::BprmCheckSecurity { tgid, uid: _, exe_path: _, dev: _, ino: _, is_memfd } => {
+            EbpfEvent::BprmCheckSecurity {
+                tgid,
+                uid: _,
+                exe_path: _,
+                dev: _,
+                ino: _,
+                is_memfd,
+            } => {
                 if is_memfd {
                     warn!("LSM bprm_check_security: anonymous memfd_create execution detected for TGID {}", tgid);
                     if let Some(mut node) = lineage_tracker.get(tgid) {
@@ -434,24 +543,53 @@ async fn main() -> anyhow::Result<()> {
                         lineage_tracker.insert(node.clone());
                         if node.has_secret_access() {
                             warn!("Immediate enforcement: terminating tainted TGID {} attempting memfd_create execution", tgid);
-                            let _ = freeze_orchestrator.terminate_process(tgid, &node.exe_name(), node.uid);
+                            let _ = freeze_orchestrator.terminate_process(
+                                tgid,
+                                &node.exe_name(),
+                                node.uid,
+                            );
                         }
                     }
                 }
             }
 
-            EbpfEvent::ProcessFork { parent_tgid, child_tgid } => {
+            EbpfEvent::ProcessFork {
+                parent_tgid,
+                child_tgid,
+            } => {
                 taint_mgr.register_thread(child_tgid, parent_tgid);
                 taint_mgr.inherit_fork(parent_tgid, child_tgid);
                 lineage_tracker.handle_fork(parent_tgid, child_tgid);
             }
 
-            EbpfEvent::ProcessExec { tgid, exe_path, cmdline } => {
+            EbpfEvent::ProcessExec {
+                tgid,
+                exe_path,
+                cmdline,
+            } => {
                 lineage_tracker.handle_exec(tgid, exe_path, cmdline);
             }
 
-            EbpfEvent::SocketConnect { tgid, group_leader_tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, protocol: _, so_mark }
-            | EbpfEvent::SocketSendmsg { tgid, group_leader_tgid, addr_family: _, dst_ipv4, dst_ipv6, dst_port, so_mark, is_preopened: _ } => {
+            EbpfEvent::SocketConnect {
+                tgid,
+                group_leader_tgid,
+                addr_family: _,
+                dst_ipv4,
+                dst_ipv6,
+                dst_port,
+                protocol: _,
+                so_mark,
+            }
+            | EbpfEvent::SocketSendmsg {
+                tgid,
+                group_leader_tgid,
+                addr_family: _,
+                dst_ipv4,
+                dst_ipv6,
+                dst_port,
+                so_mark,
+                is_preopened: _,
+            } => {
                 // Synchronous FlowContext lookup from flow_mark_ctx eBPF map:
                 let _flow_ctx = taint_mgr.lookup_flow_context(so_mark);
                 let is_reval = (so_mark & sentinel_common::events::SENTINEL_MARK_REVAL_BIT) != 0;
@@ -475,28 +613,36 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .as_nanos() as u64;
 
-                let mut node = lineage_tracker.get(effective_tgid).or_else(|| {
-                    if let Some(discovered) = LineageTracker::discover_from_procfs(effective_tgid) {
-                        let mut disc = discovered;
-                        if let Some(parent) = lineage_tracker.get(disc.ppid) {
-                            disc.ancestor_script = parent.script_path.clone().or_else(|| parent.ancestor_script.clone());
-                            if parent.has_secret_access() {
-                                disc.secret_accesses = parent.secret_accesses.clone();
+                let mut node = lineage_tracker
+                    .get(effective_tgid)
+                    .or_else(|| {
+                        if let Some(discovered) =
+                            LineageTracker::discover_from_procfs(effective_tgid)
+                        {
+                            let mut disc = discovered;
+                            if let Some(parent) = lineage_tracker.get(disc.ppid) {
+                                disc.ancestor_script = parent
+                                    .script_path
+                                    .clone()
+                                    .or_else(|| parent.ancestor_script.clone());
+                                if parent.has_secret_access() {
+                                    disc.secret_accesses = parent.secret_accesses.clone();
+                                }
                             }
+                            lineage_tracker.insert(disc.clone());
+                            Some(disc)
+                        } else {
+                            None
                         }
-                        lineage_tracker.insert(disc.clone());
-                        Some(disc)
-                    } else {
-                        None
-                    }
-                }).unwrap_or_else(|| {
-                    sentinel_common::process::ProcessNode::new(
-                        effective_tgid,
-                        1,
-                        1000,
-                        PathBuf::from("/proc/unknown"),
-                    )
-                });
+                    })
+                    .unwrap_or_else(|| {
+                        sentinel_common::process::ProcessNode::new(
+                            effective_tgid,
+                            1,
+                            1000,
+                            PathBuf::from("/proc/unknown"),
+                        )
+                    });
 
                 // If cmdline has 1 or fewer elements or script_path is none, re-check /proc/<effective_tgid>/cmdline
                 if node.cmdline.len() <= 1 || node.script_path.is_none() {
@@ -507,14 +653,20 @@ async fn main() -> anyhow::Result<()> {
                             .map(|s| String::from_utf8_lossy(s).to_string())
                             .collect();
                         if !cmd.is_empty() {
-                            let script_info = sentineld::lineage::tracker::inspect_interpreter(&node.exe_path, &cmd);
+                            let script_info = sentineld::lineage::tracker::inspect_interpreter(
+                                &node.exe_path,
+                                &cmd,
+                            );
                             if let Some(info) = script_info {
                                 if let Some(sp) = info.script_path {
                                     node.script_path = Some(sp);
                                     node.is_interactive_shell = false;
                                 }
                             }
-                            if cmd.iter().any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c") {
+                            if cmd
+                                .iter()
+                                .any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c")
+                            {
                                 node.is_interactive_shell = false;
                             }
                             node.cmdline = cmd;
@@ -525,49 +677,69 @@ async fn main() -> anyhow::Result<()> {
                 // Dual-defense: If this process itself has no recorded secrets, but its ancestors in the lineage
                 // tree or group leader accessed secrets (e.g. bash or scp spawned ssh), inherit ancestor secrets and script!
                 let mut effective_node = node.clone();
-                let effective_group_leader = if group_leader_tgid != 0 && group_leader_tgid != effective_tgid {
-                    group_leader_tgid
-                } else {
-                    effective_node.group_leader_tgid
-                };
+                let effective_group_leader =
+                    if group_leader_tgid != 0 && group_leader_tgid != effective_tgid {
+                        group_leader_tgid
+                    } else {
+                        effective_node.group_leader_tgid
+                    };
 
                 // 1. Check group leader first!
                 if effective_group_leader != 0 && effective_group_leader != effective_tgid {
                     if let Some(leader) = lineage_tracker.get(effective_group_leader) {
                         if effective_node.ancestor_script.is_none() {
-                            effective_node.ancestor_script = leader.script_path.clone().or_else(|| leader.ancestor_script.clone());
+                            effective_node.ancestor_script = leader
+                                .script_path
+                                .clone()
+                                .or_else(|| leader.ancestor_script.clone());
                         }
                         if effective_node.secret_accesses.is_empty() && leader.has_secret_access() {
-                            effective_node.secret_accesses.extend(leader.secret_accesses.clone());
+                            effective_node
+                                .secret_accesses
+                                .extend(leader.secret_accesses.clone());
                         }
                     }
                 }
 
                 // 2. Upward ancestor traversal
-                if effective_node.secret_accesses.is_empty() || effective_node.ancestor_script.is_none() {
+                if effective_node.secret_accesses.is_empty()
+                    || effective_node.ancestor_script.is_none()
+                {
                     let mut curr_ppid = effective_node.ppid;
                     let mut visited = std::collections::HashSet::new();
                     visited.insert(effective_tgid);
                     while curr_ppid > 1 && visited.insert(curr_ppid) {
-                        let ancestor_opt = lineage_tracker.get(curr_ppid)
+                        let ancestor_opt = lineage_tracker
+                            .get(curr_ppid)
                             .or_else(|| LineageTracker::discover_from_procfs(curr_ppid));
 
                         if let Some(mut ancestor) = ancestor_opt {
                             if ancestor.cmdline.len() <= 1 || ancestor.script_path.is_none() {
-                                if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", curr_ppid)) {
+                                if let Ok(bytes) =
+                                    std::fs::read(format!("/proc/{}/cmdline", curr_ppid))
+                                {
                                     let cmd: Vec<String> = bytes
                                         .split(|&b| b == 0)
                                         .filter(|s| !s.is_empty())
                                         .map(|s| String::from_utf8_lossy(s).to_string())
                                         .collect();
                                     if !cmd.is_empty() {
-                                        if let Some(info) = sentineld::lineage::tracker::inspect_interpreter(&ancestor.exe_path, &cmd) {
+                                        if let Some(info) =
+                                            sentineld::lineage::tracker::inspect_interpreter(
+                                                &ancestor.exe_path,
+                                                &cmd,
+                                            )
+                                        {
                                             if let Some(sp) = info.script_path {
                                                 ancestor.script_path = Some(sp);
                                                 ancestor.is_interactive_shell = false;
                                             }
                                         }
-                                        if cmd.iter().any(|a| a.ends_with(".sh") || a.starts_with("/tmp/") || a == "-c") {
+                                        if cmd.iter().any(|a| {
+                                            a.ends_with(".sh")
+                                                || a.starts_with("/tmp/")
+                                                || a == "-c"
+                                        }) {
                                             ancestor.is_interactive_shell = false;
                                         }
                                         ancestor.cmdline = cmd;
@@ -576,13 +748,19 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             if effective_node.ancestor_script.is_none() {
-                                effective_node.ancestor_script = ancestor.script_path.clone().or_else(|| ancestor.ancestor_script.clone());
+                                effective_node.ancestor_script = ancestor
+                                    .script_path
+                                    .clone()
+                                    .or_else(|| ancestor.ancestor_script.clone());
                             }
                             if !ancestor.secret_accesses.is_empty() {
-                                effective_node.secret_accesses.extend(ancestor.secret_accesses.clone());
+                                effective_node
+                                    .secret_accesses
+                                    .extend(ancestor.secret_accesses.clone());
                                 break;
                             }
-                            if ancestor.is_interactive_shell && ancestor.secret_accesses.is_empty() {
+                            if ancestor.is_interactive_shell && ancestor.secret_accesses.is_empty()
+                            {
                                 break;
                             }
                             curr_ppid = ancestor.ppid;
@@ -594,15 +772,22 @@ async fn main() -> anyhow::Result<()> {
 
                 // 3. Dual-domain / cross-namespace fallback: If still no secrets recorded, check for recent taint
                 if effective_node.secret_accesses.is_empty() {
-                    if let Some(tainted) = lineage_tracker.find_recent_tainted(now_ns, 30_000_000_000) {
+                    if let Some(tainted) =
+                        lineage_tracker.find_recent_tainted(now_ns, 30_000_000_000)
+                    {
                         warn!(
                             "Cross-namespace taint correlation: associating network connect from TGID {} with recent tainted process TGID {} ({})",
                             effective_tgid, tainted.tgid, tainted.display_name()
                         );
                         if effective_node.ancestor_script.is_none() {
-                            effective_node.ancestor_script = tainted.script_path.clone().or_else(|| tainted.ancestor_script.clone());
+                            effective_node.ancestor_script = tainted
+                                .script_path
+                                .clone()
+                                .or_else(|| tainted.ancestor_script.clone());
                         }
-                        effective_node.secret_accesses.extend(tainted.secret_accesses.clone());
+                        effective_node
+                            .secret_accesses
+                            .extend(tainted.secret_accesses.clone());
                         if effective_node.group_leader_tgid <= 1 {
                             effective_node.group_leader_tgid = tainted.group_leader_tgid;
                         }
@@ -625,7 +810,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                     ipc_server.broadcast_event(IpcMessage::Event {
                         timestamp: chrono::Utc::now().to_rfc3339(),
-                        summary: format!("Pre-approved contextual flow ({}) for {}", rule.id, effective_node.display_name()),
+                        summary: format!(
+                            "Pre-approved contextual flow ({}) for {}",
+                            rule.id,
+                            effective_node.display_name()
+                        ),
                         risk_score: Some(0),
                     });
                     continue;
@@ -636,15 +825,16 @@ async fn main() -> anyhow::Result<()> {
                 let mut is_tofu_tampered = false;
                 if is_tofu_target {
                     if let Some(ref sha) = effective_node.exe_sha256 {
-                        match tofu_mgr.check_or_register(&effective_node.exe_path, sha) {
-                            TofuCheckResult::Tampered { expected, actual } => {
-                                warn!(
-                                    "TOFU TAMPER ALERT: Binary {} hash mismatch! Expected {}, got {}",
-                                    effective_node.exe_path.display(), expected, actual
-                                );
-                                is_tofu_tampered = true;
-                            }
-                            _ => {}
+                        if let TofuCheckResult::Tampered { expected, actual } =
+                            tofu_mgr.check_or_register(&effective_node.exe_path, sha)
+                        {
+                            warn!(
+                                "TOFU TAMPER ALERT: Binary {} hash mismatch! Expected {}, got {}",
+                                effective_node.exe_path.display(),
+                                expected,
+                                actual
+                            );
+                            is_tofu_tampered = true;
                         }
                     }
                 }
@@ -654,7 +844,8 @@ async fn main() -> anyhow::Result<()> {
                 });
 
                 let is_dns_port = dst_port == 53;
-                let has_dns_record = is_dns_port || !sentineld::risk::is_numeric_ip(dest_ip.as_deref().unwrap_or(""));
+                let has_dns_record = is_dns_port
+                    || !sentineld::risk::is_numeric_ip(dest_ip.as_deref().unwrap_or(""));
 
                 let net_ctx = NetworkContext {
                     dest_ip: dest_ip.clone(),
@@ -670,7 +861,12 @@ async fn main() -> anyhow::Result<()> {
                 // Check if protection is enabled (Audit 1.3)
                 let is_prot_active = protection_state.read().await.enabled;
                 if !is_prot_active {
-                    info!("[PROTECTION DISABLED] Allowing flow for TGID {} -> {}:{}", tgid, dest_ip.as_deref().unwrap_or("?"), dst_port);
+                    info!(
+                        "[PROTECTION DISABLED] Allowing flow for TGID {} -> {}:{}",
+                        tgid,
+                        dest_ip.as_deref().unwrap_or("?"),
+                        dst_port
+                    );
                     continue;
                 }
 
@@ -680,13 +876,23 @@ async fn main() -> anyhow::Result<()> {
 
                 let incident_id = Uuid::new_v4().to_string();
                 let secret_path = last_secret.map(|s| s.path.to_string_lossy().to_string());
-                let time_delta_ms = last_secret.map(|s| {
-                    now_ns.saturating_sub(s.timestamp_ns) / 1_000_000
-                });
+                let time_delta_ms =
+                    last_secret.map(|s| now_ns.saturating_sub(s.timestamp_ns) / 1_000_000);
 
                 let reasons: Vec<String> = score.firings.iter().map(|f| f.reason.clone()).collect();
 
-                let report = IncidentReport::new(
+                let primary_attck = score
+                    .firings
+                    .iter()
+                    .max_by_key(|f| f.weight)
+                    .map(|f| f.rule_id.mitre_attck().to_string());
+                let recommended_response = match verdict {
+                    Verdict::High => Some("Terminate process and isolate host network immediately".to_string()),
+                    Verdict::Grey => Some("Prompt interactive operator authorization via Unix IPC (Fail-Closed on timeout)".to_string()),
+                    Verdict::Low => Some("Allow operation and record telemetry".to_string()),
+                };
+
+                let mut report = IncidentReport::new(
                     incident_id.clone(),
                     chrono::Utc::now(),
                     score.total,
@@ -699,11 +905,19 @@ async fn main() -> anyhow::Result<()> {
                     None,
                     score.firings.clone(),
                 );
+                if let Some(ref tech) = primary_attck {
+                    report = report.with_mitre_attck(tech);
+                }
+                if let Some(ref resp) = recommended_response {
+                    report = report.with_recommended_response(resp);
+                }
 
                 if verdict != Verdict::Low {
                     protection_state.read().await.increment_incidents();
                     if let Ok(json) = serde_json::to_string_pretty(&report) {
-                        ipc_server.store_incident_json(incident_id.clone(), json).await;
+                        ipc_server
+                            .store_incident_json(incident_id.clone(), json)
+                            .await;
                     }
                     if let Some(ref s) = storage_manager {
                         let stored_rec = sentineld::storage::schema::StoredIncidentRecord {
@@ -723,7 +937,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 if config.general.audit_only {
-                    info!("[AUDIT ONLY] Verdict {:?} for TGID {} (score: {})", verdict, tgid, score.total);
+                    info!(
+                        "[AUDIT ONLY] Verdict {:?} for TGID {} (score: {})",
+                        verdict, tgid, score.total
+                    );
                     ipc_server.broadcast_event(IpcMessage::Event {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         summary: format!("[AUDIT] {}", report.human_summary),
@@ -759,7 +976,9 @@ async fn main() -> anyhow::Result<()> {
                         match hold_res {
                             HoldResult::NewPrompt(inc_id) => {
                                 let expires_at = SystemTime::now()
-                                    .checked_add(Duration::from_secs(config.general.prompt_timeout_secs))
+                                    .checked_add(Duration::from_secs(
+                                        config.general.prompt_timeout_secs,
+                                    ))
                                     .unwrap_or(SystemTime::now())
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -793,28 +1012,58 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Verdict::High => {
                         // Immediate freeze and block (respecting Never-Freeze Allowlist)
-                        let _ = freeze_orchestrator.freeze_process(effective_tgid, &effective_node.exe_path, effective_node.uid);
+                        let _ = freeze_orchestrator.freeze_process(
+                            effective_tgid,
+                            &effective_node.exe_path,
+                            effective_node.uid,
+                        );
                         if let Some(ref ip) = dest_ip {
-                            if ip != "0.0.0.0" && ip != "127.0.0.1" && !ip.starts_with("127.") && !ip.is_empty() {
-                                sentineld::network::nftables::NftablesManager::block_ip(ip);
+                            if ip != "0.0.0.0"
+                                && ip != "127.0.0.1"
+                                && !ip.starts_with("127.")
+                                && !ip.is_empty()
+                            {
+                                if let Err(e) =
+                                    sentineld::network::nftables::NftablesManager::block_ip(ip)
+                                {
+                                    warn!("Failed to block IP {}: {}", ip, e);
+                                }
                             }
                         }
-                        let _ = freeze_orchestrator.terminate_process(effective_tgid, &effective_node.exe_name(), effective_node.uid);
+                        let _ = freeze_orchestrator.terminate_process(
+                            effective_tgid,
+                            &effective_node.exe_name(),
+                            effective_node.uid,
+                        );
                         if effective_node.ppid > 1 {
                             // Only terminate parent if it is executing an untrusted script or payload, never interactive shell or desktop manager
-                            let parent_node = lineage_tracker.get(effective_node.ppid)
-                                .or_else(|| LineageTracker::discover_from_procfs(effective_node.ppid));
+                            let parent_node =
+                                lineage_tracker.get(effective_node.ppid).or_else(|| {
+                                    LineageTracker::discover_from_procfs(effective_node.ppid)
+                                });
                             if let Some(parent) = parent_node {
-                                if !parent.is_interactive_shell && (parent.script_path.is_some() || parent.ancestor_script.is_some()) {
-                                    let _ = freeze_orchestrator.terminate_process(effective_node.ppid, &parent.exe_name(), parent.uid);
+                                if !parent.is_interactive_shell
+                                    && (parent.script_path.is_some()
+                                        || parent.ancestor_script.is_some())
+                                {
+                                    let _ = freeze_orchestrator.terminate_process(
+                                        effective_node.ppid,
+                                        &parent.exe_name(),
+                                        parent.uid,
+                                    );
                                 }
                             }
                         }
                         if effective_tgid != tgid {
-                            let host_exe = lineage_tracker.get(tgid)
+                            let host_exe = lineage_tracker
+                                .get(tgid)
                                 .map(|n| n.exe_name())
                                 .unwrap_or_else(|| "stealer_host_pid".to_string());
-                            let _ = freeze_orchestrator.terminate_process(tgid, &host_exe, effective_node.uid);
+                            let _ = freeze_orchestrator.terminate_process(
+                                tgid,
+                                &host_exe,
+                                effective_node.uid,
+                            );
                         }
                         ipc_server.broadcast_event(IpcMessage::Event {
                             timestamp: chrono::Utc::now().to_rfc3339(),

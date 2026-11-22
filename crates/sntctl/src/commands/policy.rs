@@ -1,10 +1,10 @@
 //! `sntctl policy` subcommands.
 
-use clap::Subcommand;
-use std::path::{Path, PathBuf};
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json};
+use clap::Subcommand;
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::{Path, PathBuf};
 
 #[derive(Subcommand, Debug)]
 pub enum PolicyActionCmd {
@@ -19,7 +19,11 @@ pub enum PolicyActionCmd {
     Reload,
 }
 
-pub async fn run_policy(socket_path: &Path, action: PolicyActionCmd, json_output: bool) -> anyhow::Result<()> {
+pub async fn run_policy(
+    socket_path: &Path,
+    action: PolicyActionCmd,
+    json_output: bool,
+) -> anyhow::Result<()> {
     match action {
         PolicyActionCmd::List => {
             let resp = send_command(socket_path, IpcCommand::PolicyList).await?;
@@ -40,7 +44,10 @@ pub async fn run_policy(socket_path: &Path, action: PolicyActionCmd, json_output
             println!("Validating policy file: {}...", file.display());
             match sentinel_common::config::RulesConfig::load_from_file(&file) {
                 Ok(rules) => {
-                    println!("[OK] Policy file is valid. Loaded {} rules successfully.", rules.rules.len());
+                    println!(
+                        "[OK] Policy file is valid. Loaded {} rules successfully.",
+                        rules.rules.len()
+                    );
                 }
                 Err(e) => {
                     eprintln!("[FAIL] Policy validation failed: {}", e);
@@ -51,7 +58,9 @@ pub async fn run_policy(socket_path: &Path, action: PolicyActionCmd, json_output
             let resp = send_command(socket_path, IpcCommand::PolicyReload).await?;
             match resp {
                 IpcResponse::Ok(_) => println!("[OK] Security policy reloaded successfully."),
-                IpcResponse::Error { code, message } => eprintln!("Failed to reload policy [{}]: {}", code, message),
+                IpcResponse::Error { code, message } => {
+                    eprintln!("Failed to reload policy [{}]: {}", code, message)
+                }
                 _ => println!("Unexpected response: {:?}", resp),
             }
         }

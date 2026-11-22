@@ -34,6 +34,12 @@ pub struct IncidentReport {
     pub dest_domain: Option<String>,
     /// List of rules that fired with their weights and reasons.
     pub fired_rules: Vec<RuleFiring>,
+    /// MITRE ATT&CK Technique ID (e.g. "T1048.003", "T1059", "T1003").
+    #[serde(default)]
+    pub attck_technique: Option<String>,
+    /// Recommended automated or operator response action.
+    #[serde(default)]
+    pub recommended_response: Option<String>,
     /// Human-readable explanation tree.
     pub human_summary: String,
 }
@@ -64,7 +70,10 @@ impl IncidentReport {
         // Parent info if available
         if process_chain.len() > 1 {
             let parent = &process_chain[process_chain.len() - 2];
-            parts.push(format!("запущен из {} (PID {})", parent.exe_name, parent.tgid));
+            parts.push(format!(
+                "запущен из {} (PID {})",
+                parent.exe_name, parent.tgid
+            ));
         }
 
         // Secret access info
@@ -87,7 +96,20 @@ impl IncidentReport {
         format!("{} [Risk: {}/100]", parts.join(" -> "), risk_score)
     }
 
+    /// Sets the MITRE ATT&CK technique reference.
+    pub fn with_mitre_attck(mut self, technique: &str) -> Self {
+        self.attck_technique = Some(technique.to_string());
+        self
+    }
+
+    /// Sets the recommended response action.
+    pub fn with_recommended_response(mut self, response: &str) -> Self {
+        self.recommended_response = Some(response.to_string());
+        self
+    }
+
     /// Helper constructor that automatically computes `human_summary`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         timestamp: DateTime<Utc>,
@@ -122,6 +144,8 @@ impl IncidentReport {
             dest_port,
             dest_domain,
             fired_rules,
+            attck_technique: None,
+            recommended_response: None,
             human_summary,
         }
     }

@@ -10,8 +10,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use sentinel_common::process::ProcessNode;
 use crate::lineage::process_key::ProcessKey;
+use sentinel_common::process::ProcessNode;
 
 /// Process Graph lifecycle edge type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +178,13 @@ impl LineageGraph {
     // Process Graph (Ancestry) Methods
     // ------------------------------------------------------------------------
 
-    pub fn record_process_edge(&self, from: ProcessKey, to: ProcessKey, edge_type: ProcessEdgeType, timestamp_ns: u64) {
+    pub fn record_process_edge(
+        &self,
+        from: ProcessKey,
+        to: ProcessKey,
+        edge_type: ProcessEdgeType,
+        timestamp_ns: u64,
+    ) {
         let mut edges = self.process_edges.lock().unwrap();
         edges.push(ProcessEdge {
             from,
@@ -199,7 +205,13 @@ impl LineageGraph {
     // Data Flow Graph Methods (TASK-P1-14)
     // ------------------------------------------------------------------------
 
-    pub fn record_data_flow(&self, process: ProcessKey, object: FlowObject, action: FlowAction, timestamp_ns: u64) {
+    pub fn record_data_flow(
+        &self,
+        process: ProcessKey,
+        object: FlowObject,
+        action: FlowAction,
+        timestamp_ns: u64,
+    ) {
         let mut edges = self.data_flow_edges.lock().unwrap();
         edges.push(DataFlowEdge {
             process,
@@ -232,10 +244,17 @@ impl LineageGraph {
             path.push(reader.clone());
 
             // Check if reader wrote to a pipe/socket that recipient subsequently read
-            for pipe_write in edges.iter().filter(|e| e.process.pid == reader.process.pid && e.action == FlowAction::Write) {
+            for pipe_write in edges
+                .iter()
+                .filter(|e| e.process.pid == reader.process.pid && e.action == FlowAction::Write)
+            {
                 path.push(pipe_write.clone());
 
-                for recipient_read in edges.iter().filter(|e| e.process.pid == recipient_pid && e.object == pipe_write.object && e.action == FlowAction::Read) {
+                if let Some(recipient_read) = edges.iter().find(|e| {
+                    e.process.pid == recipient_pid
+                        && e.object == pipe_write.object
+                        && e.action == FlowAction::Read
+                }) {
                     path.push(recipient_read.clone());
                     return path;
                 }
@@ -327,8 +346,18 @@ mod tests {
         let nc_key = ProcessKey::new(101, 2005).with_exe(PathBuf::from("/usr/bin/nc"), (1, 3));
 
         // 1. Process Graph: records fork ancestry
-        graph.record_process_edge(bash_key.clone(), cat_key.clone(), ProcessEdgeType::Fork, 2000);
-        graph.record_process_edge(bash_key.clone(), nc_key.clone(), ProcessEdgeType::Fork, 2005);
+        graph.record_process_edge(
+            bash_key.clone(),
+            cat_key.clone(),
+            ProcessEdgeType::Fork,
+            2000,
+        );
+        graph.record_process_edge(
+            bash_key.clone(),
+            nc_key.clone(),
+            ProcessEdgeType::Fork,
+            2005,
+        );
 
         // 2. Data Flow Graph: records actual data transfers
         let secret_file = FlowObject::SecretFile(PathBuf::from("/home/user/.ssh/id_rsa"));

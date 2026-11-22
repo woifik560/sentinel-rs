@@ -1,9 +1,9 @@
 //! IPC socket client for sntctl.
 
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 
 pub const DEFAULT_PRIVILEGED_SOCKET: &str = "/run/sentinel/sentinel.sock";
 pub const DEFAULT_READONLY_SOCKET: &str = "/run/sentinel/sentinel-ro.sock";

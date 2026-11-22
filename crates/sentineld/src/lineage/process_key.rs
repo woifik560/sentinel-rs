@@ -1,8 +1,8 @@
 //! Process identity and canonical process keys protecting against PID reuse.
 
+pub use sentinel_common::process::ProcessIdentity;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-pub use sentinel_common::process::ProcessIdentity;
 
 /// A canonical process key uniquely identifying a specific process execution instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

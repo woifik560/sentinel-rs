@@ -61,7 +61,8 @@ async fn test_sec_002_unprivileged_client_rejection() {
         &protection,
         None,
         None,
-    ).await;
+    )
+    .await;
 
     match resp {
         IpcResponse::Error { code, .. } => assert_eq!(code, "EACCES"),
@@ -83,8 +84,18 @@ fn test_sec_003_ringbuffer_overflow_drop_tracking() {
     }
     failure_policy.report_ringbuffer_drop();
 
-    assert_eq!(metrics.queue_overflow_drops.load(std::sync::atomic::Ordering::Relaxed), 100_000);
-    assert_eq!(metrics.total_dropped.load(std::sync::atomic::Ordering::Relaxed), 100_000);
+    assert_eq!(
+        metrics
+            .queue_overflow_drops
+            .load(std::sync::atomic::Ordering::Relaxed),
+        100_000
+    );
+    assert_eq!(
+        metrics
+            .total_dropped
+            .load(std::sync::atomic::Ordering::Relaxed),
+        100_000
+    );
     assert_eq!(failure_policy.state(), AgentState::Degraded);
 }
 
@@ -137,7 +148,8 @@ async fn test_sec_006_unauthorized_network_isolation() {
         &protection,
         None,
         None,
-    ).await;
+    )
+    .await;
 
     match resp {
         IpcResponse::Error { code, .. } => assert_eq!(code, "EACCES"),
@@ -196,7 +208,10 @@ fn test_sec_009_disk_quota_guard() {
     // When free disk space is simulated < 500 MB, raw event insertion is dropped
     let simulated_free_mb = 350;
     let should_drop_raw_event = simulated_free_mb < 500;
-    assert!(should_drop_raw_event, "Must drop raw events when disk space < 500 MB");
+    assert!(
+        should_drop_raw_event,
+        "Must drop raw events when disk space < 500 MB"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -211,7 +226,12 @@ fn test_sec_010_fork_bomb_event_throttling() {
         metrics.inc_rate_limited();
     }
 
-    assert_eq!(metrics.rate_limit_drops.load(std::sync::atomic::Ordering::Relaxed), 10_000);
+    assert_eq!(
+        metrics
+            .rate_limit_drops
+            .load(std::sync::atomic::Ordering::Relaxed),
+        10_000
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -225,17 +245,30 @@ fn test_sec_011_scm_rights_descriptor_passing() {
     let receiver_tgid = 2002;
 
     let mut sender_node = ProcessNode::new(sender_tgid, 1, 1000, PathBuf::from("/bin/cat"));
-    sender_node.record_secret_access(PathBuf::from("/home/user/.ssh/id_rsa"), SecretCategory::SshKey, 1000);
+    sender_node.record_secret_access(
+        PathBuf::from("/home/user/.ssh/id_rsa"),
+        SecretCategory::SshKey,
+        1000,
+    );
     tracker.insert(sender_node);
 
     let receiver_node = ProcessNode::new(receiver_tgid, 1, 1000, PathBuf::from("/usr/bin/curl"));
     tracker.insert(receiver_node);
 
     // Sender passes secret descriptor to receiver via SCM_RIGHTS
-    tracker.handle_scm_rights(sender_tgid, receiver_tgid, PathBuf::from("/home/user/.ssh/id_rsa"));
+    tracker.handle_scm_rights(
+        sender_tgid,
+        receiver_tgid,
+        PathBuf::from("/home/user/.ssh/id_rsa"),
+    );
 
-    let updated_receiver = tracker.get(receiver_tgid).expect("Receiver process must exist");
-    assert_eq!(updated_receiver.taint_level, TaintLevel::ConfirmedPropagation);
+    let updated_receiver = tracker
+        .get(receiver_tgid)
+        .expect("Receiver process must exist");
+    assert_eq!(
+        updated_receiver.taint_level,
+        TaintLevel::ConfirmedPropagation
+    );
     assert!(updated_receiver.has_secret_access());
 }
 
@@ -248,7 +281,11 @@ fn test_sec_012_legitimate_backup_fp_immunity() {
 
     // Legitimate tar backup process reading ~/.ssh/id_rsa but NOT contacting external IP
     let mut backup_node = ProcessNode::new(3001, 1, 1000, PathBuf::from("/bin/tar"));
-    backup_node.record_secret_access(PathBuf::from("/home/user/.ssh/id_rsa"), SecretCategory::SshKey, 1000);
+    backup_node.record_secret_access(
+        PathBuf::from("/home/user/.ssh/id_rsa"),
+        SecretCategory::SshKey,
+        1000,
+    );
     backup_node.taint_level = TaintLevel::SensitiveAccess;
 
     let net_ctx = NetworkContext {
@@ -265,5 +302,8 @@ fn test_sec_012_legitimate_backup_fp_immunity() {
     let eval = risk_engine.evaluate_evidence(&backup_node, &net_ctx);
     // Confidence in exfiltration must be Low, and termination must NOT be allowed!
     assert_eq!(eval.confidence, Confidence::Low);
-    assert!(!eval.allows_auto_termination(), "Legitimate backup tool must NEVER be killed!");
+    assert!(
+        !eval.allows_auto_termination(),
+        "Legitimate backup tool must NEVER be killed!"
+    );
 }

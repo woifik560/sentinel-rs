@@ -10,5 +10,7 @@ pub mod ringbuffer;
 
 pub use event_dispatcher::EventDispatcher;
 pub use event_metrics::{EventMetrics, MetricsSnapshot};
-pub use event_normalizer::{EventDetails, EventNormalizer, EventSource, NormalizedEvent, NormalizedEventType, ProcessKey};
+pub use event_normalizer::{
+    EventDetails, EventNormalizer, EventSource, NormalizedEvent, NormalizedEventType, ProcessKey,
+};
 pub use ringbuffer::RingBufferConsumer;

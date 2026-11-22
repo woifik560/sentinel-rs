@@ -1,11 +1,11 @@
 //! Shared daemon protection state, telemetry metrics, and Process Protection Policy.
 
+use sentinel_common::config::default_never_freeze_list;
+use sentinel_common::policy::OperatingMode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use sentinel_common::config::default_never_freeze_list;
-use sentinel_common::policy::OperatingMode;
 
 #[derive(Debug)]
 pub struct ProtectionState {
@@ -168,10 +168,8 @@ impl ProcessProtectionPolicy {
         }
 
         // If from verified package and in never-freeze list
-        if self.protected_names.contains(exe_name) {
-            if pkg_origin.is_some() || is_system_path {
-                return true;
-            }
+        if self.protected_names.contains(exe_name) && (pkg_origin.is_some() || is_system_path) {
+            return true;
         }
 
         false

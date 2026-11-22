@@ -1,9 +1,9 @@
 //! IPC Client for sending requests to the privileged helper daemon.
 
+use super::{PrivilegedOp, PrivilegedResult};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use super::{PrivilegedOp, PrivilegedResult};
 
 pub struct PrivilegedClient {
     socket_path: PathBuf,

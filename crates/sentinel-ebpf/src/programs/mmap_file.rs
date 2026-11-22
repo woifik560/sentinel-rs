@@ -15,10 +15,10 @@
 //!      or memfd loaders, raising the `FILELESS_ANON_EXEC` risk flag.
 //! 4. Emits `RawMmapFileEvent` to the RingBuffer.
 
-use std::path::Path;
-use sentinel_common::events::{RawMmapFileEvent, MAX_PATH_LEN};
 pub use crate::maps::MmapVerdict;
 use crate::maps::TaintMapManager;
+use sentinel_common::events::{RawMmapFileEvent, MAX_PATH_LEN};
+use std::path::Path;
 
 /// Evaluates a `mmap_file` LSM hook invocation.
 pub fn evaluate_mmap_file(
@@ -72,6 +72,7 @@ pub fn handle_file_mprotect<P: AsRef<Path>>(
 }
 
 /// Helper to create a raw event for testing and RingBuffer simulation.
+#[allow(clippy::too_many_arguments)]
 pub fn create_raw_mmap_event(
     tgid: u32,
     uid: u32,

@@ -8,7 +8,6 @@
 //! 5. Taint Hygiene: `/dev/pts/*`, `/dev/null`, `~/.ssh/config`, `~/.ssh/*.pub` are exempt.
 //! 6. Never-Freeze Allowlist: `gnome-shell`, `dbus-daemon`, `systemd` are strictly protected from SIGSTOP.
 
-use std::path::Path;
 use sentinel_common::events::{MAY_READ, MAY_WRITE, SENTINEL_SO_MARK};
 use sentinel_common::process::SecretCategory;
 use sentinel_common::risk::{RiskThresholds, RuleId, Verdict};
@@ -17,6 +16,7 @@ use sentinel_ebpf::programs::bprm_check_security::is_memfd_or_fileless;
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
 use sentinel_ebpf::programs::socket_connect::{evaluate_socket_connect, SocketConnectVerdict};
+use std::path::Path;
 
 // Mock DpkgChecker for standalone testing
 #[allow(dead_code)]
@@ -62,11 +62,15 @@ fn test_scenario_1_cat_secret_pipe_curl() {
     assert!(!taint_mgr.is_tainted(curl_tgid));
 
     // 2. cat writes to stdout (pipe) -> INODE_STORAGE marked tainted
-    let write_res = evaluate_file_permission(&taint_mgr, cat_tgid, pipe_dev, pipe_ino, pipe_path, MAY_WRITE, true, false);
+    let write_res = evaluate_file_permission(
+        &taint_mgr, cat_tgid, pipe_dev, pipe_ino, pipe_path, MAY_WRITE, true, false,
+    );
     assert!(write_res.is_some());
 
     // 3. curl reads from stdin (same pipe) -> TASK_STORAGE inherits taint!
-    let read_res = evaluate_file_permission(&taint_mgr, curl_tgid, pipe_dev, pipe_ino, pipe_path, MAY_READ, true, false);
+    let read_res = evaluate_file_permission(
+        &taint_mgr, curl_tgid, pipe_dev, pipe_ino, pipe_path, MAY_READ, true, false,
+    );
     assert!(read_res.is_some());
     assert!(taint_mgr.is_tainted(curl_tgid));
 
@@ -100,10 +104,14 @@ fn test_scenario_2_tempfile_exfiltration() {
     taint_mgr.mark_tainted(bash_tgid);
 
     // Writes to /tmp/stolen_key.txt
-    evaluate_file_permission(&taint_mgr, bash_tgid, file_dev, file_ino, file_path, MAY_WRITE, false, false);
+    evaluate_file_permission(
+        &taint_mgr, bash_tgid, file_dev, file_ino, file_path, MAY_WRITE, false, false,
+    );
 
     // Another process reads /tmp/stolen_key.txt
-    evaluate_file_permission(&taint_mgr, curl_tgid, file_dev, file_ino, file_path, MAY_READ, false, false);
+    evaluate_file_permission(
+        &taint_mgr, curl_tgid, file_dev, file_ino, file_path, MAY_READ, false, false,
+    );
 
     // curl must now be tainted
     assert!(taint_mgr.is_tainted(curl_tgid));
@@ -129,7 +137,10 @@ fn test_scenario_3_lolbin_discount_prevention() {
 
     // Discount must be stripped, minimum floor 40 (GREY)
     assert_eq!(score.total, 40);
-    assert!(!score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext));
+    assert!(!score
+        .firings
+        .iter()
+        .any(|f| f.rule_id == RuleId::TrustedPackageContext));
     assert_eq!(score.classify(&RiskThresholds::default()), Verdict::Grey);
 }
 
@@ -149,13 +160,23 @@ fn test_scenario_5_taint_hygiene() {
     assert!(TaintHygiene::is_exempt_path("/tmp/.X11-unix/X0"));
 
     // Public keys and config must NOT taint
-    assert!(!TaintHygiene::is_strictly_private_secret("/home/user/.ssh/id_ed25519.pub"));
-    assert!(!TaintHygiene::is_strictly_private_secret("/home/user/.ssh/config"));
-    assert!(!TaintHygiene::is_strictly_private_secret("/home/user/.ssh/known_hosts"));
+    assert!(!TaintHygiene::is_strictly_private_secret(
+        "/home/user/.ssh/id_ed25519.pub"
+    ));
+    assert!(!TaintHygiene::is_strictly_private_secret(
+        "/home/user/.ssh/config"
+    ));
+    assert!(!TaintHygiene::is_strictly_private_secret(
+        "/home/user/.ssh/known_hosts"
+    ));
 
     // Private keys DO taint
-    assert!(TaintHygiene::is_strictly_private_secret("/home/user/.ssh/id_ed25519"));
-    assert!(TaintHygiene::is_strictly_private_secret("/home/user/.ssh/id_rsa"));
+    assert!(TaintHygiene::is_strictly_private_secret(
+        "/home/user/.ssh/id_ed25519"
+    ));
+    assert!(TaintHygiene::is_strictly_private_secret(
+        "/home/user/.ssh/id_rsa"
+    ));
 }
 
 #[test]
@@ -180,16 +201,14 @@ fn test_scenario_6_multithreaded_stealer_group_leader_taint() {
     taint_mgr.mark_tainted(thread_a_tid);
 
     // Verification: Thread B MUST immediately be recognized as tainted!
-    assert!(taint_mgr.is_tainted(thread_b_tid), "Multi-threading bypass failed: Thread B is not tainted!");
+    assert!(
+        taint_mgr.is_tainted(thread_b_tid),
+        "Multi-threading bypass failed: Thread B is not tainted!"
+    );
     assert!(taint_mgr.is_tainted(process_tgid));
 
     // When Thread B connects to socket, Slow-Path hold MUST trigger:
-    let verdict = evaluate_socket_connect(
-        taint_mgr.is_tainted(thread_b_tid),
-        false,
-        false,
-        true,
-    );
+    let verdict = evaluate_socket_connect(taint_mgr.is_tainted(thread_b_tid), false, false, true);
     assert_eq!(
         verdict,
         SocketConnectVerdict::SlowPathHoldNfqueue {
@@ -229,12 +248,7 @@ fn test_scenario_8_preopened_socket_exfiltration() {
     let tgid = 6300;
 
     // 1. Process starts clean and opens a TCP socket
-    let initial_verdict = evaluate_socket_connect(
-        taint_mgr.is_tainted(tgid),
-        false,
-        true,
-        true,
-    );
+    let initial_verdict = evaluate_socket_connect(taint_mgr.is_tainted(tgid), false, true, true);
     assert_eq!(initial_verdict, SocketConnectVerdict::FastPathAllow);
 
     // 2. Later, process reads secret -> becomes tainted!
@@ -304,11 +318,20 @@ fn test_scenario_10_ptrace_memory_snooping_denied() {
 #[test]
 fn test_scenario_11_cross_process_environ_snooping() {
     // Attempting to read another process's environment variables
-    assert!(TaintMapManager::is_proc_environ_or_mem_snoop(1000, "/proc/2000/environ"));
-    assert!(TaintMapManager::is_proc_environ_or_mem_snoop(1000, "/proc/2000/mem"));
+    assert!(TaintMapManager::is_proc_environ_or_mem_snoop(
+        1000,
+        "/proc/2000/environ"
+    ));
+    assert!(TaintMapManager::is_proc_environ_or_mem_snoop(
+        1000,
+        "/proc/2000/mem"
+    ));
 
     // Reading own environ is permitted
-    assert!(!TaintMapManager::is_proc_environ_or_mem_snoop(1000, "/proc/1000/environ"));
+    assert!(!TaintMapManager::is_proc_environ_or_mem_snoop(
+        1000,
+        "/proc/1000/environ"
+    ));
 }
 
 #[test]
@@ -346,7 +369,10 @@ fn test_scenario_13_dos_protection_and_flow_aggregation() {
 
     // Third unique destination: Queue full! Packet dropped to prevent DoS!
     let dest3 = ("192.0.2.3".to_string(), 53);
-    assert!(!orchestrator.hold(tgid, &dest3), "DoS protection failed to drop on overflow!");
+    assert!(
+        !orchestrator.hold(tgid, &dest3),
+        "DoS protection failed to drop on overflow!"
+    );
 }
 
 #[test]
@@ -385,7 +411,10 @@ fn test_scenario_15_contextual_policy_ssh_rules() {
         22,
         Some("github.com"),
     );
-    assert!(allowed, "Legitimate SSH connection to GitHub should be allowed by context policy");
+    assert!(
+        allowed,
+        "Legitimate SSH connection to GitHub should be allowed by context policy"
+    );
 
     // Same SSH key accessed by ssh going to unknown rogue port 4444 -> Prompt / Block!
     let denied = engine.is_allowed(
@@ -395,7 +424,10 @@ fn test_scenario_15_contextual_policy_ssh_rules() {
         4444,
         None,
     );
-    assert!(!denied, "SSH connecting to arbitrary rogue port must not be pre-approved");
+    assert!(
+        !denied,
+        "SSH connecting to arbitrary rogue port must not be pre-approved"
+    );
 }
 
 #[test]
@@ -408,20 +440,17 @@ fn test_scenario_16_hotpath_microbenchmark_clean_file_permission() {
 
     let start = std::time::Instant::now();
     for _ in 0..10_000 {
-        let res = taint_mgr.handle_file_permission(
-            clean_tgid,
-            dev,
-            ino,
-            path,
-            MAY_READ,
-            false,
-            false,
-        );
+        let res =
+            taint_mgr.handle_file_permission(clean_tgid, dev, ino, path, MAY_READ, false, false);
         assert!(res.is_none());
     }
     let elapsed = start.elapsed();
     // 10,000 checks should execute in just a few milliseconds on modern CPUs
-    assert!(elapsed.as_millis() < 50, "Hot-path is too slow: {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 50,
+        "Hot-path is too slow: {:?}",
+        elapsed
+    );
 }
 
 mod sentineld_mock_never_freeze {
@@ -449,7 +478,8 @@ mod sentineld_mock_never_freeze {
             if s.starts_with("/tmp") || s.starts_with("/dev/shm") || s.contains("/Downloads/") {
                 return false;
             }
-            if !s.starts_with("/usr/bin/") && !s.starts_with("/usr/lib/") && !s.starts_with("/bin/") {
+            if !s.starts_with("/usr/bin/") && !s.starts_with("/usr/lib/") && !s.starts_with("/bin/")
+            {
                 return false;
             }
             let name = path.file_name().unwrap().to_string_lossy();
@@ -490,8 +520,8 @@ mod sentineld_mock_never_freeze {
 }
 
 mod sentineld_mock_tofu {
-    use std::path::{Path, PathBuf};
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum TofuCheckResult {
@@ -544,7 +574,9 @@ mod sentineld_mock_policy {
         ) -> bool {
             let s = path.to_string_lossy();
             if s.ends_with("/ssh") {
-                if dest_port == 22 && (dest_domain == Some("github.com") || dest_ip == Some("140.82.112.3")) {
+                if dest_port == 22
+                    && (dest_domain == Some("github.com") || dest_ip == Some("140.82.112.3"))
+                {
                     return true;
                 }
             }
@@ -552,4 +584,3 @@ mod sentineld_mock_policy {
         }
     }
 }
-

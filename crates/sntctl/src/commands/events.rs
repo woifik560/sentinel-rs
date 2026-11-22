@@ -1,10 +1,10 @@
 //! `sntctl events` subcommands.
 
-use clap::Subcommand;
-use std::path::Path;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json};
+use clap::Subcommand;
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::Path;
 
 #[derive(Subcommand, Debug)]
 pub enum EventsAction {
@@ -14,9 +14,7 @@ pub enum EventsAction {
         limit: usize,
     },
     /// Show details for a specific event ID
-    Show {
-        event_id: String,
-    },
+    Show { event_id: String },
     /// Export events in JSON format
     Export {
         #[arg(short, long, default_value = "1000")]
@@ -24,11 +22,21 @@ pub enum EventsAction {
     },
 }
 
-pub async fn run_events(socket_path: &Path, action: EventsAction, json_output: bool) -> anyhow::Result<()> {
+pub async fn run_events(
+    socket_path: &Path,
+    action: EventsAction,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let cmd = match action {
-        EventsAction::List { limit } => IpcCommand::EventsList { limit: Some(limit), offset: Some(0) },
+        EventsAction::List { limit } => IpcCommand::EventsList {
+            limit: Some(limit),
+            offset: Some(0),
+        },
         EventsAction::Show { event_id } => IpcCommand::EventsShow { event_id },
-        EventsAction::Export { limit } => IpcCommand::EventsList { limit: Some(limit), offset: Some(0) },
+        EventsAction::Export { limit } => IpcCommand::EventsList {
+            limit: Some(limit),
+            offset: Some(0),
+        },
     };
 
     let resp = send_command(socket_path, cmd).await?;

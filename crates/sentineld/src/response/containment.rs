@@ -1,9 +1,9 @@
 //! Host-level containment and incident isolation state.
 
+use super::network_block::NetworkBlockManager;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::info;
-use super::network_block::NetworkBlockManager;
 
 #[derive(Clone)]
 pub struct HostContainment {

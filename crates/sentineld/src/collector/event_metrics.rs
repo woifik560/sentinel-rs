@@ -36,7 +36,8 @@ impl EventMetrics {
     }
 
     pub fn inc_kernel_drops(&self, count: u64) {
-        self.kernel_ringbuffer_drops.fetch_add(count, Ordering::Relaxed);
+        self.kernel_ringbuffer_drops
+            .fetch_add(count, Ordering::Relaxed);
         self.total_dropped.fetch_add(count, Ordering::Relaxed);
     }
 

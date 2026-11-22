@@ -12,9 +12,9 @@
 //!    a clean worker process to bypass file opening hooks.
 //! 4. Emits `RawFileReceiveEvent` to the RingBuffer.
 
-use std::path::Path;
-use sentinel_common::events::{RawFileReceiveEvent, MAX_PATH_LEN};
 use crate::maps::{FileReceiveVerdict, TaintMapManager};
+use sentinel_common::events::{RawFileReceiveEvent, MAX_PATH_LEN};
+use std::path::Path;
 
 /// Evaluates a `file_receive` LSM hook invocation.
 pub fn evaluate_file_receive(

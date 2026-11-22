@@ -4,10 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+type FlowKey = (u32, String, u16);
+type FlowValue = (String, Instant);
+
 #[derive(Clone)]
 pub struct ConnectionTracker {
     aggregate_window: Duration,
-    aggregated_flows: Arc<RwLock<HashMap<(u32, String, u16), (String, Instant)>>>,
+    aggregated_flows: Arc<RwLock<HashMap<FlowKey, FlowValue>>>,
     duration_allowlist: Arc<RwLock<HashMap<u32, Instant>>>,
     host_allowlist: Arc<RwLock<HashMap<u32, HashSet<String>>>>,
 }
@@ -25,9 +28,7 @@ impl ConnectionTracker {
     pub fn is_temporarily_allowed(&self, tgid: u32, host: Option<&str>) -> bool {
         let now = Instant::now();
         if let Some(&expiry) = self.duration_allowlist.read().unwrap().get(&tgid) {
-            if now < expiry {
-                return true;
-            }
+            return now < expiry;
         }
 
         if let Some(h) = host {

@@ -8,10 +8,10 @@
 //! 5. Behavior Detection Rule Actions
 //! 6. Risk-based Defaults by Operating Mode
 
-use sentinel_common::policy::{OperatingMode, PolicyAction, PolicyDecision};
-use sentinel_common::risk::SeverityLevel;
 use super::context::PolicyContext;
 use super::rules::PolicyRule;
+use sentinel_common::policy::{OperatingMode, PolicyAction, PolicyDecision};
+use sentinel_common::risk::SeverityLevel;
 
 pub struct PrecedenceEvaluator;
 
@@ -26,7 +26,11 @@ impl PrecedenceEvaluator {
         let pid = ctx.process_key.pid;
         let process_key_str = ctx.process_key.to_string_id();
         let risk_score = ctx.risk.as_ref().map(|r| r.score).unwrap_or(0);
-        let severity = ctx.risk.as_ref().map(|r| r.severity).unwrap_or(SeverityLevel::Low);
+        let severity = ctx
+            .risk
+            .as_ref()
+            .map(|r| r.severity)
+            .unwrap_or(SeverityLevel::Low);
 
         // 1. IMMUTABLE SAFETY CONSTRAINTS
         if pid <= 2 {
@@ -36,7 +40,10 @@ impl PrecedenceEvaluator {
                 PolicyAction::Allow,
                 0,
                 SeverityLevel::Low,
-                format!("Immutable safety constraint: System critical process (PID {})", pid),
+                format!(
+                    "Immutable safety constraint: System critical process (PID {})",
+                    pid
+                ),
             );
             decision.rule_id = Some("SAFETY_CRITICAL_PID".into());
             return decision;
@@ -57,22 +64,26 @@ impl PrecedenceEvaluator {
         }
 
         // 2. PROTECTED SYSTEM RESOURCES
-        if exe_str.starts_with("/etc/sentinel") || exe_str.starts_with("/run/sentinel") {
-            if ctx.uid != 0 {
-                let mut decision = PolicyDecision::new(
-                    pid,
-                    process_key_str,
-                    PolicyAction::Deny,
-                    90,
-                    SeverityLevel::Critical,
-                    "Protected system resource: Non-root access to sentinel internal paths".into(),
-                );
-                decision.rule_id = Some("PROTECTED_SYSTEM_RESOURCE".into());
-                return decision;
-            }
+        if (exe_str.starts_with("/etc/sentinel") || exe_str.starts_with("/run/sentinel"))
+            && ctx.uid != 0
+        {
+            let mut decision = PolicyDecision::new(
+                pid,
+                process_key_str,
+                PolicyAction::Deny,
+                90,
+                SeverityLevel::Critical,
+                "Protected system resource: Non-root access to sentinel internal paths".into(),
+            );
+            decision.rule_id = Some("PROTECTED_SYSTEM_RESOURCE".into());
+            return decision;
         }
 
-        let behavior_ids: Vec<String> = ctx.behavior_matches.iter().map(|m| m.rule_id.clone()).collect();
+        let behavior_ids: Vec<String> = ctx
+            .behavior_matches
+            .iter()
+            .map(|m| m.rule_id.clone())
+            .collect();
 
         // 3. EXPLICIT ADMIN DENY RULES
         for rule in admin_deny_rules {

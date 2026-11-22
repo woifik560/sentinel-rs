@@ -1,11 +1,13 @@
 //! Health Monitor tracking overall agent status and subsystem health.
 
-use chrono::Utc;
-use std::sync::Arc;
-use std::time::Instant;
-use sentinel_common::health::{AgentHealthReport, AgentState, HealthStatus, SubsystemHealth, SubsystemId};
 use super::degraded::{DegradedStateManager, FailurePolicyManager};
 use super::metrics::SubsystemMetrics;
+use chrono::Utc;
+use sentinel_common::health::{
+    AgentHealthReport, AgentState, HealthStatus, SubsystemHealth, SubsystemId,
+};
+use std::sync::Arc;
+use std::time::Instant;
 
 pub struct HealthMonitor {
     start_time: Instant,
@@ -66,7 +68,10 @@ impl HealthMonitor {
             },
             mandatory: true,
             last_check: Utc::now(),
-            message: format!("Ingested: {}, Dropped: {}", metrics.events_ingested, metrics.events_dropped),
+            message: format!(
+                "Ingested: {}, Dropped: {}",
+                metrics.events_ingested, metrics.events_dropped
+            ),
             error_details: None,
         });
 
@@ -85,19 +90,29 @@ impl HealthMonitor {
 
         subsystems.push(SubsystemHealth {
             id: SubsystemId::BpfLsm,
-            status: if agent_state == AgentState::ProtectionUnavailable {
-                HealthStatus::Failed
+            status: if !metrics.bpf_lsm_active {
+                if agent_state == AgentState::ProtectionUnavailable {
+                    HealthStatus::Failed
+                } else {
+                    HealthStatus::Degraded
+                }
             } else {
                 HealthStatus::Healthy
             },
             mandatory: true,
             last_check: Utc::now(),
-            message: if agent_state == AgentState::ProtectionUnavailable {
+            message: if metrics.bpf_lsm_active {
+                "BPF LSM security hooks active".into()
+            } else if agent_state == AgentState::ProtectionUnavailable {
                 "BPF LSM security probes unavailable".into()
             } else {
-                "BPF LSM security hooks active".into()
+                "BPF LSM security hooks inactive (fallback/userspace mode)".into()
             },
-            error_details: None,
+            error_details: if !metrics.bpf_lsm_active {
+                Some("BPF LSM kernel hooks not attached; operating in degraded mode".into())
+            } else {
+                None
+            },
         });
 
         subsystems.push(SubsystemHealth {
@@ -129,10 +144,18 @@ impl HealthMonitor {
 
         subsystems.push(SubsystemHealth {
             id: SubsystemId::NetworkProtection,
-            status: HealthStatus::Healthy,
+            status: if metrics.network_holding_active {
+                HealthStatus::Healthy
+            } else {
+                HealthStatus::Degraded
+            },
             mandatory: false,
             last_check: Utc::now(),
-            message: "Netfilter NFQUEUE active".into(),
+            message: if metrics.network_holding_active {
+                "Netfilter NFQUEUE active".into()
+            } else {
+                "Netfilter NFQUEUE inactive/bypass".into()
+            },
             error_details: None,
         });
 

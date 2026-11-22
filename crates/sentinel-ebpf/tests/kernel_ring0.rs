@@ -43,7 +43,10 @@ async fn test_strict_preflight_in_lsm_bpf_ring0_kernel() {
     let lsm_path = "/sys/kernel/security/lsm";
     if let Ok(lsm_content) = std::fs::read_to_string(lsm_path) {
         if lsm_content.contains("bpf") {
-            println!("Ring-0 kernel detected with BPF LSM active ('{}')", lsm_content.trim());
+            println!(
+                "Ring-0 kernel detected with BPF LSM active ('{}')",
+                lsm_content.trim()
+            );
             let mut config = LoaderConfig::default();
             config.strict_preflight = true;
             config.min_kernel_version = "6.1".to_string();
@@ -70,6 +73,9 @@ async fn test_strict_preflight_in_lsm_bpf_ring0_kernel() {
             );
         }
     } else {
-        println!("Notice: {} not found (non-Linux or virtual container). Skipping.", lsm_path);
+        println!(
+            "Notice: {} not found (non-Linux or virtual container). Skipping.",
+            lsm_path
+        );
     }
 }

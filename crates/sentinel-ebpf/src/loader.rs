@@ -6,15 +6,15 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 #[cfg(target_os = "linux")]
-use aya::programs::Program;
-#[cfg(target_os = "linux")]
 use aya::programs::lsm::LsmLinkId;
+#[cfg(target_os = "linux")]
+use aya::programs::Program;
 #[cfg(target_os = "linux")]
 use aya::{Btf, Ebpf};
 
+use crate::maps::TaintMapManager;
 use sentinel_common::events::EbpfEvent;
 use sentinel_common::health::MechanismState;
-use crate::maps::TaintMapManager;
 
 /// Configuration for loading eBPF programs.
 #[derive(Debug, Clone)]
@@ -141,7 +141,8 @@ impl EbpfLoader {
 
         // 2. Check kernel version for safe BPF_MAP_TYPE_INODE_STORAGE support (Linux 6.x+)
         let os_release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        let is_kernel_safe = verify_kernel_version_safe(&os_release, &self.config.min_kernel_version);
+        let is_kernel_safe =
+            verify_kernel_version_safe(&os_release, &self.config.min_kernel_version);
 
         if !is_kernel_safe {
             self.bpf_lsm_state = MechanismState::Unsupported;
@@ -170,93 +171,117 @@ impl EbpfLoader {
 
         // 3. Attempt Aya ELF loading and BPF LSM hook attachment if an eBPF ELF binary is present
         let bpf_obj_paths = [
-            std::env::var("SENTINEL_BPF_OBJ").ok().map(std::path::PathBuf::from),
-            Some(std::path::PathBuf::from("/usr/lib/sentinel/bpf/sentinel.bpf.o")),
+            std::env::var("SENTINEL_BPF_OBJ")
+                .ok()
+                .map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from(
+                "/usr/lib/sentinel/bpf/sentinel.bpf.o",
+            )),
             Some(std::path::PathBuf::from("/etc/sentinel/sentinel.bpf.o")),
         ];
 
         let mut loaded_and_attached = false;
         #[cfg(target_os = "linux")]
         {
-            for opt_path in &bpf_obj_paths {
-                if let Some(ref path) = opt_path {
-                    if path.exists() {
-                        info!("Attempting to load eBPF ELF object from {}", path.display());
-                        match aya::Ebpf::load_file(path) {
-                            Ok(mut bpf) => {
-                                info!("Successfully parsed eBPF ELF object from {}", path.display());
+            for path in bpf_obj_paths.iter().flatten() {
+                if path.exists() {
+                    info!("Attempting to load eBPF ELF object from {}", path.display());
+                    match aya::Ebpf::load_file(path) {
+                        Ok(mut bpf) => {
+                            info!(
+                                "Successfully parsed eBPF ELF object from {}",
+                                path.display()
+                            );
 
-                                // Load BTF from kernel
-                                let btf = match Btf::from_sys_fs() {
-                                    Ok(btf) => btf,
-                                    Err(e) => {
-                                        warn!("Kernel BTF not available (/sys/kernel/btf/vmlinux): {}. Cannot attach LSM programs.", e);
-                                        self.bpf_lsm_state = MechanismState::Unsupported;
-                                        break;
-                                    }
-                                };
+                            // Load BTF from kernel
+                            let btf = match Btf::from_sys_fs() {
+                                Ok(btf) => btf,
+                                Err(e) => {
+                                    warn!("Kernel BTF not available (/sys/kernel/btf/vmlinux): {}. Cannot attach LSM programs.", e);
+                                    self.bpf_lsm_state = MechanismState::Unsupported;
+                                    break;
+                                }
+                            };
 
-                                let mut current_links = Vec::new();
-                                let mut attach_failed = false;
-                                let mut attached_count = 0;
+                            let mut current_links = Vec::new();
+                            let mut attach_failed = false;
+                            let mut attached_count = 0;
 
-                                for (name, program) in bpf.programs_mut() {
-                                    match program {
-                                        Program::Lsm(lsm) => {
-                                            info!("Found LSM program '{}' in ELF object", name);
-                                            // Load into verifier
-                                            if let Err(e) = lsm.load(name, &btf) {
-                                                warn!("BPF verifier rejected LSM program '{}': {}", name, e);
+                            for (name, program) in bpf.programs_mut() {
+                                match program {
+                                    Program::Lsm(lsm) => {
+                                        info!("Found LSM program '{}' in ELF object", name);
+                                        // Load into verifier
+                                        if let Err(e) = lsm.load(name, &btf) {
+                                            warn!(
+                                                "BPF verifier rejected LSM program '{}': {}",
+                                                name, e
+                                            );
+                                            attach_failed = true;
+                                            break;
+                                        }
+                                        // Attach to LSM hook
+                                        match lsm.attach() {
+                                            Ok(link_id) => {
+                                                info!(
+                                                    "Successfully attached BPF LSM hook '{}'",
+                                                    name
+                                                );
+                                                current_links.push(link_id);
+                                                attached_count += 1;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to attach BPF LSM hook '{}': {}",
+                                                    name, e
+                                                );
                                                 attach_failed = true;
                                                 break;
                                             }
-                                            // Attach to LSM hook
-                                            match lsm.attach() {
-                                                Ok(link_id) => {
-                                                    info!("Successfully attached BPF LSM hook '{}'", name);
-                                                    current_links.push(link_id);
-                                                    attached_count += 1;
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to attach BPF LSM hook '{}': {}", name, e);
-                                                    attach_failed = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            info!("Found non-LSM program '{}' in ELF object", name);
                                         }
                                     }
+                                    _ => {
+                                        info!("Found non-LSM program '{}' in ELF object", name);
+                                    }
                                 }
+                            }
 
-                                if attach_failed {
-                                    warn!("Partial or complete LSM attachment failure! Rolling back previously attached hooks...");
-                                    current_links.clear(); // Dropping links detaches them
-                                    self.bpf_lsm_state = MechanismState::Failed;
-                                } else if attached_count > 0 {
-                                    info!("All {} LSM programs attached and validated.", attached_count);
-                                    self.attached_links = current_links;
-                                    self.bpf_instance = Some(bpf);
-                                    self.bpf_lsm_state = MechanismState::Active;
-                                    loaded_and_attached = true;
-                                    break;
-                                } else {
-                                    warn!("ELF object contained no attachable LSM programs.");
-                                    self.bpf_lsm_state = MechanismState::Unavailable;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to load eBPF ELF object from {}: {}", path.display(), e);
+                            if attach_failed {
+                                warn!("Partial or complete LSM attachment failure! Rolling back previously attached hooks...");
+                                current_links.clear(); // Dropping links detaches them
                                 self.bpf_lsm_state = MechanismState::Failed;
+                            } else if attached_count > 0 {
+                                info!(
+                                    "All {} LSM programs attached and validated.",
+                                    attached_count
+                                );
+                                self.attached_links = current_links;
+                                self.bpf_instance = Some(bpf);
+                                self.bpf_lsm_state = MechanismState::Active;
+                                loaded_and_attached = true;
+                                break;
+                            } else {
+                                warn!("ELF object contained no attachable LSM programs.");
+                                self.bpf_lsm_state = MechanismState::Unavailable;
                             }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to load eBPF ELF object from {}: {}",
+                                path.display(),
+                                e
+                            );
+                            self.bpf_lsm_state = MechanismState::Failed;
                         }
                     }
                 }
             }
         }
 
-        if !loaded_and_attached && self.bpf_lsm_state != MechanismState::Unsupported && self.bpf_lsm_state != MechanismState::Failed {
+        if !loaded_and_attached
+            && self.bpf_lsm_state != MechanismState::Unsupported
+            && self.bpf_lsm_state != MechanismState::Failed
+        {
             self.bpf_lsm_state = MechanismState::Unavailable;
         }
 
@@ -290,12 +315,17 @@ impl EbpfLoader {
             self.fanotify_state = MechanismState::Unsupported;
         }
 
-        if self.tracepoints_state == MechanismState::Active || self.bpf_lsm_state == MechanismState::Active {
+        if self.bpf_lsm_state == MechanismState::Active {
             self.ring_buffer_state = MechanismState::Active;
+        } else if self.tracepoints_state == MechanismState::Active {
+            self.ring_buffer_state = MechanismState::Degraded;
         } else {
             self.ring_buffer_state = MechanismState::Unavailable;
         }
-        info!("eBPF RingBuffer listener configured (size: {}, state: {:?})", self.config.ring_buffer_size, self.ring_buffer_state);
+        info!(
+            "eBPF RingBuffer listener configured (size: {}, state: {:?})",
+            self.config.ring_buffer_size, self.ring_buffer_state
+        );
         Ok(())
     }
 
@@ -365,7 +395,11 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
     let file = match File::open(&pipe_path) {
         Ok(f) => f,
         Err(e) => {
-            warn!("Could not open {}: {}. Tracepoint stream unavailable.", pipe_path.display(), e);
+            warn!(
+                "Could not open {}: {}. Tracepoint stream unavailable.",
+                pipe_path.display(),
+                e
+            );
             return;
         }
     };
@@ -380,7 +414,10 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
         // 1. sched_process_fork
         if line.contains("sched_process_fork:") {
             if let Some(c_idx) = line.find("child_pid=") {
-                let child_str = line[c_idx + 10..].split_whitespace().next().unwrap_or_default();
+                let child_str = line[c_idx + 10..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
                 let p_opt = if let Some(pp_idx) = line.find("parent_pid=") {
                     line[pp_idx + 11..].split_whitespace().next()
                 } else if let Some(p_idx) = line[..c_idx].rfind(" pid=") {
@@ -393,7 +430,10 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
 
                 if let (Some(parent_str), Ok(child_tgid)) = (p_opt, child_str.parse::<u32>()) {
                     if let Ok(parent_tgid) = parent_str.parse::<u32>() {
-                        let _ = tx.blocking_send(EbpfEvent::ProcessFork { parent_tgid, child_tgid });
+                        let _ = tx.blocking_send(EbpfEvent::ProcessFork {
+                            parent_tgid,
+                            child_tgid,
+                        });
                     }
                 }
             }
@@ -404,9 +444,15 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
                 let filename = if let Some(space_idx) = line[f_idx + 9..].find(" pid=") {
                     &line[f_idx + 9..f_idx + 9 + space_idx]
                 } else {
-                    line[f_idx + 9..].split_whitespace().next().unwrap_or_default()
+                    line[f_idx + 9..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
                 };
-                let pid_str = line[p_idx + 5..].split_whitespace().next().unwrap_or_default();
+                let pid_str = line[p_idx + 5..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
                 if let Ok(tgid) = pid_str.parse::<u32>() {
                     let cmdline_path = format!("/proc/{}/cmdline", tgid);
                     let cmdline = if let Ok(bytes) = std::fs::read(&cmdline_path) {
@@ -446,13 +492,19 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
             };
 
             let dport_opt = if let Some(dp_idx) = line.find("dport=") {
-                line[dp_idx + 6..].split_whitespace().next().and_then(|s| s.parse::<u16>().ok())
+                line[dp_idx + 6..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u16>().ok())
             } else {
                 None
             };
 
             let daddr_opt = if let Some(da_idx) = line.find("daddr=") {
-                line[da_idx + 6..].split_whitespace().next().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                line[da_idx + 6..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
             } else {
                 None
             };
@@ -490,7 +542,12 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
 fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
     use std::ffi::CString;
 
-    let fan_fd = unsafe { libc::fanotify_init(libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC, libc::O_RDONLY as u32) };
+    let fan_fd = unsafe {
+        libc::fanotify_init(
+            libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC,
+            libc::O_RDONLY as u32,
+        )
+    };
     if fan_fd < 0 {
         warn!("fanotify_init failed. File access monitoring running in passive mode.");
         return;
@@ -529,7 +586,10 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
         }
     }
 
-    info!("fanotify secret monitor active (marked {} targets).", marked);
+    info!(
+        "fanotify secret monitor active (marked {} targets).",
+        marked
+    );
 
     let mut buf = vec![0u8; 8192];
     loop {
@@ -540,9 +600,8 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
 
         let mut offset = 0;
         while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= n as usize {
-            let meta = unsafe {
-                &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata)
-            };
+            let meta =
+                unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
             if meta.event_len == 0 {
                 break;
             }
@@ -557,7 +616,10 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
 
-                    if let Some(_cat) = crate::programs::file_open::simulate_file_open_check(&path_str, &current_exe) {
+                    if let Some(_cat) = crate::programs::file_open::simulate_file_open_check(
+                        &path_str,
+                        &current_exe,
+                    ) {
                         // Extract parent PID and group leader (PGID) to ensure taint links to parent script
                         let mut ppid = 0;
                         let mut pgrp = 0;
@@ -581,7 +643,11 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                                 .and_then(|s| {
                                     for line in s.lines() {
                                         if line.starts_with("PPid:") {
-                                            return line.split_whitespace().nth(1)?.parse::<u32>().ok();
+                                            return line
+                                                .split_whitespace()
+                                                .nth(1)?
+                                                .parse::<u32>()
+                                                .ok();
                                         }
                                     }
                                     None
@@ -661,10 +727,7 @@ pub fn verify_kernel_version_safe(release_str: &str, min_version: &str) -> bool 
         None => return true,
     };
 
-    let min = match parse_ver(min_version) {
-        Some(v) => v,
-        None => (6, 1),
-    };
+    let min = parse_ver(min_version).unwrap_or((6, 1));
 
     actual >= min
 }

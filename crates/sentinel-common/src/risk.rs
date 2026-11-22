@@ -77,6 +77,25 @@ impl RuleId {
             RuleId::TrustedPackageContext => "TRUSTED_PACKAGE_CONTEXT",
         }
     }
+
+    /// Returns the MITRE ATT&CK technique ID corresponding to this rule.
+    pub fn mitre_attck(&self) -> &'static str {
+        match self {
+            RuleId::SecretNonOwner => "T1003",
+            RuleId::FastExfilBurst => "T1048.003",
+            RuleId::UntrustedBinaryOrigin => "T1204.002",
+            RuleId::FilelessMemfd => "T1620",
+            RuleId::FilelessAnonExec => "T1620",
+            RuleId::SuspiciousInterpreter => "T1059",
+            RuleId::SuspiciousScriptExecution => "T1059",
+            RuleId::RawIpConnect => "T1071",
+            RuleId::FirstSeenDestination => "T1071",
+            RuleId::TofuTamperedBinary => "T1554",
+            RuleId::IpcTaintLaunder => "T1055.008",
+            RuleId::CovertDnsTunnel => "T1071.004",
+            RuleId::TrustedPackageContext => "T1036",
+        }
+    }
 }
 
 impl fmt::Display for RuleId {
@@ -91,6 +110,13 @@ pub struct RuleFiring {
     pub rule_id: RuleId,
     pub weight: i32,
     pub reason: String,
+}
+
+impl RuleFiring {
+    /// Returns the MITRE ATT&CK technique ID for this firing.
+    pub fn mitre_attck(&self) -> &'static str {
+        self.rule_id.mitre_attck()
+    }
 }
 
 /// Confidence level for evidence causation (TASK-P1-16).
@@ -126,7 +152,9 @@ impl EvidenceEvaluation {
     /// Strict criterion for automated process termination:
     /// Impact == Critical && Confidence >= High && confirmed_propagation == true
     pub fn allows_auto_termination(&self) -> bool {
-        self.impact == Impact::Critical && self.confidence >= Confidence::High && self.confirmed_propagation
+        self.impact == Impact::Critical
+            && self.confidence >= Confidence::High
+            && self.confirmed_propagation
     }
 }
 

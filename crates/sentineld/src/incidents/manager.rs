@@ -7,12 +7,12 @@ use std::sync::{Arc, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
-use sentinel_common::ipc::LineageStep;
-use sentinel_common::policy::PolicyAction;
-use sentinel_common::risk::{RuleFiring, SeverityLevel, Verdict};
 use crate::collector::ProcessKey;
 use crate::incidents::correlator::IncidentCorrelator;
 use crate::storage::{StorageManager, StoredIncidentRecord};
+use sentinel_common::ipc::LineageStep;
+use sentinel_common::policy::PolicyAction;
+use sentinel_common::risk::{RuleFiring, SeverityLevel, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncidentStatus {
@@ -83,6 +83,7 @@ impl IncidentManager {
     }
 
     /// Record a security event firing, either creating a new incident or correlating with an existing one.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_threat(
         &self,
         process_key: ProcessKey,
@@ -94,9 +95,9 @@ impl IncidentManager {
         human_summary: String,
         event_id: Option<String>,
     ) -> String {
-        let (incident_id, is_new) = self.correlator.correlate_or_create(&process_key, || {
-            Uuid::new_v4().to_string()
-        });
+        let (incident_id, is_new) = self
+            .correlator
+            .correlate_or_create(&process_key, || Uuid::new_v4().to_string());
 
         let now = Utc::now();
         let mut map = self.active_incidents.write().unwrap();
@@ -145,7 +146,10 @@ impl IncidentManager {
             }
 
             map.insert(incident_id.clone(), incident);
-            info!("Created new EDR incident: {} (risk={})", incident_id, risk_score);
+            info!(
+                "Created new EDR incident: {} (risk={})",
+                incident_id, risk_score
+            );
         } else if let Some(inc) = map.get_mut(&incident_id) {
             inc.updated_at = now;
             if risk_score > inc.risk_score {
@@ -160,7 +164,10 @@ impl IncidentManager {
                     }
                 }
             }
-            info!("Correlated threat event into active incident {}", incident_id);
+            info!(
+                "Correlated threat event into active incident {}",
+                incident_id
+            );
         }
 
         incident_id

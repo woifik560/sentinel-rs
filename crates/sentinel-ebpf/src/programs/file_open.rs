@@ -33,13 +33,15 @@ impl Default for FileOpenHookConfig {
 }
 
 /// Simulation helper for validating file_open events in user-space testing and runtime.
-pub fn simulate_file_open_check(
-    path_str: &str,
-    current_exe: &str,
-) -> Option<SecretCategory> {
+pub fn simulate_file_open_check(path_str: &str, current_exe: &str) -> Option<SecretCategory> {
     // 0. Cross-process /proc/<pid>/environ or /proc/<pid>/mem snooping
-    if path_str.starts_with("/proc/") && (path_str.ends_with("/environ") || path_str.ends_with("/mem")) {
-        return Some(SecretCategory::Other(format!("Cross-Process Secret Snoop: {}", path_str)));
+    if path_str.starts_with("/proc/")
+        && (path_str.ends_with("/environ") || path_str.ends_with("/mem"))
+    {
+        return Some(SecretCategory::Other(format!(
+            "Cross-Process Secret Snoop: {}",
+            path_str
+        )));
     }
 
     // 1. Enforce Taint Hygiene: Ignore non-private files (.pub, config, known_hosts)
@@ -48,16 +50,16 @@ pub fn simulate_file_open_check(
     }
 
     // 2. SSH Keys App Scope validation
-    if path_str.contains("/.ssh/") || (path_str.starts_with("/etc/ssh/ssh_host_") && path_str.ends_with("_key")) {
-        if !current_exe.ends_with("/ssh")
-            && !current_exe.ends_with("/scp")
-            && !current_exe.ends_with("/ssh-add")
-            && !current_exe.ends_with("/sftp")
-            && !current_exe.ends_with("/sshd")
-            && !current_exe.ends_with("/git")
-        {
-            return Some(SecretCategory::SshKey);
-        }
+    if (path_str.contains("/.ssh/")
+        || (path_str.starts_with("/etc/ssh/ssh_host_") && path_str.ends_with("_key")))
+        && !current_exe.ends_with("/ssh")
+        && !current_exe.ends_with("/scp")
+        && !current_exe.ends_with("/ssh-add")
+        && !current_exe.ends_with("/sftp")
+        && !current_exe.ends_with("/sshd")
+        && !current_exe.ends_with("/git")
+    {
+        return Some(SecretCategory::SshKey);
     }
 
     // 2b. Developer & Cloud credentials App Scope validation
@@ -85,7 +87,10 @@ pub fn simulate_file_open_check(
     }
 
     // 2c. Shell history App Scope validation
-    if path_str.ends_with("/.bash_history") || path_str.ends_with("/.zsh_history") || path_str.ends_with("/.histfile") {
+    if path_str.ends_with("/.bash_history")
+        || path_str.ends_with("/.zsh_history")
+        || path_str.ends_with("/.histfile")
+    {
         let exe_name = current_exe.rsplit('/').next().unwrap_or(current_exe);
         if exe_name != "bash" && exe_name != "zsh" {
             return Some(SecretCategory::Other("ShellHistory".to_string()));
@@ -93,26 +98,32 @@ pub fn simulate_file_open_check(
     }
 
     // 3. GPG Keys App Scope validation
-    if path_str.contains("/.gnupg/") {
-        if !current_exe.ends_with("/gpg")
-            && !current_exe.ends_with("/gpg-agent")
-            && !current_exe.ends_with("/gpg2")
-        {
-            return Some(SecretCategory::GpgKey);
-        }
+    if path_str.contains("/.gnupg/")
+        && !current_exe.ends_with("/gpg")
+        && !current_exe.ends_with("/gpg-agent")
+        && !current_exe.ends_with("/gpg2")
+    {
+        return Some(SecretCategory::GpgKey);
     }
 
     // 4. Telegram Desktop App Scope validation
-    if path_str.contains("/TelegramDesktop/tdata") {
-        if !current_exe.ends_with("/Telegram") && !current_exe.ends_with("/telegram-desktop") {
-            return Some(SecretCategory::TelegramData);
-        }
+    if path_str.contains("/TelegramDesktop/tdata")
+        && !current_exe.ends_with("/Telegram")
+        && !current_exe.ends_with("/telegram-desktop")
+    {
+        return Some(SecretCategory::TelegramData);
     }
 
     // 5. Browser Credentials App Scope validation
-    if path_str.contains("cookies.sqlite") || path_str.contains("/Cookies") || path_str.contains("/Login Data") {
+    if path_str.contains("cookies.sqlite")
+        || path_str.contains("/Cookies")
+        || path_str.contains("/Login Data")
+    {
         // Exclude Steam internal CEF caches and game runtime data
-        if path_str.contains("/Steam/") || path_str.contains("/.steam/") || path_str.contains("/steamapps/") {
+        if path_str.contains("/Steam/")
+            || path_str.contains("/.steam/")
+            || path_str.contains("/steamapps/")
+        {
             return None;
         }
 
@@ -140,10 +151,14 @@ pub fn simulate_file_open_check(
     }
 
     // 7. Cloud Credentials App Scope validation
-    if path_str.contains("/.aws/") || path_str.contains("/.kube/") || path_str.contains("/.config/gcloud/") {
-        if !current_exe.ends_with("/aws") && !current_exe.ends_with("/kubectl") && !current_exe.ends_with("/gcloud") {
-            return Some(SecretCategory::CloudCredentials);
-        }
+    if (path_str.contains("/.aws/")
+        || path_str.contains("/.kube/")
+        || path_str.contains("/.config/gcloud/"))
+        && !current_exe.ends_with("/aws")
+        && !current_exe.ends_with("/kubectl")
+        && !current_exe.ends_with("/gcloud")
+    {
+        return Some(SecretCategory::CloudCredentials);
     }
 
     None

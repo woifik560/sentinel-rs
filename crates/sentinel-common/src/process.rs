@@ -75,19 +75,14 @@ impl ProcessIdentity {
 }
 
 /// Typed taint propagation levels (TASK-P1-13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum TaintLevel {
+    #[default]
     None,
     Observed,
     SensitiveAccess,
     SuspectedPropagation,
     ConfirmedPropagation,
-}
-
-impl Default for TaintLevel {
-    fn default() -> Self {
-        TaintLevel::None
-    }
 }
 
 /// Typed sensitive secret sources.
@@ -244,7 +239,12 @@ impl ProcessNode {
     }
 
     /// Record a secret access on this process node.
-    pub fn record_secret_access(&mut self, path: PathBuf, category: SecretCategory, timestamp_ns: u64) {
+    pub fn record_secret_access(
+        &mut self,
+        path: PathBuf,
+        category: SecretCategory,
+        timestamp_ns: u64,
+    ) {
         self.secret_accesses.push(SecretAccessEvent {
             path,
             category,
@@ -275,7 +275,16 @@ impl ProcessNode {
         if let Some(name) = self.exe_path.file_name().and_then(|n| n.to_str()) {
             matches!(
                 name,
-                "python3" | "python" | "bash" | "sh" | "zsh" | "dash" | "node" | "perl" | "ruby" | "php"
+                "python3"
+                    | "python"
+                    | "bash"
+                    | "sh"
+                    | "zsh"
+                    | "dash"
+                    | "node"
+                    | "perl"
+                    | "ruby"
+                    | "php"
             )
         } else {
             false
@@ -298,7 +307,10 @@ impl ProcessNode {
     /// Check if the executable is located in a privileged system path (/usr/, /opt/, /bin/, /lib/).
     pub fn is_system_path(&self) -> bool {
         let s = self.exe_path.to_string_lossy();
-        s.starts_with("/usr/") || s.starts_with("/opt/") || s.starts_with("/bin/") || s.starts_with("/lib/")
+        s.starts_with("/usr/")
+            || s.starts_with("/opt/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/lib/")
     }
 
     /// Extract canonical ProcessIdentity for this process node.

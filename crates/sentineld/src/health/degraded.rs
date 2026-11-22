@@ -1,8 +1,8 @@
 //! Degraded operational states detection and tracking with FailurePolicyManager.
 
+use sentinel_common::health::AgentState;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
-use sentinel_common::health::AgentState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DegradedReason {

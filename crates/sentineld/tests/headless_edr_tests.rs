@@ -5,7 +5,6 @@
 //! 4. Incident management & temporal correlation.
 //! 5. Autonomous defensive response orchestrator.
 
-use std::path::PathBuf;
 use sentinel_common::policy::{OperatingMode, PolicyAction};
 use sentinel_common::risk::{RuleFiring, RuleId};
 use sentineld::incidents::manager::{IncidentManager, IncidentStatus};
@@ -13,6 +12,7 @@ use sentineld::lineage::ProcessKey as LineageKey;
 use sentineld::policy::{PolicyContext, PolicyEngine, PolicyRule, RuleCondition};
 use sentineld::response::process_term::verify_process_identity;
 use sentineld::risk::{AttackStage, EvidenceAggregator, RiskAssessment};
+use std::path::PathBuf;
 
 #[test]
 fn test_pid_reuse_protection_mechanisms() {
@@ -53,13 +53,23 @@ fn test_six_stage_policy_precedence() {
     assert_eq!(decision.rule_id, Some("SAFETY_CRITICAL_PID".into()));
 
     // 2. Immutable Safety Constraint: Sentinel daemon must ALWAYS be allowed
-    let daemon_ctx = PolicyContext::new(LineageKey::new(4500, 200), PathBuf::from("/usr/local/bin/sentineld"), 0, 0);
+    let daemon_ctx = PolicyContext::new(
+        LineageKey::new(4500, 200),
+        PathBuf::from("/usr/local/bin/sentineld"),
+        0,
+        0,
+    );
     let decision = engine.evaluate(&daemon_ctx);
     assert_eq!(decision.action, PolicyAction::Allow);
     assert_eq!(decision.rule_id, Some("SAFETY_AGENT_SELF".into()));
 
     // 3. Protected System Resource: Non-root accessing /etc/sentinel
-    let tampered_ctx = PolicyContext::new(LineageKey::new(5100, 300), PathBuf::from("/etc/sentinel/evil.sh"), 1000, 1000);
+    let tampered_ctx = PolicyContext::new(
+        LineageKey::new(5100, 300),
+        PathBuf::from("/etc/sentinel/evil.sh"),
+        1000,
+        1000,
+    );
     let decision = engine.evaluate(&tampered_ctx);
     assert_eq!(decision.action, PolicyAction::Deny);
     assert_eq!(decision.rule_id, Some("PROTECTED_SYSTEM_RESOURCE".into()));
@@ -75,7 +85,12 @@ fn test_six_stage_policy_precedence() {
     };
     engine.add_deny_rule(deny_rule);
 
-    let evil_ctx = PolicyContext::new(LineageKey::new(6000, 400), PathBuf::from("/opt/evil/backdoor"), 1000, 1000);
+    let evil_ctx = PolicyContext::new(
+        LineageKey::new(6000, 400),
+        PathBuf::from("/opt/evil/backdoor"),
+        1000,
+        1000,
+    );
     let decision = engine.evaluate(&evil_ctx);
     assert_eq!(decision.action, PolicyAction::TerminateProcess);
     assert_eq!(decision.policy_id, Some("DENY_TEST".into()));
@@ -84,7 +99,12 @@ fn test_six_stage_policy_precedence() {
 #[test]
 fn test_operating_mode_autonomous_verdicts() {
     let engine = PolicyEngine::new(OperatingMode::Audit);
-    let mut ctx = PolicyContext::new(LineageKey::new(7000, 500), PathBuf::from("/tmp/miner"), 1000, 1000);
+    let mut ctx = PolicyContext::new(
+        LineageKey::new(7000, 500),
+        PathBuf::from("/tmp/miner"),
+        1000,
+        1000,
+    );
     ctx.risk = Some(RiskAssessment::new(85, Vec::new()));
 
     // Audit mode never blocks
@@ -98,7 +118,12 @@ fn test_operating_mode_autonomous_verdicts() {
 
     // Strict mode isolates medium risk and kills lower thresholds (> 50)
     engine.set_mode(OperatingMode::Strict);
-    let mut medium_ctx = PolicyContext::new(LineageKey::new(7001, 501), PathBuf::from("/tmp/script"), 1000, 1000);
+    let mut medium_ctx = PolicyContext::new(
+        LineageKey::new(7001, 501),
+        PathBuf::from("/tmp/script"),
+        1000,
+        1000,
+    );
     medium_ctx.risk = Some(RiskAssessment::new(55, Vec::new()));
     let decision = engine.evaluate(&medium_ctx);
     assert_eq!(decision.action, PolicyAction::TerminateProcess);

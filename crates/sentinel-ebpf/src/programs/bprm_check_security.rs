@@ -16,12 +16,12 @@
 //!
 //! 3. Submits `RawBprmCheckSecurityEvent` to the RingBuffer.
 
-use std::path::Path;
+use crate::maps::TaintMapManager;
 use sentinel_common::events::{RawBprmCheckSecurityEvent, MAX_PATH_LEN};
 use sentinel_common::process::{
     PROFILE_FILELESS_MEMFD, PROFILE_INTERPRETER, PROFILE_TRUSTED_PKG, PROFILE_UNTRUSTED_ORIGIN,
 };
-use crate::maps::TaintMapManager;
+use std::path::Path;
 
 /// Evaluates bprm execution check with kernel INODE_STORAGE cache and baseline profile.
 pub fn evaluate_bprm_security(
@@ -64,9 +64,16 @@ pub fn is_memfd_or_fileless(path_str: &str) -> bool {
 }
 
 /// Kernel-level check at execve time: prevents launching sentineld or sntctl with malicious LD_PRELOAD or LD_AUDIT.
-pub fn check_daemon_secure_bprm(exe_path: &Path, envp_entries: &[&str]) -> Result<(), &'static str> {
+pub fn check_daemon_secure_bprm(
+    exe_path: &Path,
+    envp_entries: &[&str],
+) -> Result<(), &'static str> {
     let path_str = exe_path.to_string_lossy();
-    if path_str.ends_with("/sentineld") || path_str == "sentineld" || path_str.ends_with("/sntctl") || path_str == "sntctl" {
+    if path_str.ends_with("/sentineld")
+        || path_str == "sentineld"
+        || path_str.ends_with("/sntctl")
+        || path_str == "sntctl"
+    {
         for entry in envp_entries {
             if entry.starts_with("LD_PRELOAD=") && entry.len() > "LD_PRELOAD=".len() {
                 return Err("-EPERM: LD_PRELOAD forbidden on sentinel binaries");

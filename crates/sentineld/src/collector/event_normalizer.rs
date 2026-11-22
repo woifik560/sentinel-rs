@@ -126,7 +126,11 @@ impl EventNormalizer {
         let timestamp = Utc::now();
 
         match event {
-            EbpfEvent::ProcessExec { tgid, exe_path, cmdline } => {
+            EbpfEvent::ProcessExec {
+                tgid,
+                exe_path,
+                cmdline,
+            } => {
                 let is_memfd = exe_path.to_string_lossy().contains("memfd");
                 let key = ProcessKey::new(tgid, start_time_ns);
                 NormalizedEvent {
@@ -150,7 +154,10 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::ProcessFork { parent_tgid, child_tgid } => {
+            EbpfEvent::ProcessFork {
+                parent_tgid,
+                child_tgid,
+            } => {
                 let key = ProcessKey::new(child_tgid, start_time_ns);
                 let parent_key = ProcessKey::new(parent_tgid, 0);
                 NormalizedEvent {
@@ -166,11 +173,21 @@ impl EventNormalizer {
                     exe_path: None,
                     exe_hash: None,
                     parent_key: Some(parent_key),
-                    details: EventDetails::ProcessFork { parent_tgid, child_tgid },
+                    details: EventDetails::ProcessFork {
+                        parent_tgid,
+                        child_tgid,
+                    },
                 }
             }
 
-            EbpfEvent::FileOpen { tgid, uid, path, dev, ino, flags } => {
+            EbpfEvent::FileOpen {
+                tgid,
+                uid,
+                path,
+                dev,
+                ino,
+                flags,
+            } => {
                 let key = ProcessKey::new(tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -185,11 +202,24 @@ impl EventNormalizer {
                     exe_path: None,
                     exe_hash: None,
                     parent_key: None,
-                    details: EventDetails::FileOpen { path, flags, dev, ino },
+                    details: EventDetails::FileOpen {
+                        path,
+                        flags,
+                        dev,
+                        ino,
+                    },
                 }
             }
 
-            EbpfEvent::FilePermission { tgid, uid, path, mask, is_pipe, is_fifo, .. } => {
+            EbpfEvent::FilePermission {
+                tgid,
+                uid,
+                path,
+                mask,
+                is_pipe,
+                is_fifo,
+                ..
+            } => {
                 let key = ProcessKey::new(tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -204,11 +234,22 @@ impl EventNormalizer {
                     exe_path: None,
                     exe_hash: None,
                     parent_key: None,
-                    details: EventDetails::FilePermission { path, mask, is_pipe, is_fifo },
+                    details: EventDetails::FilePermission {
+                        path,
+                        mask,
+                        is_pipe,
+                        is_fifo,
+                    },
                 }
             }
 
-            EbpfEvent::BprmCheckSecurity { tgid, uid, exe_path, is_memfd, .. } => {
+            EbpfEvent::BprmCheckSecurity {
+                tgid,
+                uid,
+                exe_path,
+                is_memfd,
+                ..
+            } => {
                 let key = ProcessKey::new(tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -301,7 +342,12 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::UnixMaySend { sender_tgid, receiver_tgid, sock_path, is_blocked } => {
+            EbpfEvent::UnixMaySend {
+                sender_tgid,
+                receiver_tgid,
+                sock_path,
+                is_blocked,
+            } => {
                 let key = ProcessKey::new(sender_tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -325,7 +371,12 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::PtraceAccessCheck { tracer_tgid, tracee_tgid, mode, is_blocked } => {
+            EbpfEvent::PtraceAccessCheck {
+                tracer_tgid,
+                tracee_tgid,
+                mode,
+                is_blocked,
+            } => {
                 let key = ProcessKey::new(tracer_tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -349,7 +400,12 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::ProcEnvironAccess { reader_tgid, target_tgid, path: _path, is_blocked } => {
+            EbpfEvent::ProcEnvironAccess {
+                reader_tgid,
+                target_tgid,
+                path: _path,
+                is_blocked,
+            } => {
                 let key = ProcessKey::new(reader_tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -373,7 +429,16 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::MmapFile { tgid, uid, path, prot, flags, is_secret, is_exec, .. } => {
+            EbpfEvent::MmapFile {
+                tgid,
+                uid,
+                path,
+                prot,
+                flags,
+                is_secret,
+                is_exec,
+                ..
+            } => {
                 let key = ProcessKey::new(tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -398,7 +463,13 @@ impl EventNormalizer {
                 }
             }
 
-            EbpfEvent::FileReceive { receiver_tgid, sender_tgid, path, is_tainted, .. } => {
+            EbpfEvent::FileReceive {
+                receiver_tgid,
+                sender_tgid,
+                path,
+                is_tainted,
+                ..
+            } => {
                 let key = ProcessKey::new(receiver_tgid, start_time_ns);
                 NormalizedEvent {
                     event_id,
@@ -437,7 +508,8 @@ impl EventNormalizer {
                 if bytes.len() < std::mem::size_of::<RawFileOpenEvent>() {
                     return None;
                 }
-                let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawFileOpenEvent) };
+                let raw =
+                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawFileOpenEvent) };
                 let len = (raw.path_len as usize).min(raw.path.len());
                 let path_str = String::from_utf8_lossy(&raw.path[..len]).to_string();
                 let path = PathBuf::from(path_str);
@@ -468,7 +540,9 @@ impl EventNormalizer {
                 if bytes.len() < std::mem::size_of::<RawProcessForkEvent>() {
                     return None;
                 }
-                let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawProcessForkEvent) };
+                let raw = unsafe {
+                    std::ptr::read_unaligned(bytes.as_ptr() as *const RawProcessForkEvent)
+                };
                 let key = ProcessKey::new(raw.child_tgid, 0);
                 Some(NormalizedEvent {
                     event_id,
@@ -521,12 +595,18 @@ mod tests {
             )
         };
 
-        let normalized = EventNormalizer::normalize_raw_bytes(EVENT_TYPE_FILE_OPEN, bytes).expect("Failed to normalize raw bytes");
+        let normalized = EventNormalizer::normalize_raw_bytes(EVENT_TYPE_FILE_OPEN, bytes)
+            .expect("Failed to normalize raw bytes");
         assert_eq!(normalized.event_type, NormalizedEventType::FileOpen);
         assert_eq!(normalized.pid, 1234);
         assert_eq!(normalized.tgid, 1234);
         match normalized.details {
-            EventDetails::FileOpen { path, flags, dev, ino } => {
+            EventDetails::FileOpen {
+                path,
+                flags,
+                dev,
+                ino,
+            } => {
                 assert_eq!(path, PathBuf::from("/etc/shadow"));
                 assert_eq!(flags, 0o644);
                 assert_eq!(dev, 2049);

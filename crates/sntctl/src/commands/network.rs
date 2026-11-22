@@ -1,10 +1,10 @@
 //! `sntctl network` subcommands.
 
-use clap::Subcommand;
-use std::path::Path;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json};
+use clap::Subcommand;
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::Path;
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkAction {
@@ -30,17 +30,23 @@ pub enum NetworkAction {
     Unisolate,
 }
 
-pub async fn run_network(socket_path: &Path, action: NetworkAction, json_output: bool) -> anyhow::Result<()> {
+pub async fn run_network(
+    socket_path: &Path,
+    action: NetworkAction,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let cmd = match &action {
         NetworkAction::Status => IpcCommand::NetworkStatus,
         NetworkAction::Blocked => IpcCommand::NetworkBlocked,
-        NetworkAction::Isolate { tier, timeout, trusted_ssh_ip } => {
-            IpcCommand::NetworkIsolateTimed {
-                tier: tier.clone(),
-                timeout_secs: *timeout,
-                trusted_ssh_ips: trusted_ssh_ip.clone(),
-            }
-        }
+        NetworkAction::Isolate {
+            tier,
+            timeout,
+            trusted_ssh_ip,
+        } => IpcCommand::NetworkIsolateTimed {
+            tier: tier.clone(),
+            timeout_secs: *timeout,
+            trusted_ssh_ips: trusted_ssh_ip.clone(),
+        },
         NetworkAction::ConfirmIsolation => IpcCommand::NetworkConfirmIsolation,
         NetworkAction::Unisolate => IpcCommand::NetworkUnisolate,
     };
@@ -64,7 +70,9 @@ pub async fn run_network(socket_path: &Path, action: NetworkAction, json_output:
                     NetworkAction::ConfirmIsolation => {
                         println!("Network isolation confirmed! Anti-Lockout timer disarmed.");
                     }
-                    NetworkAction::Unisolate => println!("Host network containment successfully released"),
+                    NetworkAction::Unisolate => {
+                        println!("Host network containment successfully released")
+                    }
                     _ => {
                         print_header("Network Protection Status");
                         print_json(&data)?;

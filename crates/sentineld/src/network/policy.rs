@@ -1,8 +1,8 @@
 //! Network safety and policy checkers.
 
+use sentinel_common::config::default_never_freeze_list;
 use std::collections::HashSet;
 use std::path::Path;
-use sentinel_common::config::default_never_freeze_list;
 
 #[derive(Clone, Debug)]
 pub struct NeverFreezeChecker {
@@ -50,10 +50,12 @@ impl NeverFreezeChecker {
             .and_then(|n| n.to_str())
             .unwrap_or_default();
 
-        if exe_name.starts_with("systemd") || exe_name.starts_with("dbus") || exe_name.starts_with("udevd") {
-            if uid == 0 || uid < 1000 {
-                return true;
-            }
+        if (exe_name.starts_with("systemd")
+            || exe_name.starts_with("dbus")
+            || exe_name.starts_with("udevd"))
+            && (uid == 0 || uid < 1000)
+        {
+            return true;
         }
 
         if exe_name == "sntctl" || exe_name == "sentinelctl" || exe_name == "sentineld" {

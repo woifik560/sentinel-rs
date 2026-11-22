@@ -32,7 +32,10 @@ async fn test_incidents_clear_requires_root_admin() {
         PathBuf::from("/etc/sentinel/rules.toml"),
         PathBuf::from("/etc/sentinel/config.toml"),
     )));
-    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(RulesConfig::default(), DpkgChecker::new())));
+    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(
+        RulesConfig::default(),
+        DpkgChecker::new(),
+    )));
 
     // Populate an incident
     incidents.write().await.insert("inc-1".into(), "{}".into());
@@ -47,7 +50,8 @@ async fn test_incidents_clear_requires_root_admin() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
 
     match resp {
         IpcResponse::Error { code, message } => {
@@ -70,7 +74,8 @@ async fn test_incidents_clear_requires_root_admin() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
 
     match resp_op {
         IpcResponse::Error { code, .. } => assert_eq!(code, "EACCES"),
@@ -87,7 +92,8 @@ async fn test_incidents_clear_requires_root_admin() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
 
     match resp_root {
         IpcResponse::Ok(val) => {
@@ -110,7 +116,10 @@ async fn test_protection_toggle_controls_real_state() {
         PathBuf::from("/etc/sentinel/rules.toml"),
         PathBuf::from("/etc/sentinel/config.toml"),
     )));
-    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(RulesConfig::default(), DpkgChecker::new())));
+    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(
+        RulesConfig::default(),
+        DpkgChecker::new(),
+    )));
 
     // Check initial status
     assert!(protection_state.read().await.enabled);
@@ -125,7 +134,8 @@ async fn test_protection_toggle_controls_real_state() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp, IpcResponse::Error { ref code, .. } if code == "EACCES"));
 
     // Root disables protection
@@ -138,7 +148,8 @@ async fn test_protection_toggle_controls_real_state() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp_root, IpcResponse::Ok(ref val) if val["enabled"] == false));
     assert!(!protection_state.read().await.enabled);
 
@@ -152,7 +163,8 @@ async fn test_protection_toggle_controls_real_state() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp_enable, IpcResponse::Ok(ref val) if val["enabled"] == true));
     assert!(protection_state.read().await.enabled);
 }
@@ -168,10 +180,16 @@ async fn test_unsupported_commands_return_enotsup() {
         PathBuf::from("/etc/sentinel/rules.toml"),
         PathBuf::from("/etc/sentinel/config.toml"),
     )));
-    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(RulesConfig::default(), DpkgChecker::new())));
+    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(
+        RulesConfig::default(),
+        DpkgChecker::new(),
+    )));
 
     let resp = sentineld::ipc_server::handle_ipc_command_for_test(
-        IpcCommand::EventsList { limit: None, offset: None },
+        IpcCommand::EventsList {
+            limit: None,
+            offset: None,
+        },
         ClientRole::RootAdmin,
         &freeze,
         &lineage,
@@ -179,7 +197,8 @@ async fn test_unsupported_commands_return_enotsup() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
 
     match resp {
         IpcResponse::Error { code, .. } => assert_eq!(code, "ENOTSUP"),
@@ -205,7 +224,10 @@ fn test_anti_pid_reuse_verification() {
         // Correct PID + mismatching executable path -> MUST return PidReuseDetected
         let wrong_exe = PathBuf::from("/usr/bin/nonexistent_malware");
         let res_exe = verify_process_identity(&valid_key, Some(&wrong_exe));
-        assert!(matches!(res_exe, Err(TerminationError::PidReuseDetected(_))));
+        assert!(matches!(
+            res_exe,
+            Err(TerminationError::PidReuseDetected(_))
+        ));
     }
 }
 
@@ -228,11 +250,17 @@ async fn test_readonly_denied_sensitive_queries() {
         PathBuf::from("/etc/sentinel/rules.toml"),
         PathBuf::from("/etc/sentinel/config.toml"),
     )));
-    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(RulesConfig::default(), DpkgChecker::new())));
+    let risk_engine = Arc::new(RwLock::new(RiskEngine::new(
+        RulesConfig::default(),
+        DpkgChecker::new(),
+    )));
 
     // 1. ReadOnly client attempts IncidentsList -> MUST return EACCES
     let resp = sentineld::ipc_server::handle_ipc_command_for_test(
-        IpcCommand::IncidentsList { limit: None, offset: None },
+        IpcCommand::IncidentsList {
+            limit: None,
+            offset: None,
+        },
         ClientRole::ReadOnly,
         &freeze,
         &lineage,
@@ -240,7 +268,8 @@ async fn test_readonly_denied_sensitive_queries() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp, IpcResponse::Error { ref code, .. } if code == "EACCES"));
 
     // 2. ReadOnly client attempts ProcessLineage -> MUST return EACCES
@@ -253,7 +282,8 @@ async fn test_readonly_denied_sensitive_queries() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp_lineage, IpcResponse::Error { ref code, .. } if code == "EACCES"));
 
     // 3. ReadOnly client attempts PolicyList -> MUST return EACCES
@@ -266,12 +296,16 @@ async fn test_readonly_denied_sensitive_queries() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp_policy, IpcResponse::Error { ref code, .. } if code == "EACCES"));
 
     // 4. Operator client is permitted to query incidents
     let resp_op = sentineld::ipc_server::handle_ipc_command_for_test(
-        IpcCommand::IncidentsList { limit: None, offset: None },
+        IpcCommand::IncidentsList {
+            limit: None,
+            offset: None,
+        },
         ClientRole::Operator,
         &freeze,
         &lineage,
@@ -279,7 +313,8 @@ async fn test_readonly_denied_sensitive_queries() {
         &protection_state,
         Some(&risk_engine),
         None,
-    ).await;
+    )
+    .await;
     assert!(matches!(resp_op, IpcResponse::Ok(_)));
 }
 
@@ -304,7 +339,8 @@ fn test_nftables_syntax_generator_correctness() {
     assert!(restricted_script.contains("192.168.1.50"));
 
     // Selective Isolation
-    let selective_script = NftablesManager::generate_isolation_script(IsolationTier::Selective, &[]);
+    let selective_script =
+        NftablesManager::generate_isolation_script(IsolationTier::Selective, &[]);
     assert!(selective_script.contains("blocked_v4"));
     assert!(selective_script.contains("blocked_v6"));
 }
@@ -319,21 +355,38 @@ async fn test_network_anti_lockout_confirm_state() {
     assert_eq!(*net_mgr.isolation_tier.read().await, IsolationTier::None);
     // Confirm when not isolated must return error
     let unisolated_err = net_mgr.confirm_isolation().await;
-    assert!(unisolated_err.is_err(), "Confirming isolation while not isolated must fail");
+    assert!(
+        unisolated_err.is_err(),
+        "Confirming isolation while not isolated must fail"
+    );
 
     // Simulate active isolation and timer
     *net_mgr.isolation_tier.write().await = IsolationTier::FullIsolation;
-    net_mgr.isolation_timer_active.store(true, std::sync::atomic::Ordering::SeqCst);
-    net_mgr.isolation_confirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+    net_mgr
+        .isolation_timer_active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    net_mgr
+        .isolation_confirmed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     // Operator confirms isolation
-    let confirmed = net_mgr.confirm_isolation().await.expect("Failed to confirm isolation");
+    let confirmed = net_mgr
+        .confirm_isolation()
+        .await
+        .expect("Failed to confirm isolation");
     assert!(confirmed);
-    assert!(net_mgr.isolation_confirmed.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!net_mgr.isolation_timer_active.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(net_mgr
+        .isolation_confirmed
+        .load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!net_mgr
+        .isolation_timer_active
+        .load(std::sync::atomic::Ordering::SeqCst));
 
     // Second confirmation returns false (already confirmed/disarmed)
-    let second_confirm = net_mgr.confirm_isolation().await.expect("Failed second confirm");
+    let second_confirm = net_mgr
+        .confirm_isolation()
+        .await
+        .expect("Failed second confirm");
     assert!(!second_confirm);
 }
 
@@ -343,7 +396,10 @@ fn test_missing_start_time_fails_closed() {
     let key_missing_ticks = ProcessKey::new(current_pid, 0);
     // Without alternative identity, 0 ticks must fail closed
     let result = verify_process_identity(&key_missing_ticks, None);
-    assert!(result.is_err(), "Zero start time ticks must fail closed without alternative identity");
+    assert!(
+        result.is_err(),
+        "Zero start time ticks must fail closed without alternative identity"
+    );
 }
 
 #[test]
@@ -354,7 +410,11 @@ fn test_selective_isolation_policy_blocks_designated_targets() {
     policy.blocked_ips.push("203.0.113.5".parse().unwrap());
     policy.blocked_ports.push(4444);
 
-    let script = NftablesManager::generate_isolation_script_with_policy(IsolationTier::Selective, &[], &policy);
+    let script = NftablesManager::generate_isolation_script_with_policy(
+        IsolationTier::Selective,
+        &[],
+        &policy,
+    );
     assert!(script.contains("203.0.113.5"));
     assert!(script.contains("tcp dport 4444 counter drop"));
     assert!(script.contains("udp dport 4444 counter drop"));
@@ -389,6 +449,6 @@ async fn test_privileged_helper_rejection_for_unauthorized_user() {
     assert!(matches!(res_foreign, PrivilegedResult::Error { ref code, .. } if code == "EPERM"));
 
     // Test that targeting PID 1 is rejected
-    let res_pid1 = PrivilegedExecutor::signal_process(1, libc::SIGTERM);
+    let res_pid1 = PrivilegedExecutor::signal_process(1, libc::SIGTERM, None, None);
     assert!(matches!(res_pid1, PrivilegedResult::Error { ref code, .. } if code == "EPERM"));
 }

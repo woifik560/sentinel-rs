@@ -25,11 +25,12 @@
 //!    - Ignores pseudo-terminals (`/dev/pts/*`), `/dev/null`, system log files,
 //!      and GUI session sockets (Wayland/X11) to avoid over-tainting the desktop environment.
 
-use std::path::Path;
-use sentinel_common::events::{RawFilePermissionEvent, MAX_PATH_LEN};
 use crate::maps::{TaintFlags, TaintMapManager};
+use sentinel_common::events::{RawFilePermissionEvent, MAX_PATH_LEN};
+use std::path::Path;
 
 /// Evaluates a `file_permission` hook invocation in userspace or simulation.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_file_permission(
     manager: &TaintMapManager,
     tgid: u32,
@@ -44,6 +45,7 @@ pub fn evaluate_file_permission(
 }
 
 /// Helper to format raw permission event for testing and RingBuffer simulation.
+#[allow(clippy::too_many_arguments)]
 pub fn create_raw_permission_event(
     tgid: u32,
     uid: u32,

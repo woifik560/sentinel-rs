@@ -1,7 +1,7 @@
 //! Policy rule definitions and match conditions.
 
-use serde::{Deserialize, Serialize};
 use sentinel_common::policy::PolicyAction;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,7 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
+    #[allow(clippy::too_many_arguments)]
     pub fn matches(
         &self,
         exe_path: &Path,
@@ -84,7 +85,10 @@ impl PolicyRule {
                 }
                 RuleCondition::DestDomainMatches(pattern) => {
                     if let Some(domain) = dest_domain {
-                        if domain != pattern && !domain.ends_with(&format!(".{}", pattern)) && pattern != "*" {
+                        if domain != pattern
+                            && !domain.ends_with(&format!(".{}", pattern))
+                            && pattern != "*"
+                        {
                             return false;
                         }
                     } else {

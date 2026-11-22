@@ -23,7 +23,10 @@ pub async fn run_config(action: ConfigAction) -> anyhow::Result<()> {
                 file
             };
 
-            println!("Validating configuration file: {}...", target_path.display());
+            println!(
+                "Validating configuration file: {}...",
+                target_path.display()
+            );
             match sentinel_common::config::SentinelConfig::load_from_file(&target_path) {
                 Ok(_) => {
                     println!("[OK] Configuration file is valid.");

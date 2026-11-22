@@ -173,7 +173,10 @@ impl NfqueueHoldManager {
         let mut map = self.held_packets.write().unwrap();
         if let Some(packet_ids) = map.remove(incident_id) {
             for packet_id in packet_ids {
-                info!("NFQUEUE: Issuing NF_ACCEPT for packet {} (incident {})", packet_id, incident_id);
+                info!(
+                    "NFQUEUE: Issuing NF_ACCEPT for packet {} (incident {})",
+                    packet_id, incident_id
+                );
             }
         }
     }
@@ -183,7 +186,10 @@ impl NfqueueHoldManager {
         let mut map = self.held_packets.write().unwrap();
         if let Some(packet_ids) = map.remove(incident_id) {
             for packet_id in packet_ids {
-                info!("NFQUEUE: Issuing NF_DROP / TCP RST for packet {} (incident {})", packet_id, incident_id);
+                info!(
+                    "NFQUEUE: Issuing NF_DROP / TCP RST for packet {} (incident {})",
+                    packet_id, incident_id
+                );
             }
         }
     }
@@ -202,6 +208,8 @@ pub enum HoldResult {
     QueueFull,
 }
 
+type AggregatedFlowsMap = Arc<RwLock<HashMap<(u32, String, u16), (String, Instant)>>>;
+
 #[derive(Clone)]
 pub struct FreezeInspectOrchestrator {
     timeout: Duration,
@@ -211,7 +219,7 @@ pub struct FreezeInspectOrchestrator {
     nfqueue: NfqueueHoldManager,
     frozen_processes: Arc<RwLock<HashMap<u32, Instant>>>,
     pending_prompts: Arc<RwLock<HashMap<String, PendingPrompt>>>,
-    aggregated_flows: Arc<RwLock<HashMap<(u32, String, u16), (String, Instant)>>>,
+    aggregated_flows: AggregatedFlowsMap,
     duration_allowlist: Arc<RwLock<HashMap<u32, Instant>>>,
     host_allowlist: Arc<RwLock<HashMap<u32, HashSet<String>>>>,
 }
@@ -246,18 +254,14 @@ impl FreezeInspectOrchestrator {
         let now = Instant::now();
         {
             let map = self.duration_allowlist.read().unwrap();
-            if let Some(exp) = map.get(&tgid) {
-                if now < *exp {
-                    return true;
-                }
+            if map.get(&tgid).is_some_and(|exp| now < *exp) {
+                return true;
             }
         }
-        if let Some(ref d) = dest {
+        if let Some(d) = dest {
             let map = self.host_allowlist.read().unwrap();
-            if let Some(hosts) = map.get(&tgid) {
-                if hosts.contains(&d.0) {
-                    return true;
-                }
+            if map.get(&tgid).is_some_and(|hosts| hosts.contains(&d.0)) {
+                return true;
             }
         }
         false
@@ -414,22 +418,25 @@ impl FreezeInspectOrchestrator {
             })
             .unwrap_or(uid);
 
-        if self.never_freeze.is_protected(tgid, &real_exe_path, real_uid) {
+        if self
+            .never_freeze
+            .is_protected(tgid, &real_exe_path, real_uid)
+        {
             error!(
                 "NEVER-FREEZE SAFETY: Prevented SIGKILL on protected system process: TGID {} ({})",
-                tgid, real_exe_path.display()
+                tgid,
+                real_exe_path.display()
             );
             return Ok(());
         }
 
         // Retrieve start_time from /proc/<tgid>/stat to build a ProcessKey
         let start_time_ns = match std::fs::read_to_string(format!("/proc/{}/stat", tgid)) {
-            Ok(stat) => {
-                stat.rfind(')')
-                    .and_then(|r| stat[r + 1..].split_whitespace().nth(19))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-            }
+            Ok(stat) => stat
+                .rfind(')')
+                .and_then(|r| stat[r + 1..].split_whitespace().nth(19))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
             Err(_) => 0,
         };
 
@@ -439,7 +446,11 @@ impl FreezeInspectOrchestrator {
         }
 
         let key = crate::lineage::ProcessKey::new(tgid, start_time_ns);
-        match crate::response::safe_terminate_process(&key, Some(&real_exe_path), Duration::from_millis(100)) {
+        match crate::response::safe_terminate_process(
+            &key,
+            Some(&real_exe_path),
+            Duration::from_millis(100),
+        ) {
             Ok(_) => {
                 let mut map = self.frozen_processes.write().unwrap();
                 map.remove(&tgid);
@@ -447,7 +458,11 @@ impl FreezeInspectOrchestrator {
             }
             Err(e) => {
                 error!("Safe termination failed for TGID {}: {}", tgid, e);
-                Err(anyhow::anyhow!("Termination failed for TGID {}: {}", tgid, e))
+                Err(anyhow::anyhow!(
+                    "Termination failed for TGID {}: {}",
+                    tgid,
+                    e
+                ))
             }
         }
     }
@@ -462,7 +477,10 @@ impl FreezeInspectOrchestrator {
         let prompt = match prompt {
             Some(p) => p,
             None => {
-                warn!("Verdict received for unknown or expired incident {}", verdict.incident_id);
+                warn!(
+                    "Verdict received for unknown or expired incident {}",
+                    verdict.incident_id
+                );
                 return Ok(());
             }
         };
@@ -473,31 +491,46 @@ impl FreezeInspectOrchestrator {
                 self.terminate_process(prompt.tgid, &prompt.exe_name, 1000)?;
             }
             PromptAction::DenyOnce => {
-                info!("Denied once for TGID {} (dropping packet with TCP RST)", prompt.tgid);
+                info!(
+                    "Denied once for TGID {} (dropping packet with TCP RST)",
+                    prompt.tgid
+                );
                 self.nfqueue.drop(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
             PromptAction::AllowOnce => {
-                info!("Allowing connection once and releasing packet for TGID {}", prompt.tgid);
+                info!(
+                    "Allowing connection once and releasing packet for TGID {}",
+                    prompt.tgid
+                );
                 self.nfqueue.accept(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
             PromptAction::AllowForDuration { seconds } => {
-                info!("Allowing TGID {} for {} seconds (batch de-duplication)", prompt.tgid, seconds);
+                info!(
+                    "Allowing TGID {} for {} seconds (batch de-duplication)",
+                    prompt.tgid, seconds
+                );
                 let mut map = self.duration_allowlist.write().unwrap();
                 map.insert(prompt.tgid, Instant::now() + Duration::from_secs(seconds));
                 self.nfqueue.accept(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
             PromptAction::AllowHost { ref host } => {
-                info!("Allowing TGID {} to host {} (host de-duplication)", prompt.tgid, host);
+                info!(
+                    "Allowing TGID {} to host {} (host de-duplication)",
+                    prompt.tgid, host
+                );
                 let mut map = self.host_allowlist.write().unwrap();
                 map.entry(prompt.tgid).or_default().insert(host.clone());
                 self.nfqueue.accept(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
             PromptAction::AllowProcess | PromptAction::AllowAppScope => {
-                info!("Allowing process connection and releasing packet for TGID {}", prompt.tgid);
+                info!(
+                    "Allowing process connection and releasing packet for TGID {}",
+                    prompt.tgid
+                );
                 self.nfqueue.accept(&verdict.incident_id);
                 let _ = self.unfreeze_process(prompt.tgid);
             }
@@ -594,19 +627,43 @@ mod tests {
         let dest = Some(("1.2.3.4".to_string(), 443));
 
         // 1. First attempt: NewPrompt
-        let res1 = orchestrator.hold_network("inc-1".into(), tgid, "stealer".into(), Some(1), dest.clone());
+        let res1 = orchestrator.hold_network(
+            "inc-1".into(),
+            tgid,
+            "stealer".into(),
+            Some(1),
+            dest.clone(),
+        );
         assert_eq!(res1, HoldResult::NewPrompt("inc-1".into()));
 
         // 2. Duplicate rapid attempt to same destination: Aggregated
-        let res2 = orchestrator.hold_network("inc-2".into(), tgid, "stealer".into(), Some(2), dest.clone());
+        let res2 = orchestrator.hold_network(
+            "inc-2".into(),
+            tgid,
+            "stealer".into(),
+            Some(2),
+            dest.clone(),
+        );
         assert_eq!(res2, HoldResult::Aggregated("inc-1".into()));
 
         // 3. Different destination: NewPrompt (filling queue to capacity 2)
-        let res3 = orchestrator.hold_network("inc-3".into(), tgid, "stealer".into(), Some(3), Some(("5.6.7.8".into(), 80)));
+        let res3 = orchestrator.hold_network(
+            "inc-3".into(),
+            tgid,
+            "stealer".into(),
+            Some(3),
+            Some(("5.6.7.8".into(), 80)),
+        );
         assert_eq!(res3, HoldResult::NewPrompt("inc-3".into()));
 
         // 4. Over capacity: QueueFull (packet dropped immediately!)
-        let res4 = orchestrator.hold_network("inc-4".into(), tgid, "stealer".into(), Some(4), Some(("9.9.9.9".into(), 53)));
+        let res4 = orchestrator.hold_network(
+            "inc-4".into(),
+            tgid,
+            "stealer".into(),
+            Some(4),
+            Some(("9.9.9.9".into(), 53)),
+        );
         assert_eq!(res4, HoldResult::QueueFull);
     }
 }

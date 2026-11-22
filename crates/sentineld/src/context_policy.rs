@@ -4,9 +4,9 @@
 //! e.g. `/usr/bin/ssh` with `~/.ssh/id_ed25519` can connect to `github.com:22` or `gitlab.com:22`
 //! without prompting the user, but triggers an interactive alert if connecting to an arbitrary IP or port.
 
-use std::path::Path;
 use sentinel_common::config::ContextRule;
 use sentinel_common::process::SecretCategory;
+use std::path::Path;
 
 #[derive(Clone, Default)]
 pub struct ContextPolicyEngine {
@@ -71,11 +71,10 @@ impl ContextPolicyEngine {
                         SecretCategory::BrowserCookies | SecretCategory::BrowserData => {
                             cat_str.eq_ignore_ascii_case("browser")
                         }
-                        SecretCategory::CloudCredentials => {
-                            cat_str.eq_ignore_ascii_case("cloud")
-                        }
+                        SecretCategory::CloudCredentials => cat_str.eq_ignore_ascii_case("cloud"),
                         SecretCategory::DeveloperCredentials => {
-                            cat_str.eq_ignore_ascii_case("dev") || cat_str.eq_ignore_ascii_case("git")
+                            cat_str.eq_ignore_ascii_case("dev")
+                                || cat_str.eq_ignore_ascii_case("git")
                         }
                         SecretCategory::TelegramData => cat_str.eq_ignore_ascii_case("telegram"),
                         SecretCategory::CryptoWallet => cat_str.eq_ignore_ascii_case("crypto"),

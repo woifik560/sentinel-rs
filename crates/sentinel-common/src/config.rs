@@ -288,8 +288,7 @@ impl SentinelConfig {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|e| ConfigError::Io(e, path.as_ref().to_path_buf()))?;
-        toml::from_str(&content)
-            .map_err(|e| ConfigError::Parse(e, path.as_ref().to_path_buf()))
+        toml::from_str(&content).map_err(|e| ConfigError::Parse(e, path.as_ref().to_path_buf()))
     }
 }
 
@@ -303,7 +302,7 @@ pub struct RuleConfig {
 }
 
 /// Full rules configuration matching `rules.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RulesConfig {
     #[serde(default)]
     pub thresholds: RiskThresholds,
@@ -311,22 +310,12 @@ pub struct RulesConfig {
     pub rules: HashMap<String, RuleConfig>,
 }
 
-impl Default for RulesConfig {
-    fn default() -> Self {
-        Self {
-            thresholds: RiskThresholds::default(),
-            rules: HashMap::new(),
-        }
-    }
-}
-
 impl RulesConfig {
     /// Load rules configuration from a TOML file.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|e| ConfigError::Io(e, path.as_ref().to_path_buf()))?;
-        toml::from_str(&content)
-            .map_err(|e| ConfigError::Parse(e, path.as_ref().to_path_buf()))
+        toml::from_str(&content).map_err(|e| ConfigError::Parse(e, path.as_ref().to_path_buf()))
     }
 }
 

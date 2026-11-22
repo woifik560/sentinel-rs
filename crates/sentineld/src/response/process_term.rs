@@ -1,16 +1,18 @@
 //! Safe process termination with anti-PID-reuse verification and Linux pidfd support.
 
+use crate::lineage::ProcessKey;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use tracing::{error, info, warn};
-use crate::lineage::ProcessKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminationError {
-    #[error("PID reuse detected: target PID {0} belongs to a different process! Aborting termination.")]
+    #[error(
+        "PID reuse detected: target PID {0} belongs to a different process! Aborting termination."
+    )]
     PidReuseDetected(u32),
     #[error("Process {0} not found")]
     NotFound(u32),
@@ -35,9 +37,8 @@ impl PidFd {
     pub fn open(pid: u32) -> Result<Self, TerminationError> {
         #[cfg(target_os = "linux")]
         {
-            let fd = unsafe {
-                libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0)
-            } as libc::c_int;
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) }
+                as libc::c_int;
 
             if fd >= 0 {
                 return Ok(Self { pid, fd });
@@ -54,7 +55,10 @@ impl PidFd {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Err(TerminationError::PidFdFailed(pid, "Not supported on non-linux OS".into()))
+            Err(TerminationError::PidFdFailed(
+                pid,
+                "Not supported on non-linux OS".into(),
+            ))
         }
     }
 
@@ -140,7 +144,10 @@ impl Drop for PidFd {
 }
 
 /// Verifies that the process currently running at `pid` matches the expected `ProcessKey` and `expected_exe`.
-pub fn verify_process_identity(key: &ProcessKey, expected_exe: Option<&Path>) -> Result<(), TerminationError> {
+pub fn verify_process_identity(
+    key: &ProcessKey,
+    expected_exe: Option<&Path>,
+) -> Result<(), TerminationError> {
     verify_process_identity_internal(key, expected_exe, None)
 }
 
@@ -161,18 +168,17 @@ pub fn verify_process_identity_internal(
     if key.start_time_ns == 0 && expected_exe.is_none() && pidfd_fd.is_none() {
         return Err(TerminationError::VerificationFailed(
             pid,
-            "Process start time is 0/missing without strong alternative identity (fail-closed)".into(),
+            "Process start time is 0/missing without strong alternative identity (fail-closed)"
+                .into(),
         ));
     }
 
     // 1. Verify start time from /proc/<pid>/stat
     let stat_path = format!("{}/stat", proc_path);
-    let content = fs::read_to_string(&stat_path).map_err(|e| {
-        match e.raw_os_error() {
-            Some(libc::ENOENT) => TerminationError::NotFound(pid),
-            Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
-            _ => TerminationError::VerificationFailed(pid, format!("Cannot read {}: {}", stat_path, e)),
-        }
+    let content = fs::read_to_string(&stat_path).map_err(|e| match e.raw_os_error() {
+        Some(libc::ENOENT) => TerminationError::NotFound(pid),
+        Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
+        _ => TerminationError::VerificationFailed(pid, format!("Cannot read {}: {}", stat_path, e)),
     })?;
 
     let rparen = content.rfind(')').ok_or_else(|| {
@@ -181,31 +187,36 @@ pub fn verify_process_identity_internal(
     let rest = &content[rparen + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let starttime_str = fields.get(19).ok_or_else(|| {
-        TerminationError::VerificationFailed(pid, format!("Missing starttime field in stat for PID {}", pid))
+        TerminationError::VerificationFailed(
+            pid,
+            format!("Missing starttime field in stat for PID {}", pid),
+        )
     })?;
     let curr_start_time = starttime_str.parse::<u64>().map_err(|e| {
-        TerminationError::VerificationFailed(pid, format!("Failed to parse starttime in stat for PID {}: {}", pid, e))
+        TerminationError::VerificationFailed(
+            pid,
+            format!("Failed to parse starttime in stat for PID {}: {}", pid, e),
+        )
     })?;
 
-    if key.start_time_ns > 0 {
-        if curr_start_time != key.start_time_ns {
-            warn!(
-                "PID reuse detected for PID {}! Expected start_time {}, found {}",
-                pid, key.start_time_ns, curr_start_time
-            );
-            return Err(TerminationError::PidReuseDetected(pid));
-        }
+    if key.start_time_ns > 0 && curr_start_time != key.start_time_ns {
+        warn!(
+            "PID reuse detected for PID {}! Expected start_time {}, found {}",
+            pid, key.start_time_ns, curr_start_time
+        );
+        return Err(TerminationError::PidReuseDetected(pid));
     }
 
     // 2. Verify exe symlink if provided
     if let Some(expected) = expected_exe {
         let exe_link = format!("{}/exe", proc_path);
-        let actual_target = fs::read_link(&exe_link).map_err(|e| {
-            match e.raw_os_error() {
-                Some(libc::ENOENT) => TerminationError::NotFound(pid),
-                Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
-                _ => TerminationError::VerificationFailed(pid, format!("Cannot read link {}: {}", exe_link, e)),
-            }
+        let actual_target = fs::read_link(&exe_link).map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOENT) => TerminationError::NotFound(pid),
+            Some(libc::EACCES) | Some(libc::EPERM) => TerminationError::PermissionDenied(pid),
+            _ => TerminationError::VerificationFailed(
+                pid,
+                format!("Cannot read link {}: {}", exe_link, e),
+            ),
         })?;
 
         let actual_str = actual_target.to_string_lossy();
@@ -272,7 +283,10 @@ pub fn safe_terminate_process(
         }
 
         // 5. Forceful kill if still alive
-        warn!("Process {} did not exit within grace period, sending SIGKILL via pidfd", pid);
+        warn!(
+            "Process {} did not exit within grace period, sending SIGKILL via pidfd",
+            pid
+        );
         pidfd.send_signal(Signal::SIGKILL)?;
         info!("Process {} forcibly terminated with SIGKILL via pidfd", pid);
         return Ok(true);
@@ -282,11 +296,16 @@ pub fn safe_terminate_process(
     // delegate process signaling to the sentinel-privileged helper.
     let priv_client = sentinel_privileged::client::PrivilegedClient::default();
     if priv_client.is_available() {
-        info!("Privilege separation: delegating signal to sentinel-privileged helper for PID {}", pid);
+        info!(
+            "Privilege separation: delegating signal to sentinel-privileged helper for PID {}",
+            pid
+        );
         verify_process_identity(key, expected_exe)?;
         match priv_client.execute_sync(&sentinel_privileged::PrivilegedOp::SignalProcess {
             pid,
             signal: libc::SIGTERM,
+            expected_start_time: Some(key.start_time_ns),
+            expected_exe: expected_exe.map(|p| p.to_string_lossy().to_string()),
         }) {
             Ok(sentinel_privileged::PrivilegedResult::Ok(_)) => {
                 info!("Privileged helper signaled process {}", pid);
@@ -294,6 +313,12 @@ pub fn safe_terminate_process(
             }
             Ok(sentinel_privileged::PrivilegedResult::Error { code, message }) => {
                 warn!("Privileged helper error signaling {pid} ({code}): {message}");
+                if message.contains("PID reuse detected") {
+                    return Err(TerminationError::PidReuseDetected(pid));
+                }
+                if code == "ESRCH" {
+                    return Err(TerminationError::NotFound(pid));
+                }
             }
             Err(e) => {
                 warn!("Failed to communicate with privileged helper for PID {pid}: {e}");
@@ -341,7 +366,10 @@ pub fn safe_terminate_process(
     }
 
     // 4. Forceful kill
-    warn!("Process {} did not exit within grace period, sending SIGKILL", pid);
+    warn!(
+        "Process {} did not exit within grace period, sending SIGKILL",
+        pid
+    );
     if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
         if e == nix::errno::Errno::ESRCH {
             return Ok(true);

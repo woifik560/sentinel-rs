@@ -1,11 +1,114 @@
 //! `sntctl setup-kernel` universal bootloader configuration tool.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub async fn run_setup_kernel(force: bool) -> anyhow::Result<()> {
+/// Creates a `.sentinel.bak` copy of target file before modifying it.
+fn backup_file(path: &Path) -> std::io::Result<PathBuf> {
+    let bak = PathBuf::from(format!("{}.sentinel.bak", path.display()));
+    if !bak.exists() && path.exists() {
+        std::fs::copy(path, &bak)?;
+        println!(
+            "[BACKUP] Created backup of {} at {}",
+            path.display(),
+            bak.display()
+        );
+    }
+    Ok(bak)
+}
+
+/// Restores target file from its `.sentinel.bak` copy.
+fn restore_backup(path: &Path) -> std::io::Result<bool> {
+    let bak = PathBuf::from(format!("{}.sentinel.bak", path.display()));
+    if bak.exists() {
+        std::fs::copy(&bak, path)?;
+        println!(
+            "[RESTORE] Restored {} from {}",
+            path.display(),
+            bak.display()
+        );
+        let _ = std::fs::remove_file(&bak);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn run_setup_kernel(force: bool, rollback: bool) -> anyhow::Result<()> {
     println!("================================================================================");
     println!(" Sentinel-RS Universal Kernel & Bootloader Setup Tool");
     println!("================================================================================");
+
+    if rollback {
+        println!("[ROLLBACK] Initiating bootloader rollback from Sentinel backup files...");
+        let mut restored_any = false;
+
+        // Restore /etc/default/grub
+        let grub_path = Path::new("/etc/default/grub");
+        if restore_backup(grub_path)? {
+            restored_any = true;
+            if Path::new("/usr/sbin/update-grub").exists() {
+                println!("[INFO] Re-running update-grub to regenerate configuration...");
+                let s = std::process::Command::new("/usr/sbin/update-grub").status()?;
+                if !s.success() {
+                    anyhow::bail!("update-grub failed during rollback with exit status: {}", s);
+                }
+            } else if Path::new("/usr/sbin/grub2-mkconfig").exists() {
+                let out_cfg = if Path::new("/boot/grub2/grub.cfg").exists() {
+                    "/boot/grub2/grub.cfg"
+                } else {
+                    "/boot/grub/grub.cfg"
+                };
+                println!("[INFO] Re-running grub2-mkconfig to regenerate configuration...");
+                let s = std::process::Command::new("/usr/sbin/grub2-mkconfig")
+                    .arg("-o")
+                    .arg(out_cfg)
+                    .status()?;
+                if !s.success() {
+                    anyhow::bail!(
+                        "grub2-mkconfig failed during rollback with exit status: {}",
+                        s
+                    );
+                }
+            }
+        }
+
+        // Restore /etc/kernel/cmdline
+        let cmdline_path = Path::new("/etc/kernel/cmdline");
+        if restore_backup(cmdline_path)? {
+            restored_any = true;
+        }
+
+        // Restore systemd-boot loader entries
+        if let Ok(entries) = std::fs::read_dir("/boot/loader/entries") {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let path_str = p.to_string_lossy().to_string();
+                if path_str.ends_with(".conf.sentinel.bak") {
+                    let orig = PathBuf::from(path_str.trim_end_matches(".sentinel.bak"));
+                    if std::fs::copy(&p, &orig).is_ok() {
+                        let _ = std::fs::remove_file(&p);
+                        println!("[RESTORE] Restored {}", orig.display());
+                        restored_any = true;
+                    }
+                }
+            }
+        }
+
+        if restored_any {
+            println!(
+                "================================================================================"
+            );
+            println!(" [SUCCESS] Bootloader configuration successfully rolled back to pre-Sentinel state.");
+            println!(" Please reboot to activate the restored kernel parameters:");
+            println!("   sudo reboot");
+            println!(
+                "================================================================================"
+            );
+        } else {
+            println!("[INFO] No Sentinel backup files found to restore.");
+        }
+        return Ok(());
+    }
 
     let current_lsm = std::fs::read_to_string("/sys/kernel/security/lsm")
         .unwrap_or_default()
@@ -84,12 +187,16 @@ pub async fn run_setup_kernel(force: bool) -> anyhow::Result<()> {
     }
 
     // C. systemd-boot
-    if !configured && (Path::new("/etc/kernel/cmdline").exists() || Path::new("/boot/loader/entries").is_dir()) {
+    if !configured
+        && (Path::new("/etc/kernel/cmdline").exists() || Path::new("/boot/loader/entries").is_dir())
+    {
         println!("[INFO] Detected bootloader: systemd-boot");
         if Path::new("/etc/kernel/cmdline").exists() {
-            let cmdline = std::fs::read_to_string("/etc/kernel/cmdline").unwrap_or_default();
+            let cmdline_path = Path::new("/etc/kernel/cmdline");
+            let _ = backup_file(cmdline_path);
+            let cmdline = std::fs::read_to_string(cmdline_path).unwrap_or_default();
             let new_cmdline = patch_cmdline(&cmdline, &lsm_param);
-            if std::fs::write("/etc/kernel/cmdline", new_cmdline).is_ok() {
+            if std::fs::write(cmdline_path, new_cmdline).is_ok() {
                 println!("[OK] Successfully patched /etc/kernel/cmdline");
                 configured = true;
             }
@@ -98,13 +205,14 @@ pub async fn run_setup_kernel(force: bool) -> anyhow::Result<()> {
         if let Ok(entries) = std::fs::read_dir("/boot/loader/entries") {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().map(|e| e == "conf").unwrap_or(false) {
+                if p.extension().map(|e| e == "conf").unwrap_or(false)
+                    && !p.to_string_lossy().ends_with(".sentinel.bak")
+                {
                     if let Ok(content) = std::fs::read_to_string(&p) {
                         let mut lines: Vec<String> = Vec::new();
                         let mut modified = false;
                         for line in content.lines() {
-                            if line.starts_with("options ") {
-                                let rest = &line["options ".len()..];
+                            if let Some(rest) = line.strip_prefix("options ") {
                                 let patched = patch_cmdline(rest, &lsm_param);
                                 lines.push(format!("options {}", patched));
                                 modified = true;
@@ -113,6 +221,7 @@ pub async fn run_setup_kernel(force: bool) -> anyhow::Result<()> {
                             }
                         }
                         if modified {
+                            let _ = backup_file(&p);
                             let _ = std::fs::write(&p, lines.join("\n"));
                             configured = true;
                         }
@@ -128,75 +237,110 @@ pub async fn run_setup_kernel(force: bool) -> anyhow::Result<()> {
     // D. Classic GRUB (/etc/default/grub)
     if !configured && Path::new("/etc/default/grub").exists() {
         println!("[INFO] Detected bootloader: GRUB (/etc/default/grub)");
-        if let Ok(grub_content) = std::fs::read_to_string("/etc/default/grub") {
+        let grub_path = Path::new("/etc/default/grub");
+        if let Ok(grub_content) = std::fs::read_to_string(grub_path) {
+            let bak_path = backup_file(grub_path)?;
             let patched_grub = patch_grub_default(&grub_content, &lsm_param);
-            if std::fs::write("/etc/default/grub", patched_grub).is_ok() {
-                println!("[OK] Successfully updated /etc/default/grub with '{}'", lsm_param);
+            if std::fs::write(grub_path, &patched_grub).is_ok() {
+                println!(
+                    "[OK] Successfully updated /etc/default/grub with '{}'",
+                    lsm_param
+                );
 
-                if Path::new("/usr/sbin/update-grub").exists() {
-                    let _ = std::process::Command::new("/usr/sbin/update-grub").status();
-                    configured = true;
+                let update_result = if Path::new("/usr/sbin/update-grub").exists() {
+                    std::process::Command::new("/usr/sbin/update-grub").status()
                 } else if Path::new("/usr/sbin/grub2-mkconfig").exists() {
                     let out_cfg = if Path::new("/boot/grub2/grub.cfg").exists() {
                         "/boot/grub2/grub.cfg"
                     } else {
                         "/boot/grub/grub.cfg"
                     };
-                    let _ = std::process::Command::new("/usr/sbin/grub2-mkconfig")
+                    std::process::Command::new("/usr/sbin/grub2-mkconfig")
                         .arg("-o")
                         .arg(out_cfg)
-                        .status();
-                    configured = true;
+                        .status()
                 } else if Path::new("/usr/sbin/grub-mkconfig").exists() {
-                    let _ = std::process::Command::new("/usr/sbin/grub-mkconfig")
+                    std::process::Command::new("/usr/sbin/grub-mkconfig")
                         .arg("-o")
                         .arg("/boot/grub/grub.cfg")
-                        .status();
-                    configured = true;
+                        .status()
+                } else {
+                    Ok(std::process::ExitStatus::default())
+                };
+
+                match update_result {
+                    Ok(s) if s.success() => {
+                        configured = true;
+                    }
+                    Ok(s) => {
+                        println!("[ERROR] Bootloader update command failed with exit status: {}. Rolling back changes...", s);
+                        let _ = std::fs::copy(&bak_path, grub_path);
+                        anyhow::bail!("Bootloader configuration failed ({}); automatically rolled back /etc/default/grub.", s);
+                    }
+                    Err(e) => {
+                        println!("[ERROR] Failed to execute bootloader tool: {}. Rolling back changes...", e);
+                        let _ = std::fs::copy(&bak_path, grub_path);
+                        anyhow::bail!("Failed to execute bootloader updater ({}); automatically rolled back /etc/default/grub.", e);
+                    }
                 }
             }
         }
     }
 
     if configured {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!(" [SUCCESS] Kernel bootloader configuration completed successfully!");
         println!(" Active LSMs configured: {}", lsms.join(","));
         println!(" Please reboot your computer to activate BPF LSM in the Linux kernel:");
         println!("   sudo reboot");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
     } else {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!(" [INFO / SIMULATION] Target bootloader configuration complete.");
-        println!(" To activate manually, ensure '{}' is in your kernel boot line.", lsm_param);
-        println!("================================================================================");
+        println!(
+            " To activate manually, ensure '{}' is in your kernel boot line.",
+            lsm_param
+        );
+        println!(
+            "================================================================================"
+        );
     }
 
     Ok(())
 }
 
-fn patch_cmdline(cmdline: &str, lsm_param: &str) -> String {
+pub fn patch_cmdline(cmdline: &str, lsm_param: &str) -> String {
     let mut words: Vec<&str> = cmdline.split_whitespace().collect();
     words.retain(|w| !w.starts_with("lsm="));
     words.push(lsm_param);
     words.join(" ")
 }
 
-fn patch_grub_default(content: &str, lsm_param: &str) -> String {
+pub fn patch_grub_default(content: &str, lsm_param: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut replaced = false;
 
     for line in content.lines() {
-        if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
-            let val = line["GRUB_CMDLINE_LINUX_DEFAULT=".len()..].trim_matches('"');
+        if let Some(rest) = line.strip_prefix("GRUB_CMDLINE_LINUX_DEFAULT=") {
+            let val = rest.trim_matches('"');
             let patched = patch_cmdline(val, lsm_param);
             lines.push(format!("GRUB_CMDLINE_LINUX_DEFAULT=\"{}\"", patched));
             replaced = true;
-        } else if !replaced && line.starts_with("GRUB_CMDLINE_LINUX=") {
-            let val = line["GRUB_CMDLINE_LINUX=".len()..].trim_matches('"');
-            let patched = patch_cmdline(val, lsm_param);
-            lines.push(format!("GRUB_CMDLINE_LINUX=\"{}\"", patched));
-            replaced = true;
+        } else if !replaced {
+            if let Some(rest) = line.strip_prefix("GRUB_CMDLINE_LINUX=") {
+                let val = rest.trim_matches('"');
+                let patched = patch_cmdline(val, lsm_param);
+                lines.push(format!("GRUB_CMDLINE_LINUX=\"{}\"", patched));
+                replaced = true;
+            } else {
+                lines.push(line.to_string());
+            }
         } else {
             lines.push(line.to_string());
         }
@@ -207,4 +351,56 @@ fn patch_grub_default(content: &str, lsm_param: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patch_cmdline_replaces_existing_lsm() {
+        let orig = "quiet splash lsm=lockdown,capability,apparmor vt.handoff=7";
+        let patched = patch_cmdline(orig, "lsm=lockdown,capability,landlock,yama,apparmor,bpf");
+        assert!(!patched.contains("lsm=lockdown,capability,apparmor "));
+        assert!(patched.contains("lsm=lockdown,capability,landlock,yama,apparmor,bpf"));
+        assert!(patched.contains("quiet splash"));
+        assert!(patched.contains("vt.handoff=7"));
+    }
+
+    #[test]
+    fn test_patch_grub_default_updates_cmdline() {
+        let grub = "GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"\nGRUB_TIMEOUT=5";
+        let patched = patch_grub_default(grub, "lsm=landlock,bpf");
+        assert!(patched.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,bpf\""));
+        assert!(patched.contains("GRUB_TIMEOUT=5"));
+    }
+
+    #[test]
+    fn test_backup_and_restore_cycle() {
+        let temp_dir = std::env::temp_dir().join(format!("sentinel_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let test_file = temp_dir.join("grub");
+
+        std::fs::write(&test_file, "ORIGINAL_CONTENT").unwrap();
+        let bak = backup_file(&test_file).unwrap();
+        assert!(bak.exists());
+
+        // Modify file
+        std::fs::write(&test_file, "MODIFIED_CONTENT").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&test_file).unwrap(),
+            "MODIFIED_CONTENT"
+        );
+
+        // Restore
+        let restored = restore_backup(&test_file).unwrap();
+        assert!(restored);
+        assert_eq!(
+            std::fs::read_to_string(&test_file).unwrap(),
+            "ORIGINAL_CONTENT"
+        );
+        assert!(!bak.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

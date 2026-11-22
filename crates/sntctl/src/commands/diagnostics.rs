@@ -1,9 +1,9 @@
 //! `sntctl diagnostics` command implementation.
 
-use std::path::Path;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json};
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::Path;
 
 pub async fn run_diagnostics(socket_path: &Path, json_output: bool) -> anyhow::Result<()> {
     let resp = send_command(socket_path, IpcCommand::Diagnostics).await?;

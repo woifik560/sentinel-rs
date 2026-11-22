@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
+use crate::sha_cache::compute_sha256;
 use flate2::read::GzDecoder;
 use sentinel_ebpf::TaintMapManager;
-use crate::sha_cache::compute_sha256;
 
 /// Cryptographic integrity report for an executable binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +90,7 @@ impl PacmanBackend {
             let mut matched = false;
             if let Ok(file) = File::open(&files_path) {
                 let reader = BufReader::new(file);
-                for line in reader.lines().flatten() {
+                for line in reader.lines().map_while(Result::ok) {
                     let trimmed = line.trim();
                     if trimmed == rel_path_str.as_ref() {
                         matched = true;
@@ -124,11 +124,12 @@ impl PacmanBackend {
                 }
 
                 let actual_sha256 = compute_sha256(canonical_path);
-                let is_verified = if let (Some(expected), Some(actual)) = (&recorded_sha256, &actual_sha256) {
-                    expected.eq_ignore_ascii_case(actual)
-                } else {
-                    actual_sha256.is_some()
-                };
+                let is_verified =
+                    if let (Some(expected), Some(actual)) = (&recorded_sha256, &actual_sha256) {
+                        expected.eq_ignore_ascii_case(actual)
+                    } else {
+                        actual_sha256.is_some()
+                    };
 
                 return Some(PackageIntegrityInfo {
                     package_name: pkg_name.to_string(),
@@ -311,7 +312,9 @@ impl NixOsBackend {
         let is_rdonly = if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
             mounts.lines().any(|l| {
                 let parts: Vec<&str> = l.split_whitespace().collect();
-                parts.len() >= 4 && (parts[1] == "/nix/store" || parts[1] == "/") && parts[3].split(',').any(|opt| opt == "ro")
+                parts.len() >= 4
+                    && (parts[1] == "/nix/store" || parts[1] == "/")
+                    && parts[3].split(',').any(|opt| opt == "ro")
             })
         } else {
             true // Fallback for tests
@@ -381,7 +384,9 @@ impl ImmutableOsBackend {
         let is_usr_rdonly = if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
             mounts.lines().any(|l| {
                 let parts: Vec<&str> = l.split_whitespace().collect();
-                parts.len() >= 4 && (parts[1] == "/usr" || parts[1] == "/") && parts[3].split(',').any(|opt| opt == "ro")
+                parts.len() >= 4
+                    && (parts[1] == "/usr" || parts[1] == "/")
+                    && parts[3].split(',').any(|opt| opt == "ro")
             })
         } else {
             false
@@ -467,7 +472,7 @@ impl DpkgBackend {
 
                     if let Ok(file) = File::open(entry.path()) {
                         let reader = BufReader::new(file);
-                        for line in reader.lines().flatten() {
+                        for line in reader.lines().map_while(Result::ok) {
                             let mut parts = line.split_whitespace();
                             if let (Some(_md5), Some(recorded_rel)) = (parts.next(), parts.next()) {
                                 if recorded_rel == rel_path_str.as_ref() {
@@ -556,7 +561,10 @@ impl Default for CompositePkgChecker {
 impl CompositePkgChecker {
     pub fn new() -> Self {
         let active_distro = Self::detect_distribution();
-        info!("Initialized Distro-Agnostic PkgIntegrityProvider (Active backend: {})", active_distro);
+        info!(
+            "Initialized Distro-Agnostic PkgIntegrityProvider (Active backend: {})",
+            active_distro
+        );
 
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -590,10 +598,15 @@ impl CompositePkgChecker {
         // Inspect /etc/os-release
         if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
             let lower = content.to_lowercase();
-            if lower.contains("arch") || lower.contains("manjaro") || lower.contains("endeavouros") {
+            if lower.contains("arch") || lower.contains("manjaro") || lower.contains("endeavouros")
+            {
                 return "pacman";
             }
-            if lower.contains("fedora") || lower.contains("rhel") || lower.contains("centos") || lower.contains("suse") {
+            if lower.contains("fedora")
+                || lower.contains("rhel")
+                || lower.contains("centos")
+                || lower.contains("suse")
+            {
                 return "rpm";
             }
             if lower.contains("nixos") {
@@ -657,7 +670,8 @@ impl CompositePkgChecker {
             "dpkg" => self.dpkg.check_package(&canonical_path),
             _ => {
                 // Fallback: try all backends sequentially
-                self.dpkg.check_package(&canonical_path)
+                self.dpkg
+                    .check_package(&canonical_path)
                     .or_else(|| self.pacman.check_package(&canonical_path))
                     .or_else(|| self.rpm.check_package(&canonical_path))
                     .or_else(|| self.nixos.check_package(&canonical_path))
@@ -673,7 +687,11 @@ impl CompositePkgChecker {
                     {
                         use std::os::unix::fs::MetadataExt;
                         if let Ok(meta) = std::fs::metadata(&canonical_path) {
-                            mgr.mark_inode_trusted(meta.dev(), meta.ino(), meta.mtime_nsec() as u64);
+                            mgr.mark_inode_trusted(
+                                meta.dev(),
+                                meta.ino(),
+                                meta.mtime_nsec() as u64,
+                            );
                         }
                     }
                     #[cfg(not(unix))]

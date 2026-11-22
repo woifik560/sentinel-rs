@@ -1,7 +1,7 @@
 //! `sntctl doctor` diagnostics implementation.
 
-use std::path::Path;
 use crate::client::{DEFAULT_PRIVILEGED_SOCKET, DEFAULT_READONLY_SOCKET};
+use std::path::Path;
 
 pub async fn run_doctor() -> anyhow::Result<()> {
     println!("================================================================================");
@@ -31,9 +31,15 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     };
 
     if is_recent_kernel {
-        println!("[OK]   Linux Kernel: {} (>= 6.1 BPF object storage supported)", kernel_release);
+        println!(
+            "[OK]   Linux Kernel: {} (>= 6.1 BPF object storage supported)",
+            kernel_release
+        );
     } else {
-        println!("[WARN] Linux Kernel: {} (Kernel >= 6.1 recommended for full BPF LSM)", kernel_release);
+        println!(
+            "[WARN] Linux Kernel: {} (Kernel >= 6.1 recommended for full BPF LSM)",
+            kernel_release
+        );
     }
 
     // 2. BPF LSM Active Check
@@ -43,11 +49,16 @@ pub async fn run_doctor() -> anyhow::Result<()> {
         .to_string();
 
     if lsm_active.contains("bpf") {
-        println!("[OK]   BPF LSM: Active in /sys/kernel/security/lsm ({})", lsm_active);
+        println!(
+            "[OK]   BPF LSM: Active in /sys/kernel/security/lsm ({})",
+            lsm_active
+        );
     } else {
         all_ok = false;
         println!("[FAIL] BPF LSM: 'bpf' is NOT enabled in /sys/kernel/security/lsm!");
-        println!("       Remediation: Run 'sudo sntctl setup-kernel' to configure your bootloader.");
+        println!(
+            "       Remediation: Run 'sudo sntctl setup-kernel' to configure your bootloader."
+        );
     }
 
     // 3. Socket and IPC Directory Check
@@ -58,19 +69,34 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     if sock_dir.exists() {
         println!("[OK]   IPC Directory: {} exists", sock_dir.display());
     } else {
-        println!("[INFO] IPC Directory: {} will be created on daemon start", sock_dir.display());
+        println!(
+            "[INFO] IPC Directory: {} will be created on daemon start",
+            sock_dir.display()
+        );
     }
 
     if mgmt_sock.exists() {
-        println!("[OK]   Management Socket: {} (SO_PEERCRED RBAC active)", mgmt_sock.display());
+        println!(
+            "[OK]   Management Socket: {} (SO_PEERCRED RBAC active)",
+            mgmt_sock.display()
+        );
     } else {
-        println!("[INFO] Management Socket: {} not active (daemon offline?)", mgmt_sock.display());
+        println!(
+            "[INFO] Management Socket: {} not active (daemon offline?)",
+            mgmt_sock.display()
+        );
     }
 
     if ro_sock.exists() {
-        println!("[OK]   Read-Only Socket: {} accessible for operator monitoring", ro_sock.display());
+        println!(
+            "[OK]   Read-Only Socket: {} accessible for operator monitoring",
+            ro_sock.display()
+        );
     } else {
-        println!("[INFO] Read-Only Socket: {} not active (daemon offline?)", ro_sock.display());
+        println!(
+            "[INFO] Read-Only Socket: {} not active (daemon offline?)",
+            ro_sock.display()
+        );
     }
 
     // 4. Netfilter / nftables Check

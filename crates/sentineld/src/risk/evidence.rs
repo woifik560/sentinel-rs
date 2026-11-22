@@ -1,7 +1,7 @@
 //! Evidence models and aggregation for the Risk Engine.
 
-use serde::{Deserialize, Serialize};
 use sentinel_common::risk::RuleFiring;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Attack stage categorization aligned with MITRE ATT&CK.

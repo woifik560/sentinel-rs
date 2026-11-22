@@ -11,4 +11,6 @@ pub struct SubsystemMetrics {
     pub tracked_processes: usize,
     pub memory_rss_bytes: u64,
     pub uptime_secs: u64,
+    pub bpf_lsm_active: bool,
+    pub network_holding_active: bool,
 }

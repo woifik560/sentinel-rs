@@ -37,19 +37,21 @@ Sentinel-RS adheres to the **Principle of Least Privilege (PoLP)** and the **Def
 
 ### 3.3 Strongly-Typed API Operations
 
-The helper rejects raw shell strings. It only accepts typed JSON-RPC requests conforming to `PrivilegedRequest`:
+The helper rejects raw shell strings. It only accepts typed JSON-RPC requests conforming to `PrivilegedOp`:
 
 ```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub enum PrivilegedRequest {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PrivilegedOp {
     /// Atomic batch execution of validated nftables rules
-    ApplyNftablesBatch {
-        commands: Vec<String>,
+    ExecuteNftBatch {
+        script: String,
     },
-    /// Safe process termination via pidfd with PID 1 protection
-    TerminateProcess {
+    /// Safe process signaling via pidfd with PID 1 and anti-PID-reuse identity checks
+    SignalProcess {
         pid: u32,
         signal: i32,
+        expected_start_time: Option<u64>,
+        expected_exe: Option<String>,
     },
     /// Query status of the privileged helper
     Ping,
@@ -57,8 +59,8 @@ pub enum PrivilegedRequest {
 ```
 
 ### 3.4 Invariant Enforcement
-1. **Firewall Syntax Pre-Check**: Before applying any batch of nftables rules, the helper runs a dry-run check (`nft -c -f -`). If the dry run returns an error, the batch is aborted, preventing corrupted firewall rulesets.
-2. **PID 1 & Self Never-Kill**: Any request with `pid <= 1` or targeting `sentinel-privileged` itself is unconditionally rejected with an `EPERM` error.
+1. **Firewall Syntax Pre-Check & Whitelisting**: Before applying any batch of nftables rules, the helper verifies that all instructions target exclusively table `inet sentinel`. Any attempt to tamper with foreign tables (e.g. `ip filter`) or execute destructive operations such as `flush ruleset` is rejected with an `EPERM` error.
+2. **Anti-PID-Reuse & Identity Verification**: In addition to rejecting `pid <= 1` or targeting `sentinel-privileged`, the helper independently inspects `/proc/<pid>/stat` to extract process start time (in jiffies) and resolves `/proc/<pid>/exe`. If the process start time or executable does not match the parameters provided by `sentineld`, the signal operation is aborted immediately with `EPERM`, completely neutralizing Time-of-Check to Time-of-Use (TOCTOU) PID wrap-around attacks.
 
 ---
 

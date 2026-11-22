@@ -1,10 +1,10 @@
 //! `sntctl incidents` subcommands.
 
-use clap::Subcommand;
-use std::path::Path;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json};
+use clap::Subcommand;
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::Path;
 
 #[derive(Subcommand, Debug)]
 pub enum IncidentsAction {
@@ -14,20 +14,23 @@ pub enum IncidentsAction {
         limit: usize,
     },
     /// Show full forensic incident report by incident ID
-    Show {
-        incident_id: String,
-    },
+    Show { incident_id: String },
     /// Export incident report in JSON format
-    Export {
-        incident_id: String,
-    },
+    Export { incident_id: String },
     /// Clear all security incidents
     Clear,
 }
 
-pub async fn run_incidents(socket_path: &Path, action: IncidentsAction, json_output: bool) -> anyhow::Result<()> {
+pub async fn run_incidents(
+    socket_path: &Path,
+    action: IncidentsAction,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let cmd = match action {
-        IncidentsAction::List { limit } => IpcCommand::IncidentsList { limit: Some(limit), offset: Some(0) },
+        IncidentsAction::List { limit } => IpcCommand::IncidentsList {
+            limit: Some(limit),
+            offset: Some(0),
+        },
         IncidentsAction::Show { incident_id } => IpcCommand::IncidentsShow { incident_id },
         IncidentsAction::Export { incident_id } => IpcCommand::IncidentsShow { incident_id },
         IncidentsAction::Clear => IpcCommand::IncidentsClear,

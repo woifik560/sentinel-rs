@@ -1,13 +1,18 @@
 //! Process suspension (SIGSTOP) and resumption (SIGCONT) controls.
 
+use super::process_term::{
+    verify_process_identity, verify_process_identity_internal, PidFd, TerminationError,
+};
+use crate::lineage::ProcessKey;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::path::Path;
 use tracing::info;
-use crate::lineage::ProcessKey;
-use super::process_term::{verify_process_identity, verify_process_identity_internal, PidFd, TerminationError};
 
-pub fn suspend_process(key: &ProcessKey, expected_exe: Option<&Path>) -> Result<(), TerminationError> {
+pub fn suspend_process(
+    key: &ProcessKey,
+    expected_exe: Option<&Path>,
+) -> Result<(), TerminationError> {
     let pid = key.pid;
 
     if let Ok(pidfd) = PidFd::open(pid) {
@@ -26,7 +31,10 @@ pub fn suspend_process(key: &ProcessKey, expected_exe: Option<&Path>) -> Result<
     Ok(())
 }
 
-pub fn resume_process(key: &ProcessKey, expected_exe: Option<&Path>) -> Result<(), TerminationError> {
+pub fn resume_process(
+    key: &ProcessKey,
+    expected_exe: Option<&Path>,
+) -> Result<(), TerminationError> {
     let pid = key.pid;
 
     if let Ok(pidfd) = PidFd::open(pid) {

@@ -18,9 +18,7 @@ const MAX_CONCURRENT_CLIENTS: usize = 16;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .init();
+    tracing_subscriber::fmt().with_target(false).init();
 
     info!("Starting Sentinel Privileged Helper daemon (sentinel-privileged)...");
 
@@ -35,8 +33,15 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("CRITICAL: Failed to enforce 0600 permissions on {}: {}", socket_path.display(), e))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "CRITICAL: Failed to enforce 0600 permissions on {}: {}",
+                    socket_path.display(),
+                    e
+                )
+            },
+        )?;
     }
 
     info!("Privileged helper listening on {}", socket_path.display());
@@ -76,7 +81,10 @@ async fn run_server(listener: UnixListener, semaphore: Arc<Semaphore>) -> anyhow
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to query peer credentials: {}. Rejecting connection.", e);
+                            warn!(
+                                "Failed to query peer credentials: {}. Rejecting connection.",
+                                e
+                            );
                             continue;
                         }
                     }
@@ -85,7 +93,10 @@ async fn run_server(listener: UnixListener, semaphore: Arc<Semaphore>) -> anyhow
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        warn!("Privileged helper saturated: max connections ({}) reached. Rejecting.", MAX_CONCURRENT_CLIENTS);
+                        warn!(
+                            "Privileged helper saturated: max connections ({}) reached. Rejecting.",
+                            MAX_CONCURRENT_CLIENTS
+                        );
                         let (_, mut writer) = stream.into_split();
                         let res = PrivilegedResult::Error {
                             code: "EBUSY".into(),
@@ -110,7 +121,10 @@ async fn run_server(listener: UnixListener, semaphore: Arc<Semaphore>) -> anyhow
                             if n as u64 > MAX_PAYLOAD_BYTES {
                                 let res = PrivilegedResult::Error {
                                     code: "EMSGSIZE".into(),
-                                    message: format!("Payload exceeds maximum allowed size of {} bytes", MAX_PAYLOAD_BYTES),
+                                    message: format!(
+                                        "Payload exceeds maximum allowed size of {} bytes",
+                                        MAX_PAYLOAD_BYTES
+                                    ),
                                 };
                                 if let Ok(json) = serde_json::to_string(&res) {
                                     let _ = writer.write_all(json.as_bytes()).await;

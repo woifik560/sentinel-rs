@@ -54,6 +54,18 @@ cat /sys/kernel/security/lsm
 ```
 *Expected output*: `lockdown,capability,landlock,yama,apparmor,bpf`
 
+### Automated Configuration (Recommended):
+Use `sntctl setup-kernel`, which detects GRUB or systemd-boot, creates an automatic backup (`.sentinel.bak`), updates the bootloader configuration, and verifies exit status:
+```bash
+sudo sntctl setup-kernel
+```
+
+If you ever need to restore your original boot configuration:
+```bash
+sudo sntctl setup-kernel --rollback
+```
+
+### Manual Configuration:
 If `bpf` is missing:
 1. Edit `/etc/default/grub`:
    ```ini

@@ -59,9 +59,10 @@ impl std::fmt::Display for PolicyAction {
 }
 
 /// Agent operational modes for policy enforcement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OperatingMode {
     /// Observe and log decisions without enforcing userspace actions.
+    #[default]
     Audit,
     /// Balanced protection: prevent high-confidence threats, monitor uncertain behavior.
     Balanced,
@@ -69,12 +70,6 @@ pub enum OperatingMode {
     Strict,
     /// Administrator-defined policies.
     Custom,
-}
-
-impl Default for OperatingMode {
-    fn default() -> Self {
-        OperatingMode::Audit
-    }
 }
 
 impl std::fmt::Display for OperatingMode {

@@ -1,13 +1,13 @@
 //! Autonomous Security Policy Engine and Authorization Layer.
 
-use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
-use sentinel_common::policy::{OperatingMode, PolicyAction, PolicyDecision};
-use sentinel_common::risk::EvidenceEvaluation;
-use crate::lineage::ProcessKey;
 use super::context::PolicyContext;
 use super::precedence::PrecedenceEvaluator;
 use super::rules::PolicyRule;
+use crate::lineage::ProcessKey;
+use sentinel_common::policy::{OperatingMode, PolicyAction, PolicyDecision};
+use sentinel_common::risk::EvidenceEvaluation;
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 
 /// A tamper-evident record authorizing response actions with full explainability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +109,11 @@ impl PolicyEngine {
             decision: decision.clone(),
             evidence_summary,
             motivation: decision.reason.clone(),
-            signature: format!("sha256-sentinel-policy:{}:{}", ctx.process_key.pid, timestamp.timestamp()),
+            signature: format!(
+                "sha256-sentinel-policy:{}:{}",
+                ctx.process_key.pid,
+                timestamp.timestamp()
+            ),
         };
 
         (decision, record)
@@ -119,9 +123,9 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use sentinel_common::risk::{Confidence, Impact};
     use sentinel_common::policy::PolicyAction;
+    use sentinel_common::risk::{Confidence, Impact};
+    use std::path::PathBuf;
 
     #[test]
     fn test_policy_precedence_safety_constraints() {
@@ -136,7 +140,12 @@ mod tests {
     #[test]
     fn test_evidence_based_authorization_guard() {
         let engine = PolicyEngine::new(OperatingMode::Balanced);
-        let mut ctx = PolicyContext::new(ProcessKey::new(1234, 100), PathBuf::from("/usr/bin/backup-tool"), 1000, 1000);
+        let mut ctx = PolicyContext::new(
+            ProcessKey::new(1234, 100),
+            PathBuf::from("/usr/bin/backup-tool"),
+            1000,
+            1000,
+        );
         ctx.risk = Some(crate::risk::RiskAssessment::new(90, Vec::new()));
 
         // Evidence with low confidence in exfiltration (e.g. routine backup read)

@@ -28,7 +28,11 @@ impl IncidentCorrelator {
     }
 
     /// Check if an event for the given process key correlates with an existing open incident.
-    pub fn correlate_or_create<F>(&self, process_key: &ProcessKey, new_incident_id_fn: F) -> (String, bool)
+    pub fn correlate_or_create<F>(
+        &self,
+        process_key: &ProcessKey,
+        new_incident_id_fn: F,
+    ) -> (String, bool)
     where
         F: FnOnce() -> String,
     {

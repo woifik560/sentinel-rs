@@ -30,8 +30,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use sentinel_common::events::{
-    decode_flow_mark, encode_flow_mark, FlowContext, MAY_READ, MAY_WRITE,
-    PROT_EXEC, SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
+    decode_flow_mark, encode_flow_mark, FlowContext, MAY_READ, MAY_WRITE, PROT_EXEC,
+    SENTINEL_MARK_FLOW_ID_MASK, SENTINEL_MARK_REVAL_BIT, SENTINEL_SO_MARK_PREFIX,
 };
 use sentinel_common::ipc::{ClientRole, IpcMessage, PromptAction, PromptVerdict};
 use sentinel_common::process::{ProcessNode, SecretCategory};
@@ -39,8 +39,12 @@ use sentinel_common::risk::{
     calculate_shannon_entropy, is_cumulative_dns_tunnel, is_suspicious_dns_query,
     is_suspicious_dns_query_adaptive, RuleId,
 };
-use sentinel_ebpf::maps::{PtraceVerdict, TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict};
-use sentinel_ebpf::programs::bprm_check_security::{bpf_get_file_hash_simulated, is_memfd_or_fileless};
+use sentinel_ebpf::maps::{
+    PtraceVerdict, TaintFlags, TaintHygiene, TaintMapManager, UnixSendVerdict,
+};
+use sentinel_ebpf::programs::bprm_check_security::{
+    bpf_get_file_hash_simulated, is_memfd_or_fileless,
+};
 use sentinel_ebpf::programs::file_open::simulate_file_open_check;
 use sentinel_ebpf::programs::file_permission::evaluate_file_permission;
 use sentinel_ebpf::programs::file_receive::handle_file_receive;
@@ -73,13 +77,26 @@ fn test_1_cat_secret_pipe_curl() {
     assert!(!taint_mgr.is_tainted(curl_tgid));
 
     // 2. cat writes to pipe stdout -> INODE_STORAGE marked tainted
-    let write_res = evaluate_file_permission(&taint_mgr, cat_tgid, pipe_dev, pipe_ino, pipe_path, MAY_WRITE, true, false);
-    assert!(write_res.is_some(), "Pipe inode should inherit taint from cat");
+    let write_res = evaluate_file_permission(
+        &taint_mgr, cat_tgid, pipe_dev, pipe_ino, pipe_path, MAY_WRITE, true, false,
+    );
+    assert!(
+        write_res.is_some(),
+        "Pipe inode should inherit taint from cat"
+    );
 
     // 3. curl reads from pipe stdin -> curl TASK_STORAGE marked tainted
-    let read_res = evaluate_file_permission(&taint_mgr, curl_tgid, pipe_dev, pipe_ino, pipe_path, MAY_READ, true, false);
-    assert!(read_res.is_some(), "curl process should inherit taint from pipe");
-    assert!(taint_mgr.is_tainted(curl_tgid), "curl must be tainted after reading pipe");
+    let read_res = evaluate_file_permission(
+        &taint_mgr, curl_tgid, pipe_dev, pipe_ino, pipe_path, MAY_READ, true, false,
+    );
+    assert!(
+        read_res.is_some(),
+        "curl process should inherit taint from pipe"
+    );
+    assert!(
+        taint_mgr.is_tainted(curl_tgid),
+        "curl must be tainted after reading pipe"
+    );
 
     // 4. curl attempts outbound connection -> FastPath rejected, Hold in NFQUEUE
     let _flow_id = 42;
@@ -105,7 +122,10 @@ fn test_2_established_socket_bypass_sendmsg() {
     assert_eq!(initial_connect, SocketConnectVerdict::FastPathAccept);
 
     // 2. Process later accesses browser cookies/passwords
-    let secret = simulate_file_open_check("/home/user/.config/google-chrome/Default/Login Data", "/tmp/stealer");
+    let secret = simulate_file_open_check(
+        "/home/user/.config/google-chrome/Default/Login Data",
+        "/tmp/stealer",
+    );
     assert_eq!(secret, Some(SecretCategory::BrowserCookies));
     taint_mgr.mark_tainted(tgid);
     assert!(taint_mgr.is_tainted(tgid));
@@ -113,9 +133,7 @@ fn test_2_established_socket_bypass_sendmsg() {
     // 3. Process sends data on the PREVIOUSLY ESTABLISHED socket
     let flow_id = 105;
     let send_verdict = evaluate_socket_sendmsg_ext(
-        &taint_mgr,
-        tgid,
-        true,  // is_preopened established socket
+        &taint_mgr, tgid, true,  // is_preopened established socket
         false, // not high risk outright
         flow_id,
     );
@@ -123,7 +141,10 @@ fn test_2_established_socket_bypass_sendmsg() {
     // Must tag packet with revalidation mark (0x40000000 | flow_id)
     match send_verdict {
         SocketSendmsgVerdict::HoldForRevalidation { reval_mark } => {
-            assert_eq!(reval_mark & SENTINEL_MARK_REVAL_BIT, SENTINEL_MARK_REVAL_BIT);
+            assert_eq!(
+                reval_mark & SENTINEL_MARK_REVAL_BIT,
+                SENTINEL_MARK_REVAL_BIT
+            );
             assert_eq!(reval_mark & SENTINEL_MARK_FLOW_ID_MASK, flow_id);
         }
         _ => panic!("Expected HoldForRevalidation for sendmsg on established socket after taint"),
@@ -140,7 +161,8 @@ fn test_3_scm_rights_and_mmap_file() {
     let receiver_tgid = 3002;
 
     // 1. Sender reads crypto wallet
-    let secret = simulate_file_open_check("/home/user/.electrum/wallets/default_wallet", "/tmp/worker");
+    let secret =
+        simulate_file_open_check("/home/user/.electrum/wallets/default_wallet", "/tmp/worker");
     assert_eq!(secret, Some(SecretCategory::CryptoWallet));
     taint_mgr.mark_tainted(sender_tgid);
 
@@ -148,12 +170,25 @@ fn test_3_scm_rights_and_mmap_file() {
     assert!(!taint_mgr.is_tainted(receiver_tgid));
     let s_flags = taint_mgr.get_flags(sender_tgid);
     handle_file_receive(&taint_mgr, sender_tgid, receiver_tgid, s_flags.bits());
-    assert!(taint_mgr.is_tainted(receiver_tgid), "Receiver must be tainted via SCM_RIGHTS fd receive");
+    assert!(
+        taint_mgr.is_tainted(receiver_tgid),
+        "Receiver must be tainted via SCM_RIGHTS fd receive"
+    );
 
     // 3. Receiver mmaps file with PROT_EXEC
     let prot_read_exec = 0x1 | 0x4; // PROT_READ | PROT_EXEC
-    let mmap_verdict = handle_mmap_file(&taint_mgr, receiver_tgid, "/tmp/in_memory.so", prot_read_exec, 0x02);
-    assert_eq!(mmap_verdict, MmapVerdict::TaintedExecutionBlocked, "Executable mmap by tainted receiver must be blocked");
+    let mmap_verdict = handle_mmap_file(
+        &taint_mgr,
+        receiver_tgid,
+        "/tmp/in_memory.so",
+        prot_read_exec,
+        0x02,
+    );
+    assert_eq!(
+        mmap_verdict,
+        MmapVerdict::TaintedExecutionBlocked,
+        "Executable mmap by tainted receiver must be blocked"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -188,12 +223,19 @@ fn test_5_prctl_comm_spoofing_defense() {
 
     // Sentinel does not rely on comm! It checks real_exe against dpkg database and root ownership.
     let is_trusted_dpkg = real_exe.starts_with("/usr/bin/") && !real_exe.starts_with("/tmp/");
-    assert!(!is_trusted_dpkg, "Real exe in /tmp cannot claim dpkg trust even if comm is 'ssh'");
+    assert!(
+        !is_trusted_dpkg,
+        "Real exe in /tmp cannot claim dpkg trust even if comm is 'ssh'"
+    );
 
     // Node resolution
     let node = ProcessNode::new(4040, 1, 1000, real_exe.clone());
     assert_eq!(node.exe_path, PathBuf::from("/tmp/evil"));
-    assert_ne!(node.exe_name(), "ssh", "exe_name must reflect binary file name, not spoofed comm");
+    assert_ne!(
+        node.exe_name(),
+        "ssh",
+        "exe_name must reflect binary file name, not spoofed comm"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -214,7 +256,11 @@ fn test_6_p0_unauthorized_sock_connect_rejection() {
         ClientRole::ReadOnly
     };
 
-    assert_eq!(role, ClientRole::ReadOnly, "Attacker must only receive ReadOnly role");
+    assert_eq!(
+        role,
+        ClientRole::ReadOnly,
+        "Attacker must only receive ReadOnly role"
+    );
 
     // When ReadOnly client attempts Verdict, daemon rejects with AuthError
     let incoming_msg = IpcMessage::Verdict(PromptVerdict {
@@ -248,15 +294,27 @@ fn test_7_ptrace_memory_snooping_lsm_defense() {
 
     // Attacker of the same UID tries to attach ptrace to GUI (caller_has_cap = false)
     let gui_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, gui_pid, 0);
-    assert_eq!(gui_target_blocked, PtraceVerdict::Deny, "-EPERM must be returned when same-UID process ptraces sentinel-gui");
+    assert_eq!(
+        gui_target_blocked,
+        PtraceVerdict::Deny,
+        "-EPERM must be returned when same-UID process ptraces sentinel-gui"
+    );
 
     // Attacker tries to attach ptrace to sentineld
     let daemon_target_blocked = taint_mgr.handle_ptrace_access_check(attacker_pid, daemon_pid, 0);
-    assert_eq!(daemon_target_blocked, PtraceVerdict::Deny, "-EPERM must be returned when ptracing sentineld");
+    assert_eq!(
+        daemon_target_blocked,
+        PtraceVerdict::Deny,
+        "-EPERM must be returned when ptracing sentineld"
+    );
 
     // Normal root debugger with CAP_SYS_PTRACE can attach
     let root_allowed = taint_mgr.handle_ptrace_access_check(0, gui_pid, 0);
-    assert_eq!(root_allowed, PtraceVerdict::Allow, "Root with CAP_SYS_PTRACE is permitted");
+    assert_eq!(
+        root_allowed,
+        PtraceVerdict::Allow,
+        "Root with CAP_SYS_PTRACE is permitted"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -273,14 +331,26 @@ fn test_8_ipc_broker_isolation_anti_explosion() {
     taint_mgr.register_ipc_broker(dbus_daemon_pid);
 
     // Tainted app sends IPC to dbus-daemon
-    let broker_verdict = taint_mgr.handle_unix_may_send(tainted_app, dbus_daemon_pid, "dbus-daemon");
-    assert_eq!(broker_verdict, UnixSendVerdict::Allow, "D-Bus daemon must NOT inherit taint");
-    assert!(!taint_mgr.is_tainted(dbus_daemon_pid), "dbus-daemon must remain clean");
+    let broker_verdict =
+        taint_mgr.handle_unix_may_send(tainted_app, dbus_daemon_pid, "dbus-daemon");
+    assert_eq!(
+        broker_verdict,
+        UnixSendVerdict::Allow,
+        "D-Bus daemon must NOT inherit taint"
+    );
+    assert!(
+        !taint_mgr.is_tainted(dbus_daemon_pid),
+        "dbus-daemon must remain clean"
+    );
 
     // dbus-daemon delivers a message to other_clean_app
-    let other_verdict = taint_mgr.handle_unix_may_send(dbus_daemon_pid, other_clean_app, "gnome-calculator");
+    let other_verdict =
+        taint_mgr.handle_unix_may_send(dbus_daemon_pid, other_clean_app, "gnome-calculator");
     assert_eq!(other_verdict, UnixSendVerdict::Allow);
-    assert!(!taint_mgr.is_tainted(other_clean_app), "Clean app must not become tainted via D-Bus");
+    assert!(
+        !taint_mgr.is_tainted(other_clean_app),
+        "Clean app must not become tainted via D-Bus"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -319,7 +389,10 @@ fn test_9_dynamic_mark_correlation_concurrent() {
     assert_eq!(recovered_flow_id, 7);
 
     let retrieved_ctx = taint_mgr.get_flow_context(received_mark);
-    assert!(retrieved_ctx.is_some(), "FlowContext must be found synchronously by mark");
+    assert!(
+        retrieved_ctx.is_some(),
+        "FlowContext must be found synchronously by mark"
+    );
     let ctx = retrieved_ctx.unwrap();
     assert_eq!(ctx.tgid, 9007);
     assert_eq!(ctx.sock_cookie, 0x12340007);
@@ -340,7 +413,8 @@ async fn test_10_syn_retransmit_dedup_and_duration_allow() {
         packet_queue: Vec<u32>, // Simulated packet IDs
     }
 
-    let pending: Arc<Mutex<HashMap<String, PendingIncident>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<String, PendingIncident>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // 1. Packet 1 arrives (Initial SYN)
     {
@@ -373,7 +447,11 @@ async fn test_10_syn_retransmit_dedup_and_duration_allow() {
     // Assert: Only ONE incident was created, holding all 3 retransmitted packets
     {
         let map = pending.lock().await;
-        assert_eq!(map.len(), 1, "Only 1 dialog should be created for SYN retransmits");
+        assert_eq!(
+            map.len(),
+            1,
+            "Only 1 dialog should be created for SYN retransmits"
+        );
         let inc = map.get(incident_id).unwrap();
         assert_eq!(inc.packet_queue.len(), 3);
     }
@@ -390,7 +468,11 @@ async fn test_10_syn_retransmit_dedup_and_duration_allow() {
         }
     }
 
-    assert_eq!(released_packets, vec![1001, 1002, 1003], "All queued SYN packets released at once");
+    assert_eq!(
+        released_packets,
+        vec![1001, 1002, 1003],
+        "All queued SYN packets released at once"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -408,12 +490,24 @@ fn test_11_nftables_bitmask_collision_free() {
         let reval_flow_mark = encode_flow_mark(flow_id, true);
 
         // 1. New flow must match ONLY Rule 3 (New flow), NEVER Rule 1 (Reval)
-        assert_eq!(new_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_NEW_MATCH);
-        assert_ne!(new_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_REVAL_MATCH);
+        assert_eq!(
+            new_flow_mark & SENTINEL_MARK_NETFILTER_MASK,
+            SENTINEL_MARK_NEW_MATCH
+        );
+        assert_ne!(
+            new_flow_mark & SENTINEL_MARK_NETFILTER_MASK,
+            SENTINEL_MARK_REVAL_MATCH
+        );
 
         // 2. Revalidation flow must match Rule 1 (Reval), NOT Rule 3 (New flow)
-        assert_eq!(reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_REVAL_MATCH);
-        assert_ne!(reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK, SENTINEL_MARK_NEW_MATCH);
+        assert_eq!(
+            reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK,
+            SENTINEL_MARK_REVAL_MATCH
+        );
+        assert_ne!(
+            reval_flow_mark & SENTINEL_MARK_NETFILTER_MASK,
+            SENTINEL_MARK_NEW_MATCH
+        );
 
         // 3. Both must decode cleanly to the exact same flow_id
         let (_, reval_1, id_1) = decode_flow_mark(new_flow_mark);
@@ -486,7 +580,10 @@ fn test_13_dbus_systemd_spawn_link() {
     // 2. Spawned process was launched via D-Bus / systemd-run (PPID is PID 1)
     tracker.handle_fork(1, spawned_tgid);
     let initial_spawned = tracker.get(spawned_tgid).unwrap();
-    assert!(!initial_spawned.has_secret_access(), "Initial process before broker link has no secrets");
+    assert!(
+        !initial_spawned.has_secret_access(),
+        "Initial process before broker link has no secrets"
+    );
 
     // 3. Sentinel-RS detects the IPC spawn invocation and links them
     tracker.link_ipc_spawn(attacker_tgid, spawned_tgid);
@@ -556,7 +653,10 @@ fn test_15_multidistro_package_integrity_and_kernel_cache() {
     let test_file = temp_dir.join("sentinel_test_pkg_hash.bin");
     std::fs::write(&test_file, b"test package binary payload").unwrap();
     let hash = bpf_get_file_hash_simulated(&test_file);
-    assert!(hash.is_some(), "Kernel kfunc bpf_get_file_hash must return cryptographic hash");
+    assert!(
+        hash.is_some(),
+        "Kernel kfunc bpf_get_file_hash must return cryptographic hash"
+    );
     let _ = std::fs::remove_file(test_file);
 }
 
@@ -585,7 +685,8 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
 
     // 4. Non-root unverified process attempts connection to /run/sentinel/sentinel.sock -> Kernel returns Block (-EACCES)
     let rogue_tgid = 9999;
-    let rogue_connect = taint_mgr.handle_unix_may_send(rogue_tgid, 1, "/run/sentinel/sentinel.sock");
+    let rogue_connect =
+        taint_mgr.handle_unix_may_send(rogue_tgid, 1, "/run/sentinel/sentinel.sock");
     assert_eq!(
         rogue_connect,
         UnixSendVerdict::Block,
@@ -602,8 +703,8 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         hostile_so_cache,
         PROT_EXEC,
         0,
-        1000,   // non-root inode_uid
-        0o755,  // inode_mode
+        1000,  // non-root inode_uid
+        0o755, // inode_mode
     );
     assert_eq!(
         mmap_verdict_cache,
@@ -624,8 +725,8 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
         hostile_so_vartmp,
         PROT_EXEC,
         0,
-        0,      // root owned...
-        0o777,  // ...BUT world-writable (mode & 0o022 != 0)!
+        0,     // root owned...
+        0o777, // ...BUT world-writable (mode & 0o022 != 0)!
     );
     assert_eq!(
         mmap_verdict_vartmp,
@@ -637,15 +738,8 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
     // 6. Two-step Injection Defense (lsm/file_mprotect: mmap RW -> mprotect RX)
     taint_mgr.set_verified_gui(gui_tgid, true);
     // Attacker allocates anonymous RW memory and calls mprotect(PROT_EXEC)
-    let mprotect_anon = handle_file_mprotect(
-        &taint_mgr,
-        gui_tgid,
-        None::<&Path>,
-        0,
-        PROT_EXEC,
-        0,
-        0,
-    );
+    let mprotect_anon =
+        handle_file_mprotect(&taint_mgr, gui_tgid, None::<&Path>, 0, PROT_EXEC, 0, 0);
     assert_eq!(
         mprotect_anon,
         MmapVerdict::DenyMmap,
@@ -654,7 +748,8 @@ fn test_16_zero_userspace_gui_attestation_and_sealing() {
     assert!(!taint_mgr.is_verified_gui(gui_tgid));
 
     // Subsequent connect attempt by compromised GUI is now blocked
-    let compromised_connect = taint_mgr.handle_unix_may_send(gui_tgid, 1, "/run/sentinel/sentinel.sock");
+    let compromised_connect =
+        taint_mgr.handle_unix_may_send(gui_tgid, 1, "/run/sentinel/sentinel.sock");
     assert_eq!(compromised_connect, UnixSendVerdict::Block);
 }
 
@@ -732,11 +827,15 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
         TaintFlags::BIT_SSH_KEYS
     );
     assert_eq!(
-        TaintHygiene::get_secret_domain_for_path("/home/user/.config/google-chrome/Default/Cookies"),
+        TaintHygiene::get_secret_domain_for_path(
+            "/home/user/.config/google-chrome/Default/Cookies"
+        ),
         TaintFlags::BIT_CHROMIUM_DATA
     );
     assert_eq!(
-        TaintHygiene::get_secret_domain_for_path("/home/user/.mozilla/firefox/profiles/cookies.sqlite"),
+        TaintHygiene::get_secret_domain_for_path(
+            "/home/user/.mozilla/firefox/profiles/cookies.sqlite"
+        ),
         TaintFlags::BIT_FIREFOX_DATA
     );
     assert_eq!(
@@ -744,17 +843,31 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
         TaintFlags::BIT_CLOUD_CREDS
     );
     assert_eq!(
-        TaintHygiene::get_secret_domain_for_path("/home/user/.local/share/TelegramDesktop/tdata/key_datas"),
+        TaintHygiene::get_secret_domain_for_path(
+            "/home/user/.local/share/TelegramDesktop/tdata/key_datas"
+        ),
         TaintFlags::BIT_TELEGRAM_DATA
     );
 
     // 2. Owner Policy: Chrome accessing Chrome data
-    assert!(TaintHygiene::is_secret_owner("chrome", "/home/user/.config/google-chrome/Default/Cookies"));
-    assert!(TaintHygiene::is_secret_owner("google-chrome", "/home/user/.config/google-chrome/Default/Cookies"));
+    assert!(TaintHygiene::is_secret_owner(
+        "chrome",
+        "/home/user/.config/google-chrome/Default/Cookies"
+    ));
+    assert!(TaintHygiene::is_secret_owner(
+        "google-chrome",
+        "/home/user/.config/google-chrome/Default/Cookies"
+    ));
     // Chrome accessing SSH keys -> NOT owner!
-    assert!(!TaintHygiene::is_secret_owner("chrome", "/home/user/.ssh/id_rsa"));
+    assert!(!TaintHygiene::is_secret_owner(
+        "chrome",
+        "/home/user/.ssh/id_rsa"
+    ));
     // Stealer or curl accessing Chrome data -> NOT owner!
-    assert!(!TaintHygiene::is_secret_owner("curl", "/home/user/.config/google-chrome/Default/Cookies"));
+    assert!(!TaintHygiene::is_secret_owner(
+        "curl",
+        "/home/user/.config/google-chrome/Default/Cookies"
+    ));
 
     // 2b. Anti-Spoofing for Owner Policy:
     // A. Legitimate system Chrome in /usr/bin/google-chrome with root ownership and trusted integrity
@@ -765,10 +878,10 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
         1,
         1001,
         chrome_cookies,
-        true,   // is_trusted_pkg
-        0,      // inode_uid (root)
-        0o755,  // inode_mode
-        false,  // has_untrusted_env
+        true,  // is_trusted_pkg
+        0,     // inode_uid (root)
+        0o755, // inode_mode
+        false, // has_untrusted_env
     ));
 
     // B. Spoofing Attempt 1: Fake binary named "chrome" launched from user home directory
@@ -779,8 +892,8 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
             1,
             2002,
             chrome_cookies,
-            false,  // not a system package
-            1000,   // user-owned
+            false, // not a system package
+            1000,  // user-owned
             0o755,
             false,
         ),
@@ -810,7 +923,7 @@ fn test_18_scoped_taint_domains_and_owner_policy() {
             true,
             0,
             0o755,
-            true,   // compromised environment!
+            true, // compromised environment!
         ),
         "Compromised Chrome environment must revoke secret owner privilege!"
     );
@@ -871,7 +984,10 @@ fn test_19_staging_attack_intermediate_file_taint() {
         false,
         false,
     );
-    assert!(write_res.is_some(), "Staging file inode must be marked with taint on write");
+    assert!(
+        write_res.is_some(),
+        "Staging file inode must be marked with taint on write"
+    );
 
     // 3. Script 2 reads the intermediate file
     let read_res = evaluate_file_permission(
@@ -884,7 +1000,10 @@ fn test_19_staging_attack_intermediate_file_taint() {
         false,
         false,
     );
-    assert!(read_res.is_some(), "Script 2 must inherit taint upon reading staging file");
+    assert!(
+        read_res.is_some(),
+        "Script 2 must inherit taint upon reading staging file"
+    );
 
     // Script 2 is now tainted with BIT_SSH_KEYS!
     assert!(taint_mgr.is_tainted(script2_tgid));
@@ -1005,7 +1124,11 @@ fn test_21_sntctl_setup_kernel_cmdline_patching() {
     assert!(patched.contains("root=UUID=123-abc"));
     assert!(patched.contains("quiet"));
     assert!(patched.ends_with(target_lsm));
-    assert_eq!(patched.matches("lsm=").count(), 1, "Only one lsm= parameter must be present");
+    assert_eq!(
+        patched.matches("lsm=").count(),
+        1,
+        "Only one lsm= parameter must be present"
+    );
 
     // 2. Test /etc/default/grub patching
     let grub_cfg = "\
@@ -1016,7 +1139,9 @@ GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"
 GRUB_CMDLINE_LINUX=\"\"
 ";
     let patched_grub = patch_grub_default(grub_cfg, "lsm=landlock,lockdown,yama,apparmor,bpf");
-    assert!(patched_grub.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,lockdown,yama,apparmor,bpf\""));
+    assert!(patched_grub.contains(
+        "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,lockdown,yama,apparmor,bpf\""
+    ));
     assert!(patched_grub.contains("GRUB_DISTRIBUTOR=\"Ubuntu\""));
 }
 
@@ -1038,5 +1163,3 @@ fn test_22_kernel_preflight_and_safe_version_check() {
     assert!(!verify_kernel_version_safe("5.10.0-1-amd64", "6.1"));
     assert!(!verify_kernel_version_safe("4.19.0-6-amd64", "6.1"));
 }
-
-

@@ -1,8 +1,8 @@
 //! Risk score explanations for security operators and telemetry.
 
 use super::evidence::RiskEvidence;
-use serde::{Deserialize, Serialize};
 use sentinel_common::risk::SeverityLevel;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskAssessment {

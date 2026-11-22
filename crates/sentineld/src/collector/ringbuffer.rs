@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use sentinel_common::events::EbpfEvent;
 use crate::collector::event_metrics::EventMetrics;
 use crate::health::FailurePolicyManager;
+use sentinel_common::events::EbpfEvent;
 
 /// Rate limiter state per PID to throttle event flooding (e.g. fork bombs).
 struct PidRateLimiter {
@@ -125,7 +125,11 @@ impl RingBufferConsumer {
                         }
                         warn!("Event collection queue full! Dropping event to avoid memory saturation");
                         // As a fail-safe backpressure attempt, await with a strict timeout
-                        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(5), tx.send(evt)).await;
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from_millis(5),
+                            tx.send(evt),
+                        )
+                        .await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         debug!("Event dispatcher channel closed. Exiting RingBuffer consumer.");

@@ -1,10 +1,10 @@
 //! `sntctl protection` subcommands.
 
-use clap::Subcommand;
-use std::path::Path;
-use sentinel_common::ipc::{IpcCommand, IpcResponse};
 use crate::client::send_command;
 use crate::output::{print_header, print_json, print_row};
+use clap::Subcommand;
+use sentinel_common::ipc::{IpcCommand, IpcResponse};
+use std::path::Path;
 
 #[derive(Subcommand, Debug)]
 pub enum ProtectionAction {
@@ -16,7 +16,11 @@ pub enum ProtectionAction {
     Disable,
 }
 
-pub async fn run_protection(socket_path: &Path, action: ProtectionAction, json_output: bool) -> anyhow::Result<()> {
+pub async fn run_protection(
+    socket_path: &Path,
+    action: ProtectionAction,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let cmd = match action {
         ProtectionAction::Status => IpcCommand::ProtectionStatus,
         ProtectionAction::Enable => IpcCommand::ProtectionEnable,
@@ -32,7 +36,10 @@ pub async fn run_protection(socket_path: &Path, action: ProtectionAction, json_o
                 print_header("Protection Status");
                 if let Some(obj) = data.as_object() {
                     for (k, v) in obj {
-                        let val_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+                        let val_str = v
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string());
                         print_row(k, &val_str);
                     }
                 }

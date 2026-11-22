@@ -15,8 +15,13 @@ pub enum StorageCommand {
     StoreEvent(NormalizedEvent),
     StoreIncident(StoredIncidentRecord),
     StoreResponse(StoredResponseRecord),
-    LinkIncidentEvent { incident_id: String, event_id: String },
-    PurgeOldRecords { retention_days: i64 },
+    LinkIncidentEvent {
+        incident_id: String,
+        event_id: String,
+    },
+    PurgeOldRecords {
+        retention_days: i64,
+    },
     CheckpointWal,
 }
 
@@ -36,11 +41,24 @@ pub fn get_available_disk_space_mb(path: &Path) -> u64 {
         let mut stat = MaybeUninit::<libc::statvfs>::uninit();
         if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
             let s = unsafe { stat.assume_init() };
-            let free_bytes = s.f_bavail as u64 * s.f_frsize as u64;
+            let free_bytes = s.f_bavail * s.f_frsize;
             return free_bytes / (1024 * 1024);
         }
     }
     1024
+}
+
+/// Open an SQLite connection configured with WAL mode, foreign keys, and 5-second busy timeout.
+pub fn open_sqlite_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(conn)
 }
 
 impl StorageManager {
@@ -51,10 +69,13 @@ impl StorageManager {
 
         // Initialize and verify migrations synchronously on startup
         {
-            let mut conn = Connection::open(&db_path)?;
+            let mut conn = open_sqlite_connection(&db_path)?;
             initialize_database(&mut conn)?;
             if !check_database_integrity(&conn)? {
-                warn!("SQLite integrity check returned non-ok status for {}", db_path.display());
+                warn!(
+                    "SQLite integrity check returned non-ok status for {}",
+                    db_path.display()
+                );
             } else {
                 info!("Database integrity verified ok for {}", db_path.display());
             }
@@ -72,7 +93,7 @@ impl StorageManager {
 
         // Spawn dedicated blocking SQLite worker thread
         std::thread::spawn(move || {
-            let mut conn = match Connection::open(&worker_path) {
+            let mut conn = match open_sqlite_connection(&worker_path) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to open SQLite worker connection: {}", e);
@@ -80,7 +101,10 @@ impl StorageManager {
                 }
             };
 
-            info!("SQLite storage worker thread active on {}", worker_path.display());
+            info!(
+                "SQLite storage worker thread active on {}",
+                worker_path.display()
+            );
 
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 if let Err(e) = execute_storage_command(&mut conn, &worker_path, cmd) {
@@ -107,14 +131,20 @@ impl StorageManager {
 
     /// Asynchronously queue an event for storage without blocking critical hot path.
     pub fn queue_event(&self, event: NormalizedEvent) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.cmd_tx.try_send(StorageCommand::StoreEvent(event)) {
-            warn!("Storage write queue full! Dropping event persistence to preserve kernel latency");
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            self.cmd_tx.try_send(StorageCommand::StoreEvent(event))
+        {
+            warn!(
+                "Storage write queue full! Dropping event persistence to preserve kernel latency"
+            );
         }
     }
 
     /// Asynchronously queue an incident for storage.
     pub fn queue_incident(&self, incident: StoredIncidentRecord) {
-        let _ = self.cmd_tx.try_send(StorageCommand::StoreIncident(incident));
+        let _ = self
+            .cmd_tx
+            .try_send(StorageCommand::StoreIncident(incident));
     }
 
     /// Asynchronously queue a response action record for storage.
@@ -124,12 +154,17 @@ impl StorageManager {
 
     /// Link incident to event.
     pub fn link_incident_event(&self, incident_id: String, event_id: String) {
-        let _ = self.cmd_tx.try_send(StorageCommand::LinkIncidentEvent { incident_id, event_id });
+        let _ = self.cmd_tx.try_send(StorageCommand::LinkIncidentEvent {
+            incident_id,
+            event_id,
+        });
     }
 
     /// Trigger retention purge (default 14 days).
     pub fn purge_retention(&self, retention_days: i64) {
-        let _ = self.cmd_tx.try_send(StorageCommand::PurgeOldRecords { retention_days });
+        let _ = self
+            .cmd_tx
+            .try_send(StorageCommand::PurgeOldRecords { retention_days });
     }
 
     /// Trigger WAL truncation checkpoint.
@@ -138,8 +173,12 @@ impl StorageManager {
     }
 
     /// Query recent incidents synchronously for sntctl CLI.
-    pub fn list_incidents(&self, limit: usize, offset: usize) -> rusqlite::Result<Vec<StoredIncidentRecord>> {
-        let conn = Connection::open(&self.db_path)?;
+    pub fn list_incidents(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<StoredIncidentRecord>> {
+        let conn = open_sqlite_connection(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT incident_id, created_at, updated_at, severity, risk_score, process_key, status, verdict, human_summary, details_json
              FROM incidents
@@ -180,7 +219,7 @@ impl StorageManager {
 
     /// Retrieve incident by ID.
     pub fn get_incident(&self, id: &str) -> rusqlite::Result<Option<StoredIncidentRecord>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = open_sqlite_connection(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT incident_id, created_at, updated_at, severity, risk_score, process_key, status, verdict, human_summary, details_json
              FROM incidents
@@ -217,18 +256,36 @@ impl StorageManager {
 
     /// Clear all stored incidents (for sntctl incidents clear).
     pub fn clear_all_incidents(&self) -> rusqlite::Result<usize> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = open_sqlite_connection(&self.db_path)?;
         conn.execute("DELETE FROM incidents", [])
     }
 
     /// Count total recorded incidents.
     pub fn count_incidents(&self) -> rusqlite::Result<usize> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = open_sqlite_connection(&self.db_path)?;
         conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| row.get(0))
     }
 }
 
-fn execute_storage_command(conn: &mut Connection, db_path: &Path, cmd: StorageCommand) -> rusqlite::Result<()> {
+fn execute_storage_command(
+    conn: &mut Connection,
+    db_path: &Path,
+    cmd: StorageCommand,
+) -> rusqlite::Result<()> {
+    // DATABASE QUOTA GUARD: prevent database growth exceeding 500 MB
+    let db_size_mb = std::fs::metadata(db_path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(0);
+    if db_size_mb > 500 {
+        warn!(
+            "DATABASE QUOTA GUARD: Database file size exceeds 500 MB ({} MB). Purging oldest raw events and checkpointing WAL...",
+            db_size_mb
+        );
+        let cutoff = (Utc::now() - Duration::days(3)).to_rfc3339();
+        let _ = conn.execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff]);
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
     match cmd {
         StorageCommand::StoreEvent(event) => {
             // TASK-P1-19: Disk Quota Guard: if disk space is < 500 MB, drop raw events to prevent disk exhaustion
@@ -309,7 +366,10 @@ fn execute_storage_command(conn: &mut Connection, db_path: &Path, cmd: StorageCo
             )?;
         }
 
-        StorageCommand::LinkIncidentEvent { incident_id, event_id } => {
+        StorageCommand::LinkIncidentEvent {
+            incident_id,
+            event_id,
+        } => {
             conn.execute(
                 "INSERT OR IGNORE INTO incident_events (incident_id, event_id) VALUES (?1, ?2)",
                 params![incident_id, event_id],
@@ -320,7 +380,10 @@ fn execute_storage_command(conn: &mut Connection, db_path: &Path, cmd: StorageCo
             let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
             let count = conn.execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff])?;
             if count > 0 {
-                info!("Purged {} raw events older than {} days (retention policy)", count, retention_days);
+                info!(
+                    "Purged {} raw events older than {} days (retention policy)",
+                    count, retention_days
+                );
             }
         }
 
@@ -331,4 +394,77 @@ fn execute_storage_command(conn: &mut Connection, db_path: &Path, cmd: StorageCo
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_sqlite_connection_pragmas() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sentinel_db_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_file = temp_dir.join("test.db");
+
+        let conn = open_sqlite_connection(&db_file).expect("Failed to open connection");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_uppercase(), "WAL");
+
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_storage_readers_and_writers() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sentinel_concurrent_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_file = temp_dir.join("test_concurrent.db");
+
+        let storage =
+            StorageManager::new(db_file.clone(), 1000).expect("Failed to create storage manager");
+
+        // Concurrently insert incidents and query
+        for i in 0..20 {
+            let record = StoredIncidentRecord {
+                incident_id: format!("inc-{}", i),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                severity: "HIGH".into(),
+                risk_score: 85,
+                process_key: "123:456".into(),
+                status: "ACTIVE".into(),
+                verdict: "BLOCK".into(),
+                human_summary: format!("Incident test {}", i),
+                details_json: "{}".into(),
+            };
+            storage.queue_incident(record);
+        }
+
+        // Concurrently query without SQLITE_BUSY error
+        let mut success_reads = 0;
+        for _ in 0..10 {
+            if storage.list_incidents(50, 0).is_ok() {
+                success_reads += 1;
+            }
+        }
+        assert_eq!(
+            success_reads, 10,
+            "All 10 concurrent reads must succeed without SQLITE_BUSY"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

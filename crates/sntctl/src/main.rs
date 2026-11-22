@@ -119,6 +119,10 @@ enum Commands {
         /// Force re-configuration even if BPF is already present in /sys/kernel/security/lsm
         #[arg(long)]
         force: bool,
+
+        /// Rollback previous bootloader configuration changes from backup
+        #[arg(long)]
+        rollback: bool,
     },
 }
 
@@ -178,11 +182,15 @@ async fn main() -> anyhow::Result<()> {
             run_protection(&sock, action, json).await?
         }
         Commands::Events { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_events(&sock, action, json).await?
         }
         Commands::Incidents { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_incidents(&sock, action, json).await?
         }
         Commands::Policy { action } => {
@@ -200,12 +208,16 @@ async fn main() -> anyhow::Result<()> {
             run_policy(&sock, action, json).await?
         }
         Commands::Rules { action } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_rules(&sock, action, json).await?
         }
         Commands::Process { action } => {
             let default_sock = match action {
-                ProcessAction::Kill { .. } | ProcessAction::Suspend { .. } => DEFAULT_PRIVILEGED_SOCKET,
+                ProcessAction::Kill { .. } | ProcessAction::Suspend { .. } => {
+                    DEFAULT_PRIVILEGED_SOCKET
+                }
                 _ => DEFAULT_READONLY_SOCKET,
             };
             let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
@@ -213,7 +225,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Network { action } => {
             let default_sock = match action {
-                NetworkAction::Isolate { .. } | NetworkAction::Unisolate | NetworkAction::ConfirmIsolation => DEFAULT_PRIVILEGED_SOCKET,
+                NetworkAction::Isolate { .. }
+                | NetworkAction::Unisolate
+                | NetworkAction::ConfirmIsolation => DEFAULT_PRIVILEGED_SOCKET,
                 _ => DEFAULT_READONLY_SOCKET,
             };
             let sock = cli.socket.unwrap_or_else(|| PathBuf::from(default_sock));
@@ -221,18 +235,24 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { action } => run_config(action).await?,
         Commands::Diagnostics => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_diagnostics(&sock, json).await?
         }
         Commands::Unfreeze { tgid } => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVILEGED_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_PRIVILEGED_SOCKET));
             run_unfreeze(&sock, tgid).await?
         }
         Commands::Monitor => {
-            let sock = cli.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
+            let sock = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_monitor(&sock).await?
         }
-        Commands::SetupKernel { force } => run_setup_kernel(force).await?,
+        Commands::SetupKernel { force, rollback } => run_setup_kernel(force, rollback).await?,
     }
 
     Ok(())
@@ -258,20 +278,30 @@ async fn run_monitor(socket_path: &Path) -> anyhow::Result<()> {
     let payload = serde_json::to_string(&sub)? + "\n";
     writer.write_all(payload.as_bytes()).await?;
 
-    println!("Streaming Sentinel-RS firewall events from {} (Ctrl+C to quit)...", socket_path.display());
+    println!(
+        "Streaming Sentinel-RS firewall events from {} (Ctrl+C to quit)...",
+        socket_path.display()
+    );
     let mut line = String::new();
     while reader.read_line(&mut line).await? > 0 {
         let trimmed = line.trim();
         if let Ok(msg) = serde_json::from_str::<IpcMessage>(trimmed) {
             match msg {
-                IpcMessage::Event { timestamp, summary, risk_score } => {
+                IpcMessage::Event {
+                    timestamp,
+                    summary,
+                    risk_score,
+                } => {
                     let score_str = risk_score
                         .map(|s| format!(" [Risk: {}]", s))
                         .unwrap_or_default();
                     println!("[{}] {}{}", timestamp, summary, score_str);
                 }
                 IpcMessage::Prompt(p) => {
-                    println!("[ALERT] Incident {} (Risk: {}/100)", p.incident_id, p.risk_score);
+                    println!(
+                        "[ALERT] Incident {} (Risk: {}/100)",
+                        p.incident_id, p.risk_score
+                    );
                 }
                 _ => {}
             }

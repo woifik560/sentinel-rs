@@ -2,10 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use sentinel_common::policy::PolicyAction;
-use sentinel_common::risk::SeverityLevel;
 use crate::collector::{NormalizedEvent, NormalizedEventType};
 use crate::lineage::LineageTracker;
+use sentinel_common::policy::PolicyAction;
+use sentinel_common::risk::SeverityLevel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BehaviorRule {
@@ -33,6 +33,7 @@ pub struct DetectionMatch {
 }
 
 impl BehaviorRule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: &str,
         version: u32,
@@ -76,7 +77,10 @@ impl BehaviorRule {
             "RULE_SUSPICIOUS_EXEC_PATH" => {
                 if let Some(ref path) = event.exe_path {
                     let p = path.to_string_lossy();
-                    if p.starts_with("/tmp/") || p.starts_with("/dev/shm/") || p.starts_with("/var/tmp/") {
+                    if p.starts_with("/tmp/")
+                        || p.starts_with("/dev/shm/")
+                        || p.starts_with("/var/tmp/")
+                    {
                         return Some(DetectionMatch {
                             rule_id: self.id.clone(),
                             rule_name: self.name.clone(),
@@ -91,21 +95,35 @@ impl BehaviorRule {
             }
 
             "RULE_ANONYMOUS_MEMFD_EXEC" => {
-                if let crate::collector::EventDetails::ProcessExec { is_memfd: true, ref exe_path, .. } = event.details {
+                if let crate::collector::EventDetails::ProcessExec {
+                    is_memfd: true,
+                    ref exe_path,
+                    ..
+                } = event.details
+                {
                     return Some(DetectionMatch {
                         rule_id: self.id.clone(),
                         rule_name: self.name.clone(),
                         severity: self.severity,
                         weight: self.risk_weight,
                         action: self.recommended_action,
-                        reason: format!("Fileless execution detected from anonymous memory (memfd): {}", exe_path.display()),
+                        reason: format!(
+                            "Fileless execution detected from anonymous memory (memfd): {}",
+                            exe_path.display()
+                        ),
                         confidence: 0.95,
                     });
                 }
             }
 
             "RULE_PTRACE_SNOOPING" => {
-                if let crate::collector::EventDetails::PtraceAccess { tracer_tgid, tracee_tgid, is_blocked, .. } = event.details {
+                if let crate::collector::EventDetails::PtraceAccess {
+                    tracer_tgid,
+                    tracee_tgid,
+                    is_blocked,
+                    ..
+                } = event.details
+                {
                     return Some(DetectionMatch {
                         rule_id: self.id.clone(),
                         rule_name: self.name.clone(),
@@ -122,35 +140,50 @@ impl BehaviorRule {
                 if let Some(node) = lineage.get(event.tgid) {
                     let chain = lineage.get_ancestor_chain(event.tgid);
                     // Check for unusual web server or desktop app spawning a root shell
-                    if chain.iter().any(|s| s.exe_name == "nginx" || s.exe_name == "apache2" || s.exe_name == "node") {
-                        if node.exe_path.ends_with("sh") || node.exe_path.ends_with("bash") {
-                            return Some(DetectionMatch {
-                                rule_id: self.id.clone(),
-                                rule_name: self.name.clone(),
-                                severity: self.severity,
-                                weight: self.risk_weight,
-                                action: self.recommended_action,
-                                reason: format!("Web server process spawned interactive shell: {}", node.exe_path.display()),
-                                confidence: 0.92,
-                            });
-                        }
-                    }
-                }
-            }
-
-            "RULE_TAINTED_NETWORK_EXFIL" => {
-                if let crate::collector::EventDetails::SocketConnect { dst_ipv4, dst_port, so_mark, .. } = event.details {
-                    // Check if mark has the reval or tainted flag
-                    let (is_sentinel, _, _) = sentinel_common::events::decode_flow_mark(so_mark);
-                    if is_sentinel && so_mark != 0 {
-                        let ip_str = dst_ipv4.map(|ip| ip.to_string()).unwrap_or_else(|| "remote".into());
+                    if chain.iter().any(|s| {
+                        s.exe_name == "nginx" || s.exe_name == "apache2" || s.exe_name == "node"
+                    }) && (node.exe_path.ends_with("sh") || node.exe_path.ends_with("bash"))
+                    {
                         return Some(DetectionMatch {
                             rule_id: self.id.clone(),
                             rule_name: self.name.clone(),
                             severity: self.severity,
                             weight: self.risk_weight,
                             action: self.recommended_action,
-                            reason: format!("Network connection attempt by tainted process to {}:{}", ip_str, dst_port),
+                            reason: format!(
+                                "Web server process spawned interactive shell: {}",
+                                node.exe_path.display()
+                            ),
+                            confidence: 0.92,
+                        });
+                    }
+                }
+            }
+
+            "RULE_TAINTED_NETWORK_EXFIL" => {
+                if let crate::collector::EventDetails::SocketConnect {
+                    dst_ipv4,
+                    dst_port,
+                    so_mark,
+                    ..
+                } = event.details
+                {
+                    // Check if mark has the reval or tainted flag
+                    let (is_sentinel, _, _) = sentinel_common::events::decode_flow_mark(so_mark);
+                    if is_sentinel && so_mark != 0 {
+                        let ip_str = dst_ipv4
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|| "remote".into());
+                        return Some(DetectionMatch {
+                            rule_id: self.id.clone(),
+                            rule_name: self.name.clone(),
+                            severity: self.severity,
+                            weight: self.risk_weight,
+                            action: self.recommended_action,
+                            reason: format!(
+                                "Network connection attempt by tainted process to {}:{}",
+                                ip_str, dst_port
+                            ),
                             confidence: 0.88,
                         });
                     }

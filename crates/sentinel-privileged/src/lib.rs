@@ -16,8 +16,13 @@ use serde::{Deserialize, Serialize};
 pub enum PrivilegedOp {
     /// Atomic batch transaction execution in nftables. Strictly scoped to `inet sentinel`.
     ApplyNftablesBatch { batch: String },
-    /// Safe pidfd signaling of a process instance.
-    SignalProcess { pid: u32, signal: i32 },
+    /// Safe pidfd signaling of a process instance with anti-PID-reuse verification.
+    SignalProcess {
+        pid: u32,
+        signal: i32,
+        expected_start_time: Option<u64>,
+        expected_exe: Option<String>,
+    },
     /// Health ping.
     Ping,
 }

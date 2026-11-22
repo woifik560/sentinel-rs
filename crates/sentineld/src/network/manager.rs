@@ -6,11 +6,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::response::NetworkBlockManager;
 use super::connection_tracker::ConnectionTracker;
 use super::nfqueue::NfqueueManager;
 use super::nftables::{IsolationTier, NftablesManager};
 use super::policy::NeverFreezeChecker;
+use crate::response::NetworkBlockManager;
 
 /// Manages host network protection, NFQUEUE packet triage, and transactional isolation.
 #[derive(Clone)]
@@ -29,7 +29,9 @@ impl NetworkProtectionManager {
     pub fn new(block_manager: Arc<NetworkBlockManager>, aggregate_window_ms: u64) -> Self {
         Self {
             nfqueue: Arc::new(NfqueueManager::new()),
-            tracker: Arc::new(ConnectionTracker::new(Duration::from_millis(aggregate_window_ms))),
+            tracker: Arc::new(ConnectionTracker::new(Duration::from_millis(
+                aggregate_window_ms,
+            ))),
             never_freeze: Arc::new(NeverFreezeChecker::new()),
             block_manager,
             isolation_tier: Arc::new(RwLock::new(IsolationTier::None)),
@@ -75,7 +77,8 @@ impl NetworkProtectionManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            self.timer_expires_epoch.store(now + timeout_secs, Ordering::SeqCst);
+            self.timer_expires_epoch
+                .store(now + timeout_secs, Ordering::SeqCst);
 
             // Spawn Anti-Lockout auto-rollback watcher
             let confirmed = self.isolation_confirmed.clone();

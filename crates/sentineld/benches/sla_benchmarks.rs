@@ -6,8 +6,6 @@
 //! - Response Decision Latency <= 5.0 ms
 //! - Memory Footprint <= 64 MB RSS
 
-use std::path::PathBuf;
-use std::time::Instant;
 use sentinel_common::config::RulesConfig;
 use sentinel_common::policy::OperatingMode;
 use sentinel_common::process::{ProcessNode, SecretCategory};
@@ -15,6 +13,8 @@ use sentineld::lineage::LineageTracker;
 use sentineld::pkg_check::DpkgChecker;
 use sentineld::policy::{PolicyContext, PolicyEngine};
 use sentineld::risk::{NetworkContext, RiskEngine};
+use std::path::PathBuf;
+use std::time::Instant;
 
 fn main() {
     println!("============================================================");
@@ -24,7 +24,11 @@ fn main() {
     // 1. Benchmark Risk Engine Evaluation Latency (SLA: <= 1.0 ms)
     let risk_engine = RiskEngine::new(RulesConfig::default(), DpkgChecker::new());
     let mut node = ProcessNode::new(1001, 1, 1000, PathBuf::from("/usr/bin/curl"));
-    node.record_secret_access(PathBuf::from("/home/user/.ssh/id_rsa"), SecretCategory::SshKey, 1000);
+    node.record_secret_access(
+        PathBuf::from("/home/user/.ssh/id_rsa"),
+        SecretCategory::SshKey,
+        1000,
+    );
 
     let net_ctx = NetworkContext {
         dest_ip: Some("198.51.100.1".to_string()),
@@ -48,9 +52,18 @@ fn main() {
 
     println!("Risk Engine Evaluation (10,000 iterations):");
     println!("  Total time:  {:?}", total_elapsed);
-    println!("  Avg latency: {:.3} µs ({:.4} ms)", avg_latency_us, avg_latency_ms);
-    assert!(avg_latency_ms <= 1.0, "Risk evaluation SLA violated: > 1.0 ms!");
-    println!("  [PASS] Detection/Evaluation Latency SLA <= 1.0 ms MET ({:.4} ms)", avg_latency_ms);
+    println!(
+        "  Avg latency: {:.3} µs ({:.4} ms)",
+        avg_latency_us, avg_latency_ms
+    );
+    assert!(
+        avg_latency_ms <= 1.0,
+        "Risk evaluation SLA violated: > 1.0 ms!"
+    );
+    println!(
+        "  [PASS] Detection/Evaluation Latency SLA <= 1.0 ms MET ({:.4} ms)",
+        avg_latency_ms
+    );
 
     // 2. Benchmark Lineage Insertion and Lookup (10,000 operations)
     let tracker = LineageTracker::new(8192);
@@ -78,9 +91,18 @@ fn main() {
     let avg_policy_us = policy_elapsed.as_micros() as f64 / iterations as f64;
     let avg_policy_ms = avg_policy_us / 1000.0;
     println!("Policy Authorization (10,000 evaluations):");
-    println!("  Avg latency: {:.3} µs ({:.4} ms)", avg_policy_us, avg_policy_ms);
-    assert!(avg_policy_ms <= 5.0, "Policy authorization SLA violated: > 5.0 ms!");
-    println!("  [PASS] Response Decision Latency SLA <= 5.0 ms MET ({:.4} ms)", avg_policy_ms);
+    println!(
+        "  Avg latency: {:.3} µs ({:.4} ms)",
+        avg_policy_us, avg_policy_ms
+    );
+    assert!(
+        avg_policy_ms <= 5.0,
+        "Policy authorization SLA violated: > 5.0 ms!"
+    );
+    println!(
+        "  [PASS] Response Decision Latency SLA <= 5.0 ms MET ({:.4} ms)",
+        avg_policy_ms
+    );
 
     println!("============================================================");
     println!("          ALL SLA BENCHMARK CRITERIA MET (100%)             ");

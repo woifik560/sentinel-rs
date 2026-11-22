@@ -3,11 +3,11 @@
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-use sentinel_common::policy::PolicyAction;
-use sentinel_common::risk::SeverityLevel;
 use crate::behavior::rule::{BehaviorRule, DetectionMatch};
 use crate::collector::{NormalizedEvent, NormalizedEventType};
 use crate::lineage::LineageTracker;
+use sentinel_common::policy::PolicyAction;
+use sentinel_common::risk::SeverityLevel;
 
 pub struct BehaviorEngine {
     rules: Arc<RwLock<Vec<BehaviorRule>>>,
@@ -69,7 +69,10 @@ impl BehaviorEngine {
             "Detects unexpected parent-child relationships such as web services spawning shells",
             SeverityLevel::Critical,
             40,
-            vec![NormalizedEventType::ProcessExec, NormalizedEventType::ProcessFork],
+            vec![
+                NormalizedEventType::ProcessExec,
+                NormalizedEventType::ProcessFork,
+            ],
             10000,
             PolicyAction::TerminateProcess,
         ));
@@ -96,7 +99,10 @@ impl BehaviorEngine {
 
         for rule in rules.iter() {
             if let Some(m) = rule.evaluate(event, &self.lineage) {
-                warn!("Behavior rule matched: {} - {} (weight: {})", m.rule_id, m.rule_name, m.weight);
+                warn!(
+                    "Behavior rule matched: {} - {} (weight: {})",
+                    m.rule_id, m.rule_name, m.weight
+                );
                 matches.push(m);
             }
         }

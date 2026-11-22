@@ -23,7 +23,13 @@ pub struct LineageStep {
 impl std::fmt::Display for LineageStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ref script) = self.script_path {
-            write!(f, "{} ({}) [PID {}]", self.exe_name, script.display(), self.tgid)
+            write!(
+                f,
+                "{} ({}) [PID {}]",
+                self.exe_name,
+                script.display(),
+                self.tgid
+            )
         } else {
             write!(f, "{} [PID {}]", self.exe_name, self.tgid)
         }
@@ -105,7 +111,10 @@ impl ClientRole {
 
     /// Checks if this role is permitted to execute operator queries.
     pub fn can_inspect(&self) -> bool {
-        matches!(self, ClientRole::RootAdmin | ClientRole::Operator | ClientRole::ReadOnly)
+        matches!(
+            self,
+            ClientRole::RootAdmin | ClientRole::Operator | ClientRole::ReadOnly
+        )
     }
 }
 
@@ -128,13 +137,19 @@ pub enum IpcCommand {
     /// sntctl protection disable
     ProtectionDisable,
     /// sntctl events list
-    EventsList { limit: Option<usize>, offset: Option<usize> },
+    EventsList {
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     /// sntctl events show <ID>
     EventsShow { event_id: String },
     /// sntctl events export
     EventsExport { format: String },
     /// sntctl incidents list
-    IncidentsList { limit: Option<usize>, offset: Option<usize> },
+    IncidentsList {
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     /// sntctl incidents show <ID>
     IncidentsShow { incident_id: String },
     /// sntctl incidents export <ID>
@@ -168,7 +183,11 @@ pub enum IpcCommand {
     /// sntctl network isolate
     NetworkIsolate,
     /// sntctl network isolate-timed
-    NetworkIsolateTimed { tier: String, timeout_secs: u64, trusted_ssh_ips: Vec<String> },
+    NetworkIsolateTimed {
+        tier: String,
+        timeout_secs: u64,
+        trusted_ssh_ips: Vec<String>,
+    },
     /// sntctl network confirm-isolation
     NetworkConfirmIsolation,
     /// sntctl network unisolate
@@ -255,9 +274,7 @@ pub enum IpcMessage {
         report_json: String,
     },
     /// Security / Authorization error returned when unauthenticated peer sends privileged command.
-    AuthError {
-        message: String,
-    },
+    AuthError { message: String },
     /// Structured response wrapper.
     StructuredResponse {
         success: bool,

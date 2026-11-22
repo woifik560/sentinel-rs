@@ -14,8 +14,8 @@
 //!      covert memory leakage.
 //! 4. Emits `RawPtraceAccessCheckEvent` to the RingBuffer.
 
-use sentinel_common::events::RawPtraceAccessCheckEvent;
 use crate::maps::{PtraceVerdict, TaintMapManager};
+use sentinel_common::events::RawPtraceAccessCheckEvent;
 
 /// Evaluates a `ptrace_access_check` hook invocation.
 pub fn evaluate_ptrace_access_check(

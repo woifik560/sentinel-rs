@@ -1,9 +1,9 @@
 //! Security Audit Logger.
 
+use super::events::{AuditCategory, AuditRecord};
+use crate::storage::StorageManager;
 use std::sync::Arc;
 use tracing::info;
-use crate::storage::StorageManager;
-use super::events::{AuditCategory, AuditRecord};
 
 pub struct AuditLogger {
     #[allow(dead_code)]
@@ -34,7 +34,9 @@ impl AuditLogger {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
 
-        let (operator_uid, operator_gid) = operator.map(|(u, g)| (Some(u), Some(g))).unwrap_or((None, None));
+        let (operator_uid, operator_gid) = operator
+            .map(|(u, g)| (Some(u), Some(g)))
+            .unwrap_or((None, None));
 
         info!(
             target: "sentinel_audit",

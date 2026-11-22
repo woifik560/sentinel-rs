@@ -4,9 +4,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
-use sentinel_common::events::EbpfEvent;
 use crate::collector::event_metrics::EventMetrics;
 use crate::collector::event_normalizer::{EventNormalizer, NormalizedEvent};
+use sentinel_common::events::EbpfEvent;
 
 pub struct EventDispatcher {
     metrics: Arc<EventMetrics>,
