@@ -1,0 +1,13 @@
+# Cargo Audit Configuration for Sentinel-RS
+# https://rustsec.org/
+
+[advisories]
+# Documented exceptions:
+# RUSTSEC-2026-0543: chrono crate unmaintained warning.
+# Reason: Widely adopted standard datetime library across Rust ecosystem;
+#         no security vulnerability or memory safety defect reported in version 0.4.45.
+# Impact Scope: Timestamp generation and ISO 8601 parsing across sentineld and sntctl.
+# Review Date: 2027-06-01 (evaluation for transition to jiff or time crate).
+ignore = [
+    "RUSTSEC-2026-0543",
+]

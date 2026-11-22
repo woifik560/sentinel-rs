@@ -388,7 +388,34 @@ pub fn verify_peer_client(stream: &UnixStream, is_management: bool) -> anyhow::R
         });
 
     let is_in_operator_group = if let Some(op_gid) = operator_gid {
-        peer_gid == op_gid
+        if peer_gid == op_gid {
+            true
+        } else {
+            #[cfg(unix)]
+            {
+                if let Ok(Some(user)) =
+                    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(peer_uid))
+                {
+                    if let Ok(c_user) = std::ffi::CString::new(user.name) {
+                        if let Ok(groups) =
+                            nix::unistd::getgrouplist(&c_user, nix::unistd::Gid::from_raw(peer_gid))
+                        {
+                            groups.into_iter().any(|g| g.as_raw() == op_gid)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
     } else {
         false
     };

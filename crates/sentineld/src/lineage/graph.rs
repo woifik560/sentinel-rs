@@ -239,28 +239,33 @@ impl LineageGraph {
             .filter(|e| e.object == target_obj && e.action == FlowAction::Read)
             .collect();
 
-        let mut path = Vec::new();
         for reader in initial_readers {
-            path.push(reader.clone());
+            // Case 1: Recipient itself directly read the secret file
+            if reader.process.pid == recipient_pid {
+                return vec![reader.clone()];
+            }
 
-            // Check if reader wrote to a pipe/socket that recipient subsequently read
-            for pipe_write in edges
-                .iter()
-                .filter(|e| e.process.pid == reader.process.pid && e.action == FlowAction::Write)
-            {
-                path.push(pipe_write.clone());
-
+            // Case 2: Inter-process data transfer (pipes, FIFOs, Unix sockets, or descriptor passing)
+            for write_edge in edges.iter().filter(|e| {
+                e.process.pid == reader.process.pid
+                    && (e.action == FlowAction::Write
+                        || e.action == FlowAction::SendMsg
+                        || e.action == FlowAction::FdPass)
+                    && e.timestamp_ns >= reader.timestamp_ns
+            }) {
                 if let Some(recipient_read) = edges.iter().find(|e| {
                     e.process.pid == recipient_pid
-                        && e.object == pipe_write.object
-                        && e.action == FlowAction::Read
+                        && e.object == write_edge.object
+                        && (e.action == FlowAction::Read
+                            || e.action == FlowAction::RecvMsg
+                            || e.action == FlowAction::FdPass)
+                        && e.timestamp_ns >= write_edge.timestamp_ns
                 }) {
-                    path.push(recipient_read.clone());
-                    return path;
+                    return vec![reader.clone(), write_edge.clone(), recipient_read.clone()];
                 }
             }
         }
-        path
+        Vec::new()
     }
 
     /// Find the most recently tainted process node within max_age_ns.
@@ -281,17 +286,25 @@ impl LineageGraph {
         best
     }
 
-    /// Prune terminated processes that hold no active secrets from the graph to prevent memory leaks.
-    pub fn prune_dead(&self) -> usize {
+    /// Prune terminated processes from the graph.
+    /// Processes with no secrets are pruned immediately.
+    /// Processes with secrets are pruned if their most recent secret access is older than max_age_ns.
+    pub fn prune_dead_with_retention(&self, max_secret_retention_ns: u64, now_ns: u64) -> usize {
         let mut g = self.nodes.lock().unwrap();
         let mut to_remove = Vec::new();
         for (key, node) in g.iter() {
-            if key.tgid <= 2 || !node.secret_accesses.is_empty() {
+            if key.tgid <= 2 {
                 continue;
             }
             let proc_path = format!("/proc/{}", key.tgid);
             if !std::path::Path::new(&proc_path).exists() {
-                to_remove.push(key.clone());
+                if node.secret_accesses.is_empty() {
+                    to_remove.push(key.clone());
+                } else if let Some(last) = node.secret_accesses.last() {
+                    if now_ns.saturating_sub(last.timestamp_ns) > max_secret_retention_ns {
+                        to_remove.push(key.clone());
+                    }
+                }
             }
         }
         let count = to_remove.len();
@@ -307,11 +320,22 @@ impl LineageGraph {
         }
         count
     }
+
+    /// Prune terminated processes that hold no active secrets from the graph.
+    pub fn prune_dead(&self) -> usize {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Default retention for terminated processes with secret accesses: 1 hour (3600s)
+        self.prune_dead_with_retention(3600 * 1_000_000_000, now_ns)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_common::process::SecretCategory;
     use std::path::PathBuf;
 
     #[test]
@@ -377,5 +401,77 @@ mod tests {
         assert_eq!(path[1].action, FlowAction::Write);
         assert_eq!(path[2].action, FlowAction::Read);
         assert_eq!(path[2].process.pid, 101);
+    }
+
+    #[test]
+    fn test_direct_read_and_false_branch_filtering() {
+        let graph = LineageGraph::new(64);
+        let secret = PathBuf::from("/etc/shadow");
+        let secret_obj = FlowObject::SecretFile(secret.clone());
+        let pipe1 = FlowObject::Pipe { dev: 1, ino: 100 };
+        let pipe2 = FlowObject::Pipe { dev: 1, ino: 200 };
+
+        let proc_a = ProcessKey::new(10, 1000);
+        let proc_b = ProcessKey::new(20, 2000);
+        let proc_c = ProcessKey::new(30, 3000);
+
+        // A reads secret
+        graph.record_data_flow(proc_a.clone(), secret_obj.clone(), FlowAction::Read, 100);
+        // A writes to pipe1 (dead end)
+        graph.record_data_flow(proc_a.clone(), pipe1.clone(), FlowAction::Write, 105);
+        // A writes to pipe2 (connected to C)
+        graph.record_data_flow(proc_a.clone(), pipe2.clone(), FlowAction::Write, 110);
+        // B reads pipe1 (not recipient)
+        graph.record_data_flow(proc_b.clone(), pipe1.clone(), FlowAction::Read, 115);
+        // C reads pipe2 (recipient)
+        graph.record_data_flow(proc_c.clone(), pipe2.clone(), FlowAction::Read, 120);
+
+        // Path to C must NOT contain pipe1!
+        let path = graph.find_data_flow_path(&secret, 30);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[1].object, pipe2);
+        assert_eq!(path[2].process.pid, 30);
+
+        // Path to A (direct read)
+        let direct_path = graph.find_data_flow_path(&secret, 10);
+        assert_eq!(direct_path.len(), 1);
+        assert_eq!(direct_path[0].process.pid, 10);
+    }
+
+    #[test]
+    fn test_prune_dead_retention() {
+        let graph = LineageGraph::new(64);
+        let now_ns = 10_000 * 1_000_000_000;
+
+        let mut node_clean = ProcessNode::new(999998, 1, 1000, PathBuf::from("/bin/sleep"));
+        node_clean.start_time_ns = 500;
+        graph.insert(node_clean);
+
+        let mut node_recent_secret =
+            ProcessNode::new(999997, 1, 1000, PathBuf::from("/bin/cat_secret"));
+        node_recent_secret.start_time_ns = 600;
+        node_recent_secret.record_secret_access(
+            PathBuf::from("/home/user/.ssh/id_rsa"),
+            SecretCategory::SshKey,
+            now_ns - 100_000_000,
+        ); // 100ms ago
+        graph.insert(node_recent_secret);
+
+        let mut node_old_secret =
+            ProcessNode::new(999996, 1, 1000, PathBuf::from("/bin/old_secret"));
+        node_old_secret.start_time_ns = 700;
+        node_old_secret.record_secret_access(
+            PathBuf::from("/home/user/.ssh/id_rsa"),
+            SecretCategory::SshKey,
+            now_ns - 4000 * 1_000_000_000,
+        ); // 4000s ago
+        graph.insert(node_old_secret);
+
+        // Pruning with 3600s retention: clean node and old secret node should be pruned, recent secret node retained!
+        let pruned = graph.prune_dead_with_retention(3600 * 1_000_000_000, now_ns);
+        assert_eq!(pruned, 2);
+        assert!(graph.get(999997).is_some());
+        assert!(graph.get(999998).is_none());
+        assert!(graph.get(999996).is_none());
     }
 }

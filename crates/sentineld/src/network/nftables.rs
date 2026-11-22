@@ -95,34 +95,9 @@ impl NftablesManager {
         Ok(())
     }
 
-    /// Execute an atomic batch script of nft commands via stdin (`nft -f -`).
-    /// All rules are applied in a single kernel transaction without flushing foreign tables!
-    pub fn run_nft_batch(batch_script: &str) -> anyhow::Result<()> {
-        // Step 1: Pre-validate syntax before touching kernel netfilter state
+    /// Execute an atomic batch script directly via nft -f -
+    pub fn run_direct_nft_batch(batch_script: &str) -> anyhow::Result<()> {
         Self::validate_ruleset_syntax(batch_script)?;
-
-        // Step 2: Privilege separation - delegate to privileged helper if available
-        let priv_client = sentinel_privileged::client::PrivilegedClient::default();
-        if priv_client.is_available() {
-            info!("Privilege separation: delegating nftables batch to sentinel-privileged helper via /run/sentinel/privileged.sock");
-            match priv_client.execute_sync(&sentinel_privileged::PrivilegedOp::ApplyNftablesBatch {
-                batch: batch_script.to_string(),
-            }) {
-                Ok(sentinel_privileged::PrivilegedResult::Ok(_)) => {
-                    info!("Privileged helper successfully applied nftables batch.");
-                    return Ok(());
-                }
-                Ok(sentinel_privileged::PrivilegedResult::Error { code, message }) => {
-                    warn!("Privileged helper returned error ({code}): {message}. Attempting direct fallback if capabilities permit.");
-                }
-                Err(e) => {
-                    warn!("Failed to communicate with privileged helper: {e}. Falling back to direct execution.");
-                }
-            }
-        } else {
-            info!("Privileged helper not available at /run/sentinel/privileged.sock. Executing nft directly.");
-        }
-
         let bin = Self::nft_bin();
         let mut child = Command::new(&bin)
             .arg("-f")
@@ -150,29 +125,176 @@ impl NftablesManager {
         Ok(())
     }
 
+    /// Execute an atomic batch script of nft commands via stdin (`nft -f -`).
+    /// All rules are applied in a single kernel transaction without flushing foreign tables!
+    pub fn run_nft_batch(batch_script: &str) -> anyhow::Result<()> {
+        // Step 1: Pre-validate syntax before touching kernel netfilter state
+        Self::validate_ruleset_syntax(batch_script)?;
+
+        // Step 2: Privilege separation - delegate to privileged helper if available
+        let priv_client = sentinel_privileged::client::PrivilegedClient::default();
+        if priv_client.is_available() {
+            info!("Privilege separation: delegating nftables batch to sentinel-privileged helper via /run/sentinel/privileged.sock");
+            #[allow(deprecated)]
+            match priv_client.execute_sync(&sentinel_privileged::PrivilegedOp::ApplyNftablesBatch {
+                batch: batch_script.to_string(),
+            }) {
+                Ok(sentinel_privileged::PrivilegedResult::Ok(_)) => {
+                    info!("Privileged helper successfully applied nftables batch.");
+                    return Ok(());
+                }
+                Ok(sentinel_privileged::PrivilegedResult::Error { code, message }) => {
+                    warn!("Privileged helper returned error ({code}): {message}. Attempting direct fallback if capabilities permit.");
+                }
+                Err(e) => {
+                    warn!("Failed to communicate with privileged helper: {e}. Falling back to direct execution.");
+                }
+            }
+        } else {
+            info!("Privileged helper not available at /run/sentinel/privileged.sock. Executing nft directly.");
+        }
+
+        Self::run_direct_nft_batch(batch_script)
+    }
+
+    /// Executes a strongly-typed firewall operation, delegating to sentinel-privileged if available.
+    pub fn execute_firewall_op(op: sentinel_privileged::FirewallOperation) -> anyhow::Result<()> {
+        let priv_client = sentinel_privileged::client::PrivilegedClient::default();
+        if priv_client.is_available() {
+            info!(
+                "Privilege separation: delegating typed firewall operation {:?} to sentinel-privileged helper",
+                op
+            );
+            match priv_client.execute_sync(&sentinel_privileged::PrivilegedOp::Firewall(op.clone()))
+            {
+                Ok(sentinel_privileged::PrivilegedResult::Ok(_)) => {
+                    info!("Privileged helper successfully executed firewall operation.");
+                    return Ok(());
+                }
+                Ok(sentinel_privileged::PrivilegedResult::Error { code, message }) => {
+                    warn!(
+                        "Privileged helper returned error ({code}): {message}. Attempting direct fallback if capabilities permit."
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to communicate with privileged helper: {e}. Falling back to direct execution."
+                    );
+                }
+            }
+        } else {
+            info!("Privileged helper not available at /run/sentinel/privileged.sock. Executing firewall operation directly.");
+        }
+
+        // Direct fallback:
+        match op {
+            sentinel_privileged::FirewallOperation::SetupHolding { use_bypass } => {
+                let bypass_flag = if use_bypass { " bypass" } else { "" };
+                let batch = format!(
+                    "add table inet sentinel\n\
+                     delete table inet sentinel\n\
+                     add table inet sentinel\n\
+                     add chain inet sentinel input {{ type filter hook input priority 0; policy accept; }}\n\
+                     add chain inet sentinel output {{ type filter hook output priority 0; policy accept; }}\n\
+                     add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {}{}\n\
+                     add rule inet sentinel output ct state established,related accept\n\
+                     add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{}\n",
+                    SENTINEL_NFQUEUE_NUM, bypass_flag, SENTINEL_NFQUEUE_NUM, bypass_flag
+                );
+                Self::run_direct_nft_batch(&batch)
+            }
+            sentinel_privileged::FirewallOperation::ApplyIsolation {
+                tier,
+                trusted_ssh_ips,
+                blocked_ips,
+                blocked_ports,
+            } => {
+                let isolation_tier = match tier.as_str() {
+                    "None" => IsolationTier::None,
+                    "Selective" => IsolationTier::Selective,
+                    "Restricted" => IsolationTier::Restricted,
+                    "FullIsolation" => IsolationTier::FullIsolation,
+                    _ => anyhow::bail!("Unknown isolation tier '{}'", tier),
+                };
+                let selective_policy = SelectivePolicy {
+                    blocked_ips: blocked_ips.iter().filter_map(|s| s.parse().ok()).collect(),
+                    blocked_ports,
+                };
+                let batch = Self::generate_isolation_script_with_policy(
+                    isolation_tier,
+                    &trusted_ssh_ips,
+                    &selective_policy,
+                );
+                Self::run_direct_nft_batch(&batch)
+            }
+            sentinel_privileged::FirewallOperation::BlockIp { ip } => {
+                let ip_parsed = ip
+                    .parse::<IpAddr>()
+                    .map_err(|e| anyhow::anyhow!("Invalid IP address '{}': {}", ip, e))?;
+                let rule = match ip_parsed {
+                    IpAddr::V4(v4) => {
+                        format!("insert rule inet sentinel output ip daddr {} drop\n", v4)
+                    }
+                    IpAddr::V6(v6) => {
+                        format!("insert rule inet sentinel output ip6 daddr {} drop\n", v6)
+                    }
+                };
+                let batch = format!(
+                    "add table inet sentinel\n\
+                     add chain inet sentinel output {{ type filter hook output priority 0; policy accept; }}\n\
+                     {}",
+                    rule
+                );
+                Self::run_direct_nft_batch(&batch)
+            }
+            sentinel_privileged::FirewallOperation::CleanupRules => {
+                Self::run_nft(&["delete", "table", "inet", "sentinel"])
+            }
+            sentinel_privileged::FirewallOperation::ArmAntiLockout {
+                timeout_secs,
+                trusted_ssh_ips,
+            } => {
+                let res = sentinel_privileged::server::PrivilegedExecutor::arm_anti_lockout(
+                    timeout_secs,
+                    trusted_ssh_ips,
+                );
+                match res {
+                    sentinel_privileged::PrivilegedResult::Ok(_) => Ok(()),
+                    sentinel_privileged::PrivilegedResult::Error { code, message } => {
+                        anyhow::bail!("{}: {}", code, message)
+                    }
+                }
+            }
+            sentinel_privileged::FirewallOperation::ConfirmAntiLockout => {
+                let res = sentinel_privileged::server::PrivilegedExecutor::confirm_anti_lockout();
+                match res {
+                    sentinel_privileged::PrivilegedResult::Ok(_) => Ok(()),
+                    sentinel_privileged::PrivilegedResult::Error { code, message } => {
+                        anyhow::bail!("{}: {}", code, message)
+                    }
+                }
+            }
+            sentinel_privileged::FirewallOperation::Rollback => {
+                let res = sentinel_privileged::server::PrivilegedExecutor::rollback_isolation();
+                match res {
+                    sentinel_privileged::PrivilegedResult::Ok(_) => Ok(()),
+                    sentinel_privileged::PrivilegedResult::Error { code, message } => {
+                        anyhow::bail!("{}: {}", code, message)
+                    }
+                }
+            }
+        }
+    }
+
     /// Configure kernel nftables rules for diverting SO_MARK traffic to NFQUEUE atomically and idempotently.
     pub fn setup_rules(use_bypass: bool) -> anyhow::Result<()> {
         info!(
             "Configuring hardened nftables hook for Sentinel SO_MARK -> NFQUEUE ({}, bypass={})",
             SENTINEL_NFQUEUE_NUM, use_bypass
         );
-
-        let bypass_flag = if use_bypass { " bypass" } else { "" };
-        let batch = format!(
-            "add table inet sentinel\n\
-             delete table inet sentinel\n\
-             add table inet sentinel\n\
-             add chain inet sentinel input {{ type filter hook input priority 0; policy accept; }}\n\
-             add chain inet sentinel output {{ type filter hook output priority 0; policy accept; }}\n\
-             add rule inet sentinel output meta mark & 0xff800000 == 0x5e800000 counter queue num {}{}\n\
-             add rule inet sentinel output ct state established,related accept\n\
-             add rule inet sentinel output ct state new meta mark & 0xff800000 == 0x5e000000 counter queue num {}{}\n",
-            SENTINEL_NFQUEUE_NUM, bypass_flag, SENTINEL_NFQUEUE_NUM, bypass_flag
-        );
-
-        Self::run_nft_batch(&batch)?;
-        info!("nftables rules applied atomically in table inet sentinel.");
-        Ok(())
+        Self::execute_firewall_op(sentinel_privileged::FirewallOperation::SetupHolding {
+            use_bypass,
+        })
     }
 
     /// Generates a valid atomic nftables configuration script for the requested isolation tier.
@@ -333,9 +455,30 @@ impl NftablesManager {
         tier: IsolationTier,
         trusted_ssh_ips: &[String],
     ) -> anyhow::Result<()> {
+        Self::apply_isolation_tier_with_policy(tier, trusted_ssh_ips, &SelectivePolicy::default())
+    }
+
+    /// Atomically applies an isolation tier with custom selective policy rules.
+    pub fn apply_isolation_tier_with_policy(
+        tier: IsolationTier,
+        trusted_ssh_ips: &[String],
+        policy: &SelectivePolicy,
+    ) -> anyhow::Result<()> {
         info!("Applying atomic network isolation tier: {:?}", tier);
-        let batch = Self::generate_isolation_script(tier, trusted_ssh_ips);
-        let res = Self::run_nft_batch(&batch);
+        let tier_str = match tier {
+            IsolationTier::None => "None",
+            IsolationTier::Selective => "Selective",
+            IsolationTier::Restricted => "Restricted",
+            IsolationTier::FullIsolation => "FullIsolation",
+        };
+        let blocked_ips: Vec<String> = policy.blocked_ips.iter().map(|ip| ip.to_string()).collect();
+        let res =
+            Self::execute_firewall_op(sentinel_privileged::FirewallOperation::ApplyIsolation {
+                tier: tier_str.into(),
+                trusted_ssh_ips: trusted_ssh_ips.to_vec(),
+                blocked_ips,
+                blocked_ports: policy.blocked_ports.clone(),
+            });
         if let Err(ref e) = res {
             error!(
                 "Failed to apply isolation tier {:?}: {}. Attempting rollback to default rules...",
@@ -350,38 +493,20 @@ impl NftablesManager {
 
     /// Block a specific destination IP address via nftables with strict IP validation.
     pub fn block_ip(ip: &str) -> anyhow::Result<()> {
-        let ip_parsed = ip
-            .parse::<IpAddr>()
-            .map_err(|e| anyhow::anyhow!("Invalid IP address '{}': {}", ip, e))?;
-
-        info!(
-            "Blocking malicious destination IP in nftables: {}",
-            ip_parsed
-        );
-        let rule = match ip_parsed {
-            IpAddr::V4(v4) => format!("insert rule inet sentinel output ip daddr {} drop\n", v4),
-            IpAddr::V6(v6) => format!("insert rule inet sentinel output ip6 daddr {} drop\n", v6),
-        };
-
-        let batch = format!(
-            "add table inet sentinel\n\
-             add chain inet sentinel output {{ type filter hook output priority 0; policy accept; }}\n\
-             {}",
-            rule
-        );
-
-        Self::run_nft_batch(&batch)
+        info!("Blocking malicious destination IP in nftables: {}", ip);
+        Self::execute_firewall_op(sentinel_privileged::FirewallOperation::BlockIp {
+            ip: ip.to_string(),
+        })
     }
 
     /// Clean up Sentinel rules by deleting table inet sentinel.
     /// CRITICAL: NEVER executes `nft flush ruleset`!
     pub fn cleanup_rules() {
         info!("Cleaning up Sentinel nftables rules (table inet sentinel only)");
-        if let Err(e) = Self::run_nft(&["delete", "table", "inet", "sentinel"]) {
-            warn!(
-                "Failed to delete table inet sentinel (may not exist): {}",
-                e
-            );
+        if let Err(e) =
+            Self::execute_firewall_op(sentinel_privileged::FirewallOperation::CleanupRules)
+        {
+            warn!("Failed to delete table inet sentinel: {}", e);
         }
     }
 }

@@ -48,8 +48,11 @@ jobs:
       - name: Run SLA Performance Benchmarks (TASK-P1-21)
         run: cargo bench --bench sla_benchmarks
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
       - name: Security Audit & Vulnerability Check
-        run: cargo audit || echo "cargo-audit advisory check completed"
+        run: cargo audit
 
   ring0-kernel-test:
     name: Ring-0 Kernel Test (QEMU / Linux 6.x BPF LSM)

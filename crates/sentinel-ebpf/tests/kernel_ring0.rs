@@ -25,9 +25,11 @@ async fn test_kernel_safe_version_verification() {
 
 #[tokio::test]
 async fn test_ebpf_loader_initialization_and_preflight() {
-    let mut config = LoaderConfig::default();
-    config.strict_preflight = false;
-    config.enable_tracepoints = false;
+    let config = LoaderConfig {
+        strict_preflight: false,
+        enable_tracepoints: false,
+        ..Default::default()
+    };
 
     let mut loader = EbpfLoader::new(config);
     let res = loader.load_and_attach().await;
@@ -47,9 +49,11 @@ async fn test_strict_preflight_in_lsm_bpf_ring0_kernel() {
                 "Ring-0 kernel detected with BPF LSM active ('{}')",
                 lsm_content.trim()
             );
-            let mut config = LoaderConfig::default();
-            config.strict_preflight = true;
-            config.min_kernel_version = "6.1".to_string();
+            let config = LoaderConfig {
+                strict_preflight: true,
+                min_kernel_version: "6.1".to_string(),
+                ..Default::default()
+            };
 
             let mut loader = EbpfLoader::new(config);
             let res = loader.load_and_attach().await;

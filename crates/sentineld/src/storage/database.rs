@@ -263,7 +263,9 @@ impl StorageManager {
     /// Count total recorded incidents.
     pub fn count_incidents(&self) -> rusqlite::Result<usize> {
         let conn = open_sqlite_connection(&self.db_path)?;
-        conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| row.get(0))
+        conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| {
+            row.get::<_, i64>(0).map(|c| c as usize)
+        })
     }
 }
 

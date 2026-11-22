@@ -47,38 +47,45 @@ cargo build --release
 ```
 
 Бинарные файлы после сборки:
-* `target/release/sentineld` — системный демон безопасности.
-* `target/release/sntctl` — CLI-утилита управления.
+* `target/release/sentineld` — основной системный демон безопасности (EDR/HIPS).
+* `target/release/sentinel-privileged` — изолированный привилегированный хелпер (CAP_KILL, CAP_NET_ADMIN, crash-resilient watchdog).
+* `target/release/sntctl` — CLI-утилита управления и мониторинга.
 
 ### 3. Автонастройка BPF LSM в ядре (при необходимости)
 
-Если модуль BPF LSM не активен в ядре, утилита автоматически добавит необходимые параметры в загрузчик (GRUB / systemd-boot):
+Если модуль BPF LSM не активен в ядре, утилита может внести необходимые параметры в конфигурацию загрузчика (GRUB / systemd-boot). Для предотвращения случайных изменений требуется интерактивное подтверждение или флаг `--yes`:
 ```bash
-sudo ./target/release/sntctl setup-kernel
+sudo ./target/release/sntctl setup-kernel --yes
 ```
-*(При внесении изменений потребуется перезагрузка).*
+*(При внесении изменений создается автоматический бэкап и потребуется перезагрузка).*
 
 ---
 
 ## Запуск
 
-### Вариант 1: Системная служба systemd
+### Вариант 1: Системная служба systemd (Архитектура с разделением привилегий)
+
+Для максимальной безопасности Sentinel-RS использует модель с разделением привилегий: основной демон `sentineld` работает с ограниченными привилегиями, делегируя операции изменения фаервола и сигналов защищенному хелперу `sentinel-privileged`.
 
 ```bash
 # Установка бинарников в систему
 sudo install -m 0755 target/release/sentineld /usr/local/bin/
+sudo install -m 0755 target/release/sentinel-privileged /usr/local/bin/
 sudo install -m 0755 target/release/sntctl /usr/local/bin/
 
 # Создание рабочих каталогов
 sudo mkdir -p /etc/sentinel /var/lib/sentinel /run/sentinel
+sudo chmod 0750 /run/sentinel
 
-# Копирование конфигураций и systemd-юнита
+# Копирование конфигураций и systemd-юнитов
 sudo cp config/config.toml /etc/sentinel/
 sudo cp config/rules.toml /etc/sentinel/
+sudo cp config/sentinel-privileged.service /etc/systemd/system/
 sudo cp config/sentineld.service /etc/systemd/system/
 
-# Запуск службы
+# Запуск служб
 sudo systemctl daemon-reload
+sudo systemctl enable --now sentinel-privileged.service
 sudo systemctl enable --now sentineld.service
 ```
 
@@ -278,6 +285,22 @@ journalctl -u sentineld -f          # Просмотр системного ло
 # Модульные и интеграционные тесты
 cargo test
 
+# Стресс- и SLA-бенчмарки (eval latency <= 1.0ms, decision latency <= 5.0ms)
+cargo bench --bench sla_benchmarks
+
 # Комплексный тест в реальном Linux-окружении (eBPF, netfilter, RBAC, DAG, kill/suspend, изоляция)
 sudo ./tests/run_live_vm_tests.sh
 ```
+
+---
+
+## Архитектурная и техническая документация
+
+Подробная проектная и аудиторская документация доступна в каталоге `docs/`:
+
+* [Модель разделения привилегий и безопасность IPC](docs/PRIVILEGE_MODEL.md) (`docs/PRIVILEGE_MODEL.md`)
+* [Архитектура безопасности Sentinel-RS](docs/SECURITY_ARCHITECTURE.md) (`docs/SECURITY_ARCHITECTURE.md`)
+* [Отказоустойчивость сети и Anti-Lockout Watchdog](docs/NETWORK_FAILSAFE.md) (`docs/NETWORK_FAILSAFE.md`)
+* [Отслеживание происхождения данных и Taint Tracking](docs/TAINT_TRACKING.md) (`docs/TAINT_TRACKING.md`)
+* [Первичный отчет технического аудита (INITIAL_AUDIT)](docs/audit/INITIAL_AUDIT.md) (`docs/audit/INITIAL_AUDIT.md`)
+* [Итоговый отчет технического аудита и верификации (FINAL_AUDIT)](docs/audit/FINAL_AUDIT.md) (`docs/audit/FINAL_AUDIT.md`)

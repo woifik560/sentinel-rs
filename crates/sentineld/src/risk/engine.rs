@@ -540,4 +540,107 @@ mod tests {
             .any(|f| f.rule_id == RuleId::TofuTamperedBinary));
         assert!(score.total >= 40);
     }
+
+    #[test]
+    fn test_fileless_memfd_and_anon_exec_rules() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        let mut node = ProcessNode::new(4100, 1000, 1000, PathBuf::from("/usr/bin/python3"));
+        node.is_memfd = true;
+        node.is_anon_exec = true;
+
+        let net = NetworkContext {
+            dest_ip: Some("127.0.0.1".into()),
+            dest_port: 8080,
+            has_dns_record: true,
+            is_first_seen_ip: false,
+            current_time_ns: 10_000_000_000,
+            is_tofu_tampered: false,
+            is_ipc_laundered: false,
+            dest_domain: None,
+        };
+
+        let score = engine.evaluate(&node, &net);
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::FilelessMemfd));
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::FilelessAnonExec));
+        assert!(score.total >= 85);
+    }
+
+    #[test]
+    fn test_ipc_taint_launder_and_raw_ip_rules() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        let node = ProcessNode::new(4200, 1000, 1000, PathBuf::from("/usr/bin/curl"));
+
+        let net = NetworkContext {
+            dest_ip: Some("1.2.3.4".into()),
+            dest_port: 443,
+            has_dns_record: false,  // Raw IP connect
+            is_first_seen_ip: true, // First seen IP
+            current_time_ns: 10_000_000_000,
+            is_tofu_tampered: false,
+            is_ipc_laundered: true, // IPC taint launder
+            dest_domain: None,
+        };
+
+        let score = engine.evaluate(&node, &net);
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::IpcTaintLaunder));
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::RawIpConnect));
+        assert!(score
+            .firings
+            .iter()
+            .any(|f| f.rule_id == RuleId::FirstSeenDestination));
+        // 30 (IPC) + 10 (Raw) + 15 (FirstSeen) = 55
+        assert_eq!(score.total, 55);
+    }
+
+    #[test]
+    fn test_evidence_confidence_and_impact() {
+        let rules = RulesConfig::default();
+        let dpkg = DpkgChecker::new();
+        let engine = RiskEngine::new(rules, dpkg);
+
+        let mut node = ProcessNode::new(4300, 1000, 1000, PathBuf::from("/usr/bin/curl"));
+        node.record_secret_access(
+            PathBuf::from("/home/user/.ssh/id_rsa"),
+            SecretCategory::SshKey,
+            1_000_000_000,
+        );
+
+        let net = NetworkContext {
+            dest_ip: Some("203.0.113.5".into()),
+            dest_port: 443,
+            has_dns_record: true,
+            is_first_seen_ip: true,
+            current_time_ns: 1_002_000_000,
+            is_tofu_tampered: false,
+            is_ipc_laundered: false,
+            dest_domain: Some("api.github.com".into()),
+        };
+
+        let evidence = engine.evaluate_evidence(&node, &net);
+        assert_eq!(
+            evidence.confidence,
+            sentinel_common::risk::Confidence::Certain
+        );
+        assert_eq!(evidence.impact, sentinel_common::risk::Impact::Critical);
+        assert!(evidence.confirmed_propagation);
+        assert!(evidence.score >= 55);
+    }
 }

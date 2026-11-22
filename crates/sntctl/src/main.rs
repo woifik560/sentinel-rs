@@ -123,6 +123,10 @@ enum Commands {
         /// Rollback previous bootloader configuration changes from backup
         #[arg(long)]
         rollback: bool,
+
+        /// Automatically confirm bootloader changes without interactive prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -252,7 +256,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_READONLY_SOCKET));
             run_monitor(&sock).await?
         }
-        Commands::SetupKernel { force, rollback } => run_setup_kernel(force, rollback).await?,
+        Commands::SetupKernel {
+            force,
+            rollback,
+            yes,
+        } => run_setup_kernel(force, rollback, yes).await?,
     }
 
     Ok(())

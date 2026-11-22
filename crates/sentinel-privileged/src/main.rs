@@ -22,6 +22,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Sentinel Privileged Helper daemon (sentinel-privileged)...");
 
+    // Check and recover leftover or expired anti-lockout state from a previous run/crash
+    PrivilegedExecutor::check_and_recover_lockout_state();
+
     let socket_path = PathBuf::from("/run/sentinel/privileged.sock");
     if let Some(parent) = socket_path.parent() {
         tokio::fs::create_dir_all(parent).await?;

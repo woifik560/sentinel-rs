@@ -401,7 +401,7 @@ fn test_scenario_14_tofu_tampered_binary_detection() {
 
 #[test]
 fn test_scenario_15_contextual_policy_ssh_rules() {
-    let engine = sentineld_mock_policy::ContextPolicyEngine::default();
+    let engine = sentineld_mock_policy::ContextPolicyEngine;
 
     // SSH key access for git/ssh to github.com:22 -> Pre-Approved!
     let allowed = engine.is_allowed(
@@ -573,12 +573,11 @@ mod sentineld_mock_policy {
             dest_domain: Option<&str>,
         ) -> bool {
             let s = path.to_string_lossy();
-            if s.ends_with("/ssh") {
-                if dest_port == 22
-                    && (dest_domain == Some("github.com") || dest_ip == Some("140.82.112.3"))
-                {
-                    return true;
-                }
+            if s.ends_with("/ssh")
+                && dest_port == 22
+                && (dest_domain == Some("github.com") || dest_ip == Some("140.82.112.3"))
+            {
+                return true;
             }
             false
         }

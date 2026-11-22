@@ -72,26 +72,25 @@ echo "[INFO] Using sntctl:    $SNTCTL"
 mkdir -p /run/sentinel /var/lib/sentinel /tmp/sentinel_test
 chmod 755 /run/sentinel /var/lib/sentinel /tmp/sentinel_test
 
-SYSTEMD_WAS_ACTIVE=false
-if systemctl is-active sentineld >/dev/null 2>&1; then
-    SYSTEMD_WAS_ACTIVE=true
-    echo "[*] Temporarily stopping systemd sentineld.service for isolated test run..."
-    systemctl stop sentineld
-fi
-
 DAEMON_PID=""
+MANAGING_SPAWNED_DAEMON=false
+
 cleanup() {
     local exit_code=$?
     echo ""
-    echo "[*] Cleaning up test daemon..."
-    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    echo "[*] Cleaning up test resources..."
+    if [ "$MANAGING_SPAWNED_DAEMON" = true ] && [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "[*] Gracefully stopping spawned test sentineld (PID: $DAEMON_PID)..."
         kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        sleep 1
-        kill -KILL "$DAEMON_PID" 2>/dev/null || true
-    fi
-    if [ "$SYSTEMD_WAS_ACTIVE" = true ]; then
-        echo "[*] Restoring active sentineld.service under systemd..."
-        systemctl start sentineld || true
+        for _ in {1..10}; do
+            if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+        if kill -0 "$DAEMON_PID" 2>/dev/null; then
+            kill -KILL "$DAEMON_PID" 2>/dev/null || true
+        fi
     fi
     exit "$exit_code"
 }
@@ -111,31 +110,35 @@ echo ""
 echo "--------------------------------------------------------------------------------"
 echo " TEST 2: DAEMON INITIALIZATION & SOCKET SETUP"
 echo "--------------------------------------------------------------------------------"
-pkill -9 sentineld 2>/dev/null || true
-rm -f /run/sentinel/sentinel.sock /run/sentinel/sentinel-ro.sock /run/sentinel/privileged.sock
-
-echo "[*] Starting sentineld daemon..."
-$SENTINELD --config config/config.toml --rules config/rules.toml --verbose > /tmp/sentinel_test/daemon.log 2>&1 &
-DAEMON_PID=$!
-echo "[*] sentineld launched with PID $DAEMON_PID"
-
-MAX_WAIT=20
-SOCKETS_READY=false
-while [ $MAX_WAIT -gt 0 ]; do
-    if [ -S /run/sentinel/sentinel.sock ] && [ -S /run/sentinel/sentinel-ro.sock ]; then
-        SOCKETS_READY=true
-        break
-    fi
-    sleep 0.5
-    MAX_WAIT=$((MAX_WAIT - 1))
-done
-
-if [ "$SOCKETS_READY" = true ]; then
-    record_pass "Daemon socket initialization"
+if [ -S /run/sentinel/sentinel.sock ] && $SNTCTL status >/dev/null 2>&1; then
+    echo "[*] Existing sentineld daemon detected and responding on /run/sentinel/sentinel.sock."
+    record_pass "Daemon socket initialization (using active service)"
+    SOCKETS_READY=true
 else
-    record_fail "Daemon socket initialization" "Sockets /run/sentinel/*.sock not created in time"
-    cat /tmp/sentinel_test/daemon.log
-    exit 1
+    echo "[*] No active daemon detected. Spawning dedicated test sentineld..."
+    $SENTINELD --config config/config.toml --rules config/rules.toml --verbose > /tmp/sentinel_test/daemon.log 2>&1 &
+    DAEMON_PID=$!
+    MANAGING_SPAWNED_DAEMON=true
+    echo "[*] sentineld launched with PID $DAEMON_PID"
+
+    MAX_WAIT=20
+    SOCKETS_READY=false
+    while [ $MAX_WAIT -gt 0 ]; do
+        if [ -S /run/sentinel/sentinel.sock ] && [ -S /run/sentinel/sentinel-ro.sock ]; then
+            SOCKETS_READY=true
+            break
+        fi
+        sleep 0.5
+        MAX_WAIT=$((MAX_WAIT - 1))
+    done
+
+    if [ "$SOCKETS_READY" = true ]; then
+        record_pass "Daemon socket initialization"
+    else
+        record_fail "Daemon socket initialization" "Sockets /run/sentinel/*.sock not created in time"
+        cat /tmp/sentinel_test/daemon.log
+        exit 1
+    fi
 fi
 
 echo ""
@@ -267,13 +270,18 @@ else
     record_fail "PID 1 termination rejected" "Output: $PID1_ERR"
 fi
 
-set +e
-SELF_ERR=$($SNTCTL process kill "$DAEMON_PID" 2>&1)
-set -e
-if echo "$SELF_ERR" | grep -iqE "forbidden|immutable|protected|eperm|error"; then
-    record_pass "Daemon self-termination rejected (immutable safety constraint)"
+TARGET_DAEMON_PID="${DAEMON_PID:-$(pgrep -o sentineld 2>/dev/null || echo "")}"
+if [ -n "$TARGET_DAEMON_PID" ]; then
+    set +e
+    SELF_ERR=$($SNTCTL process kill "$TARGET_DAEMON_PID" 2>&1)
+    set -e
+    if echo "$SELF_ERR" | grep -iqE "forbidden|immutable|protected|eperm|error"; then
+        record_pass "Daemon self-termination rejected (immutable safety constraint)"
+    else
+        record_fail "Daemon self-termination rejected" "Output: $SELF_ERR"
+    fi
 else
-    record_fail "Daemon self-termination rejected" "Output: $SELF_ERR"
+    record_skip "Daemon self-termination rejected" "Could not determine daemon PID"
 fi
 
 echo ""

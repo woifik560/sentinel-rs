@@ -37,21 +37,42 @@ Sentinel-RS adheres to the **Principle of Least Privilege (PoLP)** and the **Def
 
 ### 3.3 Strongly-Typed API Operations
 
-The helper rejects raw shell strings. It only accepts typed JSON-RPC requests conforming to `PrivilegedRequest`:
+The helper rejects raw shell strings. It only accepts strongly-typed JSON-RPC requests conforming to `PrivilegedOp`:
 
 ```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub enum PrivilegedRequest {
-    /// Atomic batch execution of validated nftables rules
-    ApplyNftablesBatch {
-        commands: Vec<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FirewallOperation {
+    SetupHolding { use_bypass: bool },
+    ApplyIsolation {
+        tier: String,
+        trusted_ssh_ips: Vec<String>,
+        blocked_ips: Vec<String>,
+        blocked_ports: Vec<u16>,
     },
-    /// Safe process termination via pidfd with PID 1 protection
-    TerminateProcess {
+    BlockIp { ip: String },
+    CleanupRules,
+    ArmAntiLockout {
+        timeout_secs: u64,
+        trusted_ssh_ips: Vec<String>,
+    },
+    ConfirmAntiLockout,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PrivilegedOp {
+    /// Strongly-typed firewall operations executed safely by the privileged helper
+    Firewall(FirewallOperation),
+    /// Deprecated atomic batch fallback
+    ApplyNftablesBatch { batch: String },
+    /// Safe pidfd signaling of a process instance with anti-PID-reuse verification
+    SignalProcess {
         pid: u32,
         signal: i32,
+        expected_start_time: Option<u64>,
+        expected_exe: Option<String>,
     },
-    /// Query status of the privileged helper
+    /// Health ping
     Ping,
 }
 ```
@@ -59,6 +80,8 @@ pub enum PrivilegedRequest {
 ### 3.4 Invariant Enforcement
 1. **Firewall Syntax Pre-Check**: Before applying any batch of nftables rules, the helper runs a dry-run check (`nft -c -f -`). If the dry run returns an error, the batch is aborted, preventing corrupted firewall rulesets.
 2. **PID 1 & Self Never-Kill**: Any request with `pid <= 1` or targeting `sentinel-privileged` itself is unconditionally rejected with an `EPERM` error.
+3. **Crash-Resilient Anti-Lockout Watchdog**: State is persisted to `/run/sentinel/isolation_lockout.state` with background timers to prevent host bricking if `sentineld` crashes during isolation.
+4. **Supplementary Group Authorization**: Peer credential authentication queries `nix::unistd::getgrouplist` to ensure members of the `sentinel` group with different primary GIDs are recognized as Operators.
 
 ---
 

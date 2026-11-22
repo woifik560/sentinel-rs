@@ -33,10 +33,29 @@ fn restore_backup(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-pub async fn run_setup_kernel(force: bool, rollback: bool) -> anyhow::Result<()> {
+pub async fn run_setup_kernel(force: bool, rollback: bool, yes: bool) -> anyhow::Result<()> {
     println!("================================================================================");
     println!(" Sentinel-RS Universal Kernel & Bootloader Setup Tool");
     println!("================================================================================");
+
+    if !rollback && !yes {
+        println!(
+            "WARNING: This operation will modify your bootloader configuration to enable BPF LSM."
+        );
+        print!("Are you sure you want to proceed? [y/N]: ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let trimmed = input.trim().to_lowercase();
+            if trimmed != "y" && trimmed != "yes" {
+                println!("[ABORTED] Operation cancelled by user. No bootloader changes were made.");
+                return Ok(());
+            }
+        } else {
+            anyhow::bail!("Failed to read confirmation. Use --yes for non-interactive execution.");
+        }
+    }
 
     if rollback {
         println!("[ROLLBACK] Initiating bootloader rollback from Sentinel backup files...");

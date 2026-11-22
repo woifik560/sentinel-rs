@@ -42,10 +42,15 @@ impl NetworkProtectionManager {
     }
 
     pub fn initialize(&self, use_bypass: bool) -> anyhow::Result<()> {
+        // Check and recover leftover/expired lockout state upon daemon startup
+        sentinel_privileged::server::PrivilegedExecutor::check_and_recover_lockout_state();
         NftablesManager::setup_rules(use_bypass)
     }
 
     pub fn shutdown(&self) {
+        let _ = NftablesManager::execute_firewall_op(
+            sentinel_privileged::FirewallOperation::ConfirmAntiLockout,
+        );
         NftablesManager::cleanup_rules();
     }
 
@@ -80,7 +85,15 @@ impl NetworkProtectionManager {
             self.timer_expires_epoch
                 .store(now + timeout_secs, Ordering::SeqCst);
 
-            // Spawn Anti-Lockout auto-rollback watcher
+            // Arm privileged helper & persistent watchdog
+            let _ = NftablesManager::execute_firewall_op(
+                sentinel_privileged::FirewallOperation::ArmAntiLockout {
+                    timeout_secs,
+                    trusted_ssh_ips: trusted_ssh_ips.clone(),
+                },
+            );
+
+            // Spawn local Anti-Lockout auto-rollback watcher as secondary safety net
             let confirmed = self.isolation_confirmed.clone();
             let timer_active = self.isolation_timer_active.clone();
             let tier_lock = self.isolation_tier.clone();
@@ -113,6 +126,12 @@ impl NetworkProtectionManager {
         if tier == IsolationTier::None {
             anyhow::bail!("Cannot confirm isolation: Host is not currently isolated");
         }
+
+        // Disarm persistent/privileged helper watchdog
+        let _ = NftablesManager::execute_firewall_op(
+            sentinel_privileged::FirewallOperation::ConfirmAntiLockout,
+        );
+
         if self.isolation_timer_active.swap(false, Ordering::SeqCst) {
             self.isolation_confirmed.store(true, Ordering::SeqCst);
             info!("Anti-Lockout timer disarmed: Network isolation confirmed by operator.");
@@ -129,6 +148,11 @@ impl NetworkProtectionManager {
         info!("Releasing network isolation");
         self.isolation_timer_active.store(false, Ordering::SeqCst);
         self.isolation_confirmed.store(true, Ordering::SeqCst);
+
+        // Disarm any active anti-lockout watchdog
+        let _ = NftablesManager::execute_firewall_op(
+            sentinel_privileged::FirewallOperation::ConfirmAntiLockout,
+        );
 
         NftablesManager::apply_isolation_tier(IsolationTier::None, &[])?;
         *self.isolation_tier.write().await = IsolationTier::None;

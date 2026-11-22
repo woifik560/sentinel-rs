@@ -537,14 +537,13 @@ fn test_12_ld_preload_toctou_maps_defense() {
         if parts.len() >= 6 {
             let perms = parts[1];
             let mapped_path = parts[5..].join(" ");
-            if perms.contains('x') {
-                if mapped_path.starts_with("/tmp")
+            if perms.contains('x')
+                && (mapped_path.starts_with("/tmp")
                     || mapped_path.starts_with("/dev/shm")
-                    || mapped_path.starts_with("/home")
-                {
-                    detected_malicious_mapping = true;
-                    break;
-                }
+                    || mapped_path.starts_with("/home"))
+            {
+                detected_malicious_mapping = true;
+                break;
             }
         }
     }
@@ -1094,16 +1093,20 @@ fn test_21_sntctl_setup_kernel_cmdline_patching() {
         let mut replaced = false;
 
         for line in content.lines() {
-            if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
-                let val = line["GRUB_CMDLINE_LINUX_DEFAULT=".len()..].trim_matches('"');
+            if let Some(rest) = line.strip_prefix("GRUB_CMDLINE_LINUX_DEFAULT=") {
+                let val = rest.trim_matches('"');
                 let patched = patch_cmdline(val, lsm_param);
                 lines.push(format!("GRUB_CMDLINE_LINUX_DEFAULT=\"{}\"", patched));
                 replaced = true;
-            } else if !replaced && line.starts_with("GRUB_CMDLINE_LINUX=") {
-                let val = line["GRUB_CMDLINE_LINUX=".len()..].trim_matches('"');
-                let patched = patch_cmdline(val, lsm_param);
-                lines.push(format!("GRUB_CMDLINE_LINUX=\"{}\"", patched));
-                replaced = true;
+            } else if !replaced {
+                if let Some(rest) = line.strip_prefix("GRUB_CMDLINE_LINUX=") {
+                    let val = rest.trim_matches('"');
+                    let patched = patch_cmdline(val, lsm_param);
+                    lines.push(format!("GRUB_CMDLINE_LINUX=\"{}\"", patched));
+                    replaced = true;
+                } else {
+                    lines.push(line.to_string());
+                }
             } else {
                 lines.push(line.to_string());
             }
