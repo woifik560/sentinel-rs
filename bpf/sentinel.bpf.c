@@ -6,6 +6,17 @@
 #include <bpf/bpf_core_read.h>
 #include "sentinel_types.h"
 
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+#ifndef bpf_ntohs
+#define bpf_ntohs(x) __builtin_bswap16(x)
+#endif
+
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
 /* =========================================================================
@@ -224,17 +235,17 @@ int BPF_PROG(sentinel_socket_connect, struct socket *sock, struct sockaddr *addr
     __u32 mark = next_flow_mark(false);
 
     // Synchronously write FlowContext into flow_mark_ctx map
-    struct flow_context ctx = {};
-    ctx.mark = mark;
-    ctx.tgid = tgid;
-    ctx.pid = (__u32)bpf_get_current_pid_tgid();
-    ctx.uid = (__u32)bpf_get_current_uid_gid();
-    bpf_map_update_elem(&flow_mark_ctx, &mark, &ctx, BPF_ANY);
+    struct flow_context fctx = {};
+    fctx.mark = mark;
+    fctx.tgid = tgid;
+    fctx.pid = (__u32)bpf_get_current_pid_tgid();
+    fctx.uid = (__u32)bpf_get_current_uid_gid();
+    bpf_map_update_elem(&flow_mark_ctx, &mark, &fctx, BPF_ANY);
 
     // Set mark on socket
     struct sock *sk = BPF_CORE_READ(sock, sk);
     if (sk) {
-        BPF_CORE_WRITE(sk, sk_mark, mark);
+        sk->sk_mark = mark;
     }
 
     struct raw_connect_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
