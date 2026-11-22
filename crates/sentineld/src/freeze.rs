@@ -121,15 +121,26 @@ impl NeverFreezeChecker {
 }
 
 /// NFQUEUE network holding manager for Netfilter integration.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NfqueueHoldManager {
-    /// Tracks held packets grouped by incident_id (supporting SYN retransmits).
-    held_packets: Arc<RwLock<HashMap<String, Vec<u32>>>>,
+    manager: crate::network::nfqueue::NfqueueManager,
+}
+
+impl Default for NfqueueHoldManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NfqueueHoldManager {
     pub fn new() -> Self {
-        Self::default()
+        let mgr = crate::network::nfqueue::NfqueueManager::new();
+        let _ = mgr.start();
+        Self { manager: mgr }
+    }
+
+    pub fn with_manager(manager: crate::network::nfqueue::NfqueueManager) -> Self {
+        Self { manager }
     }
 
     /// Configure kernel nftables rule for diverting SO_MARK traffic to NFQUEUE.
@@ -163,35 +174,17 @@ impl NfqueueHoldManager {
     /// Register a packet currently held in NFQUEUE awaiting interactive verdict.
     /// Supports aggregating multiple SYN retransmits under the same incident.
     pub fn register_packet(&self, incident_id: String, packet_id: u32) {
-        let mut map = self.held_packets.write().unwrap();
-        let list = map.entry(incident_id).or_default();
-        list.push(packet_id);
+        self.manager.register_packet(incident_id, packet_id);
     }
 
     /// Release packet with NF_ACCEPT verdict (traffic allowed) for all aggregated packets in this incident.
     pub fn accept(&self, incident_id: &str) {
-        let mut map = self.held_packets.write().unwrap();
-        if let Some(packet_ids) = map.remove(incident_id) {
-            for packet_id in packet_ids {
-                info!(
-                    "NFQUEUE: Issuing NF_ACCEPT for packet {} (incident {})",
-                    packet_id, incident_id
-                );
-            }
-        }
+        self.manager.accept(incident_id);
     }
 
     /// Drop packet with NF_DROP verdict (or TCP reset) for all aggregated packets in this incident.
     pub fn drop(&self, incident_id: &str) {
-        let mut map = self.held_packets.write().unwrap();
-        if let Some(packet_ids) = map.remove(incident_id) {
-            for packet_id in packet_ids {
-                info!(
-                    "NFQUEUE: Issuing NF_DROP / TCP RST for packet {} (incident {})",
-                    packet_id, incident_id
-                );
-            }
-        }
+        self.manager.drop(incident_id);
     }
 }
 

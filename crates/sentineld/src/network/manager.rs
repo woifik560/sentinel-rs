@@ -44,10 +44,12 @@ impl NetworkProtectionManager {
     pub fn initialize(&self, use_bypass: bool) -> anyhow::Result<()> {
         // Check and recover leftover/expired lockout state upon daemon startup
         sentinel_privileged::server::PrivilegedExecutor::check_and_recover_lockout_state();
+        let _ = self.nfqueue.start();
         NftablesManager::setup_rules(use_bypass)
     }
 
     pub fn shutdown(&self) {
+        self.nfqueue.shutdown();
         let _ = NftablesManager::execute_firewall_op(
             sentinel_privileged::FirewallOperation::ConfirmAntiLockout,
         );

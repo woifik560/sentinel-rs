@@ -174,6 +174,8 @@ impl EbpfLoader {
             std::env::var("SENTINEL_BPF_OBJ")
                 .ok()
                 .map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from("bpf/sentinel.bpf.o")),
+            Some(std::path::PathBuf::from("../bpf/sentinel.bpf.o")),
             Some(std::path::PathBuf::from(
                 "/usr/lib/sentinel/bpf/sentinel.bpf.o",
             )),
@@ -542,18 +544,51 @@ fn start_tracepoint_collector(tx: mpsc::Sender<EbpfEvent>) {
 fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
     use std::ffi::CString;
 
-    let fan_fd = unsafe {
-        libc::fanotify_init(
-            libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC,
-            libc::O_RDONLY as u32,
-        )
+    #[repr(C)]
+    struct FanotifyResponse {
+        fd: libc::c_int,
+        response: u32,
+    }
+    const FAN_ALLOW: u32 = 0x01;
+    const FAN_DENY: u32 = 0x02;
+    const FAN_CLASS_CONTENT: u32 = 0x00000004;
+    const FAN_CLASS_NOTIF: u32 = 0x00000000;
+    const FAN_OPEN_PERM: u64 = 0x00010000;
+    const FAN_ACCESS_PERM: u64 = 0x00020000;
+
+    // Try permission enforcement class first (requires CAP_SYS_ADMIN), fall back to notification class
+    let (fan_fd, is_perm_mode) = {
+        let fd = unsafe {
+            libc::fanotify_init(
+                FAN_CLASS_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+                (libc::O_RDONLY | libc::O_LARGEFILE) as u32,
+            )
+        };
+        if fd >= 0 {
+            (fd, true)
+        } else {
+            let notif_fd = unsafe {
+                libc::fanotify_init(
+                    FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+                    (libc::O_RDONLY | libc::O_LARGEFILE) as u32,
+                )
+            };
+            (notif_fd, false)
+        }
     };
+
     if fan_fd < 0 {
-        warn!("fanotify_init failed. File access monitoring running in passive mode.");
+        warn!("fanotify_init failed (requires CAP_SYS_ADMIN). File access monitoring running in passive tracepoint mode.");
         return;
     }
 
-    // Mark target filesystems or paths
+    let mark_mask = if is_perm_mode {
+        FAN_OPEN_PERM | FAN_ACCESS_PERM | libc::FAN_OPEN as u64
+    } else {
+        libc::FAN_OPEN as u64
+    };
+
+    // Mark target directories containing secrets and binaries
     let targets = ["/home", "/root", "/etc", "/tmp"];
     let mut marked = 0;
     for target in &targets {
@@ -562,7 +597,7 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                 libc::fanotify_mark(
                     fan_fd,
                     libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
-                    libc::FAN_OPEN,
+                    mark_mask,
                     libc::AT_FDCWD,
                     c_target.as_ptr(),
                 )
@@ -574,7 +609,7 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                     libc::fanotify_mark(
                         fan_fd,
                         libc::FAN_MARK_ADD,
-                        libc::FAN_OPEN | libc::FAN_EVENT_ON_CHILD,
+                        mark_mask | libc::FAN_EVENT_ON_CHILD as u64,
                         libc::AT_FDCWD,
                         c_target.as_ptr(),
                     )
@@ -587,14 +622,37 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
     }
 
     info!(
-        "fanotify secret monitor active (marked {} targets).",
-        marked
+        "fanotify secret monitor active (marked {} targets, enforcement_mode: {}).",
+        marked, is_perm_mode
     );
 
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 16384];
+    let mut pollfd = libc::pollfd {
+        fd: fan_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
     loop {
+        // Use poll with 100ms timeout to avoid hanging and allow clean shutdown
+        let poll_res = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        if poll_res < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if poll_res == 0 {
+            continue; // Timeout, loop back
+        }
+
         let n = unsafe { libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                continue;
+            }
             break;
         }
 
@@ -606,8 +664,26 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                 break;
             }
 
+            // Handle queue overflow
+            if (meta.mask & libc::FAN_Q_OVERFLOW as u64) != 0 {
+                warn!("fanotify queue overflow detected! Events dropped by kernel.");
+                offset += meta.event_len as usize;
+                continue;
+            }
+
             if meta.fd >= 0 {
+                let is_perm_event = (meta.mask & (FAN_OPEN_PERM | FAN_ACCESS_PERM)) != 0;
                 let proc_fd_path = format!("/proc/self/fd/{}", meta.fd);
+                let mut should_deny = false;
+
+                // Extract real inode, device, and owner UID via fstat on real file descriptor
+                let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+                let (real_dev, real_ino, real_owner_uid) = if unsafe { libc::fstat(meta.fd, &mut stat_buf) } == 0 {
+                    (stat_buf.st_dev as u64, stat_buf.st_ino as u64, stat_buf.st_uid as u32)
+                } else {
+                    (0, 0, 0)
+                };
+
                 if let Ok(target_path) = std::fs::read_link(&proc_fd_path) {
                     let path_str = target_path.to_string_lossy();
                     let pid = meta.pid as u32;
@@ -616,11 +692,24 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
 
+                    // Read real process UID from /proc/[pid]/status
+                    let proc_uid = std::fs::read_to_string(format!("/proc/{}/status", pid))
+                        .ok()
+                        .and_then(|s| {
+                            for line in s.lines() {
+                                if line.starts_with("Uid:") {
+                                    return line.split_whitespace().nth(1)?.parse::<u32>().ok();
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or(real_owner_uid);
+
                     if let Some(_cat) = crate::programs::file_open::simulate_file_open_check(
                         &path_str,
                         &current_exe,
                     ) {
-                        // Extract parent PID and group leader (PGID) to ensure taint links to parent script
+                        // Extract parent PID and PGID for lineage tracking
                         let mut ppid = 0;
                         let mut pgrp = 0;
                         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
@@ -637,24 +726,6 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                             }
                         }
 
-                        if ppid <= 1 {
-                            ppid = std::fs::read_to_string(format!("/proc/{}/status", pid))
-                                .ok()
-                                .and_then(|s| {
-                                    for line in s.lines() {
-                                        if line.starts_with("PPid:") {
-                                            return line
-                                                .split_whitespace()
-                                                .nth(1)?
-                                                .parse::<u32>()
-                                                .ok();
-                                        }
-                                    }
-                                    None
-                                })
-                                .unwrap_or(0);
-                        }
-
                         if ppid > 1 {
                             let _ = tx.blocking_send(EbpfEvent::ProcessFork {
                                 parent_tgid: ppid,
@@ -662,38 +733,56 @@ fn start_fanotify_collector(tx: mpsc::Sender<EbpfEvent>) {
                             });
                         }
 
+                        // Send real event with genuine dev, ino, and proc_uid
                         let _ = tx.blocking_send(EbpfEvent::FileOpen {
                             tgid: pid,
-                            uid: 1000,
+                            uid: proc_uid,
                             path: target_path.clone(),
-                            dev: 0,
-                            ino: 0,
-                            flags: 0,
+                            dev: real_dev,
+                            ino: real_ino,
+                            flags: meta.mask as u32,
                         });
 
                         if ppid > 1 {
                             let _ = tx.blocking_send(EbpfEvent::FileOpen {
                                 tgid: ppid,
-                                uid: 1000,
+                                uid: proc_uid,
                                 path: target_path.clone(),
-                                dev: 0,
-                                ino: 0,
-                                flags: 0,
+                                dev: real_dev,
+                                ino: real_ino,
+                                flags: meta.mask as u32,
                             });
                         }
 
                         if pgrp > 1 && pgrp != pid && pgrp != ppid {
                             let _ = tx.blocking_send(EbpfEvent::FileOpen {
                                 tgid: pgrp,
-                                uid: 1000,
+                                uid: proc_uid,
                                 path: target_path,
-                                dev: 0,
-                                ino: 0,
-                                flags: 0,
+                                dev: real_dev,
+                                ino: real_ino,
+                                flags: meta.mask as u32,
                             });
                         }
                     }
                 }
+
+                // If this is a permission event, send real verdict response to kernel
+                if is_perm_event {
+                    let resp = FanotifyResponse {
+                        fd: meta.fd,
+                        response: if should_deny { FAN_DENY } else { FAN_ALLOW },
+                    };
+                    unsafe {
+                        libc::write(
+                            fan_fd,
+                            &resp as *const _ as *const libc::c_void,
+                            std::mem::size_of::<FanotifyResponse>(),
+                        );
+                    }
+                }
+
+                // Always close metadata file descriptor to prevent FD leak
                 unsafe {
                     libc::close(meta.fd);
                 }

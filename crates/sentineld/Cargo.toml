@@ -29,6 +29,9 @@ uuid = { version = ">=1.8, <=1.15", features = ["v4", "serde"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nfq = "0.2.6"
+
 [[bench]]
 name = "sla_benchmarks"
 harness = false
